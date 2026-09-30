@@ -1338,11 +1338,33 @@ const SOURCE_INPUTS_FILE: &str = "source-inputs.tsv";
 const SOURCE_AVAILABILITY_FILE: &str = "source-availability.tsv";
 const SOURCE_AVAILABILITY_VERSION: u64 = 1;
 
+/// The canonical spelling of a source path. A path that no longer exists takes the canonical
+/// spelling of its nearest existing ancestor, so a removed source still matches the input it
+/// was registered as, however the path is written now (Windows short names and `\\?\`
+/// prefixes, symbolic links).
 fn normalize_source_input(input: &str) -> String {
-    fs::canonicalize(input)
-        .unwrap_or_else(|_| PathBuf::from(input))
-        .to_string_lossy()
-        .into_owned()
+    let path = Path::new(input);
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical.to_string_lossy().into_owned();
+    }
+    let mut missing = Vec::new();
+    let mut current = path;
+    while let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
+        missing.push(name);
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(mut canonical) = fs::canonicalize(parent) {
+            for name in missing.iter().rev() {
+                canonical.push(name);
+            }
+            return canonical.to_string_lossy().into_owned();
+        }
+        current = parent;
+    }
+    input.to_string()
 }
 
 fn load_source_inputs(output: &Path) -> io::Result<Vec<String>> {

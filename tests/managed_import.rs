@@ -276,6 +276,46 @@ fn missing_managed_copy_remains_registered() {
     std::fs::remove_dir_all(root).expect("remove test root");
 }
 
+/// One directory can be written two ways: through a symbolic link here, with an 8.3 short
+/// name or a `\\?\` prefix on Windows. A removed import is still one missing source.
+#[cfg(unix)]
+#[test]
+fn removed_import_is_one_missing_source_under_any_spelling() {
+    let root = root("spelling");
+    let real = root.join("real");
+    std::fs::create_dir_all(&real).expect("create the real directory");
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("link the directory");
+    let archive = root.join("archive");
+    std::fs::create_dir_all(&archive).expect("create archive");
+    std::fs::write(archive.join("archive.jsonl"), "{}\n").expect("write archive");
+    let live = root.join("live.jsonl");
+    std::fs::write(&live, "{}\n").expect("write live source");
+    let corpus = link.join("home").join("corpus");
+
+    run(&[
+        "import",
+        "--source",
+        text(&archive),
+        "--provenance",
+        "other-pc",
+        "--label",
+        "old-machine",
+        "--corpus",
+        text(&corpus),
+    ]);
+    run(&["sync", "--source", text(&live), "--corpus", text(&corpus)]);
+    std::fs::remove_dir_all(imported_directory(&real.join("home"))).expect("remove managed copy");
+    let build = run(&["sync", "--corpus", text(&corpus)]);
+    assert!(
+        build.contains("\"unavailable_managed_imports\":1")
+            && build.contains("\"unreadable_source_paths\":1"),
+        "the removed import is one missing source: {build}"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
 #[test]
 fn invalid_registry_returns_an_error() {
     let root = root("registry-not-file");
