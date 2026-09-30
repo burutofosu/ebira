@@ -375,6 +375,11 @@ fn follow_returns_messages_from_the_requested_sender() {
             && human.contains("keep the old colors"),
         "{human}"
     );
+    // A prompt typed while the agent was working reaches follow as it reaches said.
+    assert!(
+        human.contains("also check the docs") && human.contains("\"via\":\"queued\""),
+        "follow --sender human misses the queued prompt: {human}"
+    );
     for text in ["task-notification", "being continued", "ctx-only", "on it"] {
         assert!(
             !human.contains(text),

@@ -36,6 +36,7 @@ pub struct FollowRequest {
 
 struct Message {
     sender: &'static str,
+    via: String,
     timestamp: String,
     byte_start: u64,
     byte_len: u64,
@@ -262,7 +263,9 @@ fn value<'a>(fields: &'a [Field], path: &str) -> Option<&'a str> {
 /// Codex: `/type = response_item`, `/payload/type = message`, text parts under
 /// `/payload/content/<n>/text`. Claude Code: `/type = assistant|user`, text
 /// parts under `/message/content/<n>/text` whose type is `text`, or a plain
-/// string content. A person's message loses the blocks the tools inject into it.
+/// string content; a prompt typed while the agent was working is a
+/// `queued_command` attachment with the text in `/attachment/prompt`. A person's
+/// message loses the blocks the tools inject into it.
 fn message_from_fields(
     fields: &[Field],
     origin: SourceOrigin,
@@ -270,23 +273,15 @@ fn message_from_fields(
     byte_start: u64,
     byte_len: u64,
 ) -> Option<Message> {
-    let record_type = value(fields, "/type")?;
-    let text = if record_type == "response_item" {
-        if value(fields, "/payload/type") != Some("message") {
-            return None;
+    let text = match value(fields, "/type")? {
+        "response_item" if value(fields, "/payload/type") == Some("message") => {
+            collect_text(fields, "/payload/content/", &["input_text", "output_text"])
         }
-        collect_text(fields, "/payload/content/", &["input_text", "output_text"])
-    } else if record_type == "assistant" || record_type == "user" {
-        let plain = fields
-            .iter()
-            .find(|field| field.path == "/message/content" && field.kind == ScalarKind::String)
-            .map(|field| field.value.clone());
-        match plain {
-            Some(text) => text,
-            None => collect_text(fields, "/message/content/", &["text"]),
+        "assistant" | "user" => plain_or_parts(fields, "/message/content"),
+        "attachment" if value(fields, "/attachment/type") == Some("queued_command") => {
+            plain_or_parts(fields, "/attachment/prompt")
         }
-    } else {
-        return None;
+        _ => return None,
     };
     let mut meta = record_meta(fields);
     classify_sender(origin, fields, &mut meta);
@@ -308,11 +303,24 @@ fn message_from_fields(
     }
     Some(Message {
         sender: meta.sender.as_str(),
+        via: meta.via,
         timestamp: value(fields, "/timestamp").unwrap_or("").to_string(),
         byte_start,
         byte_len,
         text,
     })
+}
+
+/// A content value that is either a plain string or an array of text parts.
+fn plain_or_parts(fields: &[Field], content: &str) -> String {
+    let plain = fields
+        .iter()
+        .find(|field| field.path == content && field.kind == ScalarKind::String)
+        .map(|field| field.value.clone());
+    match plain {
+        Some(text) => text,
+        None => collect_text(fields, &format!("{}/", content), &["text"]),
+    }
 }
 
 /// Join the text parts of a content array whose part type is one of `kinds`.
@@ -352,8 +360,9 @@ fn print_result(disposition: &str, target: &Target, after_byte: u64, messages: &
             output.push(',');
         }
         output.push_str(&format!(
-            "{{\"sender\":{},\"timestamp\":{},\"byte_start\":{},\"byte_len\":{},\"text\":{}}}",
+            "{{\"sender\":{},\"via\":{},\"timestamp\":{},\"byte_start\":{},\"byte_len\":{},\"text\":{}}}",
             json_string(message.sender),
+            json_string(&message.via),
             json_string(&message.timestamp),
             message.byte_start,
             message.byte_len,

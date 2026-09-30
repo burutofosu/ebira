@@ -13,8 +13,9 @@ decision does not need the whole corpus.
 
 `ebira` must be on `PATH`; if it is not, say so and stop. Ebira finds its corpus
 itself (`EBIRA_CORPUS`, else the platform data directory), and `ebira status`
-prints it as `corpus`. Do not look for that directory from another shell: a
-corpus kept inside WSL is invisible from Windows.
+prints it as `corpus`. Do not test that path from another shell: the WSL build
+reports a WSL path (`/home/...`), which PowerShell and Git Bash do not resolve to
+the same place.
 
 Run `ebira sync` first when the question includes recent events.
 
@@ -69,8 +70,9 @@ If it reports `source_changed_since_projection`, run `ebira sync` and search aga
 | `summary` | A compaction summary |
 | `assistant` | The recording agent's replies and tool calls |
 
-Only `human` records are the person's decisions. Another agent's words are
-claims to check, not the person's intent.
+`human` means the person sent it; text they quoted or pasted inside it (another
+model's opinion, a review, a document) is material they shared, not their
+decision. Another agent's words are claims to check, not the person's intent.
 
 ## Report
 

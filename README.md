@@ -50,6 +50,48 @@ ebira history --query "retry budget"          # on which dates it came up
 A session id is the id in the transcript's file name. Inside a session it is in
 `CLAUDE_CODE_SESSION_ID` (Claude Code) or `CODEX_THREAD_ID` (Codex).
 
+## Try it
+
+`examples/claude-session.jsonl` is a short, made-up Claude Code session. The
+person asks for retries under two conditions, adds a request while the agent is
+working, and the conversation is compacted. The summary keeps the request and
+drops both conditions:
+
+> Summary: the user asked for retries in the upload client. Exponential backoff
+> was added and each retry is logged.
+
+From the repository:
+
+```text
+ebira sync --corpus demo-corpus --source examples/claude-session.jsonl
+ebira said --corpus demo-corpus --format text
+```
+
+```text
+# ebira said: 3 of 3 messages from the person, newest first (copies and imports skipped: 0, stale sources: 0)
+
+[2026-09-01 09:32] claude typed session=9f1c2a7e source-id=claude-3edaca68d64ba0a1 byte=1854+214
+Now make the retry limit configurable.
+
+[2026-09-01 09:00] claude queued session=9f1c2a7e source-id=claude-3edaca68d64ba0a1 byte=872+201
+Log each retry with its delay.
+
+[2026-09-01 09:00] claude typed session=9f1c2a7e source-id=claude-3edaca68d64ba0a1 byte=0+279
+Add retries to the upload client. Keep the total wait under 30 seconds, and never retry a 4xx response.
+```
+
+The summary, the tool result, and the task notification in the same transcript
+are not the person's words and are left out; the prompt typed while the agent
+was working (`queued`) is kept. The source id comes from the file's path, so
+yours differs. Read the original record behind a message:
+
+```text
+ebira context --corpus demo-corpus --source-id <source-id> --byte-start 0 --byte-len 279
+```
+
+`context` returns the record exactly as the transcript holds it. Times are UTC
+unless `EBIRA_TZ_OFFSET` is set. Delete `demo-corpus` afterwards.
+
 ## Commands
 
 | Command | What it does |
@@ -82,6 +124,11 @@ event:
 | `system` | Tool results, notifications, injected context, skill text, harness metadata |
 | `summary` | A compaction summary |
 | `assistant` | The recording agent's replies and tool calls |
+
+`human` marks what the person sent, including text they pasted into a message:
+another model's answer, a review, a document. Their own words in it are their
+request; what they quote is material they shared, not something they said or
+approved.
 
 `via` names the channel, for example `typed`, `queued`, `slash_command`,
 `subagent_prompt`, `codex_child`, `codex_exec`, `notification`,
@@ -207,9 +254,24 @@ set WSL_UTF8=1
 wsl.exe -e /home/<you>/.cargo/bin/ebira %*
 ```
 
-The WSL build sees WSL paths (`/mnt/c/Users/...`), keeps its corpus inside WSL,
-where Windows programs cannot see it, and reads environment variables such as
-`EBIRA_TZ_OFFSET` from WSL.
+The WSL build works with WSL paths. Its corpus is stored in the WSL file system,
+for example `/home/<you>/.local/share/ebira/corpus`; Windows reaches the same
+files under `\\wsl.localhost\<distribution>\`, so testing the WSL path from
+PowerShell or Git Bash says it does not exist. `ebira status` reports where the
+corpus is.
+
+Inside WSL, the first sync looks for transcripts in the WSL home, not in the
+Windows profile, so name the Windows logs once and check what was found:
+
+```text
+ebira sync --source /mnt/c/Users/<you>/.claude/projects --source /mnt/c/Users/<you>/.codex/sessions
+ebira status
+```
+
+`status` lists each registered source with its `disposition` (`present`,
+`missing`, ...), and later syncs read the same sources. Environment variables
+such as `EBIRA_TZ_OFFSET` are read inside WSL; set them in the WSL shell or in
+the wrapper.
 
 ## Agent skills
 
