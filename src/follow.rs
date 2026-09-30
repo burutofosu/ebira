@@ -52,12 +52,13 @@ struct Target {
 pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
     let target = resolve_target(root, request)?;
     let path = target.path.as_path();
+    let mut origin = target.origin;
     let size = fs::metadata(path)?.len();
     let start = request.after_byte.unwrap_or(size).min(size);
     let mut cursor = align_to_line_start(path, start)?;
     let deadline = Instant::now() + Duration::from_secs(request.seconds);
     loop {
-        let (messages, next) = scan(path, target.origin, cursor, request)?;
+        let (messages, next) = scan(path, &mut origin, cursor, request)?;
         if !messages.is_empty() {
             print_result("received", &target, next, &messages);
             return Ok(());
@@ -129,8 +130,10 @@ fn target(source_id: String, path: PathBuf) -> Target {
     }
 }
 
+/// A registered source is a JSONL file or a directory of them: a file is matched by its own
+/// name, a directory is searched.
 fn collect_session_files(
-    dir: &Path,
+    path: &Path,
     session: &str,
     found: &mut Vec<(u64, PathBuf)>,
     depth: usize,
@@ -138,33 +141,47 @@ fn collect_session_files(
     if depth > 8 {
         return Ok(());
     }
-    let entries = match fs::read_dir(dir) {
+    if path.is_file() {
+        if names_session(path, session) {
+            if let Ok(metadata) = fs::metadata(path) {
+                found.push((modified_ms(&metadata), path.to_path_buf()));
+            }
+        }
+        return Ok(());
+    }
+    let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
     };
     for entry in entries {
         let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_session_files(&path, session, found, depth + 1)?;
+        let child = entry.path();
+        if child.is_dir() {
+            collect_session_files(&child, session, found, depth + 1)?;
             continue;
         }
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        if name.ends_with(".jsonl") && name.contains(session) {
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            found.push((modified, path));
+        if names_session(&child, session) {
+            if let Ok(metadata) = entry.metadata() {
+                found.push((modified_ms(&metadata), child));
+            }
         }
     }
     Ok(())
+}
+
+fn names_session(path: &Path, session: &str) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl") && name.contains(session))
+}
+
+fn modified_ms(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Move a caller-supplied boundary forward to the start of the next line.
@@ -199,9 +216,14 @@ fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
 
 /// Read every complete line after `cursor`; return the messages found and the
 /// boundary after the last line consumed.
+///
+/// A transcript outside `.claude` and `.codex` directories is recognised by its first
+/// records. One that was still empty or unrecognised when following began is looked at
+/// again once new lines arrive, before any of them is classified, so its first messages
+/// are not read as a format without senders.
 fn scan(
     path: &Path,
-    origin: SourceOrigin,
+    origin: &mut SourceOrigin,
     cursor: u64,
     request: &FollowRequest,
 ) -> io::Result<(Vec<Message>, u64)> {
@@ -217,6 +239,10 @@ fn scan(
         Some(index) => index + 1,
         None => return Ok((Vec::new(), cursor)),
     };
+    if *origin == SourceOrigin::Generic {
+        *origin = corpus::origin_for_path(path);
+    }
+    let origin = *origin;
     let mut messages = Vec::new();
     let mut offset = 0usize;
     while offset < complete {
@@ -371,4 +397,77 @@ fn print_result(disposition: &str, target: &Target, after_byte: u64, messages: &
     }
     output.push_str("]}");
     println!("{}", output);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const CODEX_THREAD: &str = concat!(
+        r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"t1"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"the person's words"}]}}"#,
+        "\n",
+    );
+
+    fn request(sender: &str) -> FollowRequest {
+        FollowRequest {
+            source_id: None,
+            session: None,
+            path: None,
+            after_byte: Some(0),
+            seconds: 0,
+            sender: sender.to_string(),
+            prefix: None,
+            limit: 20,
+        }
+    }
+
+    /// A transcript kept outside `.claude` and `.codex`, so its format comes from its records.
+    fn transcript(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ebira-follow-{}-{}.jsonl",
+            name,
+            std::process::id()
+        ));
+        fs::write(&path, contents).expect("write transcript");
+        path
+    }
+
+    #[test]
+    fn a_transcript_written_before_following_is_read_by_sender() {
+        let path = transcript("before", CODEX_THREAD);
+        let mut origin = corpus::origin_for_path(&path);
+        assert_eq!(origin, SourceOrigin::CodexThread);
+        let (messages, _) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "the person's words");
+        fs::remove_file(path).expect("remove transcript");
+    }
+
+    #[test]
+    fn a_transcript_first_written_while_following_is_read_by_sender() {
+        let path = transcript("after", "");
+        let mut origin = corpus::origin_for_path(&path);
+        assert_eq!(origin, SourceOrigin::Generic);
+        let (messages, cursor) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
+        assert!(messages.is_empty());
+        assert_eq!(cursor, 0);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(CODEX_THREAD.as_bytes()))
+            .expect("append records");
+        let (messages, _) = scan(&path, &mut origin, cursor, &request("human")).expect("scan");
+        assert_eq!(origin, SourceOrigin::CodexThread);
+        assert_eq!(
+            messages.len(),
+            1,
+            "the first message is the person's once the format is known"
+        );
+        assert_eq!(messages[0].sender, "human");
+        fs::remove_file(path).expect("remove transcript");
+    }
 }

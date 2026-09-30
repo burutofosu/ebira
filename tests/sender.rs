@@ -402,3 +402,52 @@ fn follow_returns_messages_from_the_requested_sender() {
         "{person}"
     );
 }
+
+#[test]
+fn follow_finds_a_session_registered_as_a_file_or_in_a_directory() {
+    let logs = Logs::new("follow-session");
+    let single = logs.root.join("single-files").join("s-file.jsonl");
+    std::fs::create_dir_all(single.parent().expect("a parent directory"))
+        .expect("create directory");
+    std::fs::write(
+        &single,
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"registered as one file"},"sessionId":"s-file","uuid":"u1","timestamp":"2026-09-02T00:00:00Z"}"#,
+            "\n"
+        ),
+    )
+    .expect("write the single transcript");
+    run(&[
+        "sync",
+        "--corpus",
+        &logs.corpus(),
+        "--source",
+        single.to_str().expect("utf-8 path"),
+    ]);
+    let follow = |session: &str| {
+        run(&[
+            "follow",
+            "--corpus",
+            &logs.corpus(),
+            "--session",
+            session,
+            "--after-byte",
+            "0",
+            "--seconds",
+            "0",
+            "--sender",
+            "human",
+        ])
+    };
+    let by_file = follow("s-file");
+    assert!(
+        by_file.contains("\"disposition\":\"received\"")
+            && by_file.contains("registered as one file"),
+        "a session registered as a file: {by_file}"
+    );
+    let by_directory = follow("s-main");
+    assert!(
+        by_directory.contains("please build the map"),
+        "a session found inside a registered directory: {by_directory}"
+    );
+}
