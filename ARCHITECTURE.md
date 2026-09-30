@@ -1,0 +1,192 @@
+# Architecture
+
+Ebira indexes JSONL records into a compact corpus and retains byte locations for
+source retrieval. All commands run locally.
+
+## Modules
+
+| Module | Responsibility |
+| --- | --- |
+| `main.rs` | The command table (help and accepted options), defaults, and dispatch |
+| `jsonl.rs` | JSON parsing and scalar field extraction |
+| `core.rs` | Event classification, field selection, and turn state |
+| `format.rs` | Corpus record encoding and decoding |
+| `corpus.rs` | Source discovery, indexing, checkpoints, and generated files |
+| `imports.rs` | Managed JSONL imports and provenance records |
+| `search.rs` | Literal search, timeline reads, raw scans, and context reads |
+| `resume.rs` | Current-turn recovery and the brief recovery view |
+| `said.rs` | The person's own messages, by session, project, agent, or topic |
+| `follow.rs` | Waiting for the next message in another agent's transcript, by sender |
+| `commits.rs` | Commit-name extraction and Git resolution |
+
+The core module receives parsed values and returns state. Filesystem access,
+process execution, JSON parsing, and output formatting remain in the surrounding
+modules.
+
+## Storage
+
+Ebira stores durable imports and generated corpus data under one data directory.
+
+### Durable files
+
+- `managed-imports.tsv`
+- `managed-imports/<import-id>/files.tsv`
+- `managed-imports/<import-id>/jsonl/**`
+
+Registry entries preserve supplied provenance and original source paths. Paths
+to managed files are relative to the data directory.
+
+### Generated files
+
+- `corpus/sources.tsv`
+- `corpus/source-inputs.tsv`
+- `corpus/source-availability.tsv`
+- `corpus/timeline.tsv`
+- `corpus/corpus/*.corpus`
+
+Generated files are tied to a corpus format version. An unsupported version
+returns an error and requires a rebuild from the source JSONL.
+
+## Indexing
+
+`ebira sync` reads the registered sources plus any `--source`. When no corpus
+exists and no source is named, it registers the Claude Code and Codex transcript
+directories that exist (`$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`,
+`$CODEX_HOME/sessions` and `archived_sessions` or the same under `~/.codex`).
+`--rebuild` discards the projection and builds it again; with `--source` the
+given sources replace the registered ones.
+
+Each source file goes through these operations:
+
+```text
+source path
+  -> source kind (a `.claude` or `.codex` directory, else the first records)
+  -> source origin (path, and the opening session_meta record for Codex)
+  -> JSONL record reader
+  -> scalar field extraction
+  -> event kind and sender
+  -> event and turn state
+  -> corpus segment, catalog, and timeline entries
+```
+
+The source catalog stores a checkpoint for each JSONL file. Append-only updates
+resume at the last complete record. An incomplete final line remains pending for
+the next sync. The checkpoint includes the working directory in effect, so an
+appended record without its own `cwd` inherits the thread's, as Codex records
+after `session_meta` and `turn_context` do.
+
+## Senders
+
+The origin of a whole source is decided first: a Claude Code transcript, a
+Claude Code subagent transcript (`subagents/`), a Codex thread, a Codex child
+thread (`parent_thread_id` or a `subagent` source), or a Codex thread started
+by `codex exec`. Each record then gets a sender and a channel (`via`) from its
+own markers:
+
+- Claude Code user records: `isCompactSummary` is a summary, a `tool_result`
+  is a tool result, `isMeta` is injected, subagent transcripts carry the
+  parent's prompts. The remaining text, with `<system-reminder>` blocks
+  removed, is the person's unless it opens with a tag the harness writes
+  (`task-notification`, `agent-message`, `local-command-stdout`, and similar).
+  `queued_command` attachments are the person's prompts typed while the agent
+  was working, unless they are notifications.
+- Codex user messages: child and `codex exec` threads carry another agent's
+  prompts. In other threads, context blocks the app injects
+  (`environment_context`, `codex_internal_context`, `heartbeat`, and similar)
+  are system text, relayed agent messages are agent text, and the rest, with
+  `<in-app-browser-context>` removed, is the person's. Messages in turns named
+  `external-import-turn-*` are copies of another agent's conversation.
+- A message that opens with Claude Code's compaction sentence is a summary in
+  either format.
+
+A person's message is projected as its text only, length-delimited so that
+multi-line text reads back exactly, with images counted rather than stored.
+Only a person's message (or a record in a format without sender markers) opens
+a turn, so notifications, injected context, and summaries stay inside the
+person's turn.
+
+Source replacement, truncation, and changes observed during a sync receive
+separate dispositions. `--rebuild-source` rebuilds one source projection.
+
+The source catalog is written before processing starts so interrupted builds can
+resume pending paths. Partial corpus segments are removed during recovery.
+
+## Managed imports
+
+`ebira import` copies `.jsonl` files into the managed store and writes two
+registries:
+
+- The top-level registry records the import ID, provenance, label, source
+  computer, original path, import time, and managed directory.
+- The per-import registry records each source path, relative managed path, size,
+  and modification time.
+
+Every sync includes all registered managed imports, and `ebira status` lists
+them. Missing or unreadable managed files remain visible through command
+dispositions and status output.
+
+## Source references
+
+Each projected event contains a `SourceRef` with a source ID, byte offset, and
+byte length. `ebira context` uses this location to read the corresponding JSONL
+record. Managed imports resolve to the copied JSONL.
+
+A context read verifies the source state recorded during indexing. Changed
+sources return `source_changed_since_projection`.
+
+## Search
+
+Projection search compares a literal query with selected corpus fields. Tool
+output is shortened to `sync --tool-output-chars` characters (default 300).
+
+Raw search uses corpus entries to select records, then compares the query with
+the original JSONL bytes. The result reports unavailable sources, unreadable
+records, source growth, and the observed time boundary.
+
+Matches are chronological, or newest first with `--order desc`. Filters are
+applied to source, session, role, event kind, sender, and time range. ASCII case
+folding is optional.
+
+`said` reads only events whose sender is the person. A session scope reads the
+segments of the sources that declare the session; the other filters apply to
+event headers. Messages with the same text and timestamp are listed once, and
+imported copies are counted but not listed unless requested.
+
+## Timeline and dates
+
+`timeline.tsv` stores date runs, event counts, session counts, kind counts, and
+record locations. The corpus header records a fixed timezone offset. Builds use
+`EBIRA_TZ_OFFSET`; reads use the offset stored in the corpus.
+
+Timestamps with an explicit zone are converted to the corpus offset. Timestamps
+without a zone keep their written calendar date.
+
+## Turn recovery
+
+Turn state is tracked per session because records from multiple sessions can be
+interleaved. Inferred turn identifiers use the byte offset of the record that
+opened the turn, which keeps them stable across rebuilds.
+
+Resume output reports the observed source boundary, current turn state,
+retention counts, truncation flags, and the next read position. When a session
+id matches a main transcript and its subagent transcripts, the main transcript
+is used. The scan also keeps the person's latest messages, the latest replies
+and tool calls across turns, and the compaction count; `--brief` prints only
+those, reading reply text and tool inputs from the original records.
+
+## Commit lookup
+
+The `commits` command extracts hexadecimal names from projected records and asks
+Git which names resolve to commits in the selected repository. It returns the
+resolved object IDs and the earliest source references for each commit.
+
+## Output
+
+Commands write one JSON object to standard output; `help`, `--version`, and
+`said --format text` write plain text. `disposition` identifies the command
+result. Errors use `disposition: "error"` with a `reason` field and exit with
+status 1. A `next_actions` entry names a command and its options without the
+leading dashes, for example `{"action":"sync","request":{"corpus":...}}`.
+
+Counts and limits describe the current command. Corpus byte totals describe the
+current generated projection.

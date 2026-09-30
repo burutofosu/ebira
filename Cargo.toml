@@ -1,0 +1,13 @@
+[package]
+name = "ebira"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Search and recover Claude Code and Codex conversations from their JSONL transcripts."
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/burutofosu/ebira"
+keywords = ["claude-code", "codex", "agents", "transcripts", "jsonl"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]

@@ -1,0 +1,365 @@
+//! Follow one transcript and return the next messages written to it.
+//!
+//! An agent whose conversation is recorded by Claude Code or Codex can watch
+//! the other agent's transcript directly: no shared folder, no transcription.
+//! The command reads only the raw JSONL of one source, from a byte boundary,
+//! and returns complete records that carry a message from the requested sender,
+//! classified the same way the corpus classifies it.
+//!
+//! The transcript is named by a registered source id, by a session id whose
+//! file lives under one of the registered source roots, or by a path.
+
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+use crate::core::{
+    classify_sender, human_text_from_body, record_meta, select_body, Sender, SourceOrigin,
+};
+use crate::corpus;
+use crate::format::json_string;
+use crate::jsonl::{parse_record, Field, ScalarKind};
+
+pub struct FollowRequest {
+    pub source_id: Option<String>,
+    pub session: Option<String>,
+    pub path: Option<String>,
+    pub after_byte: Option<u64>,
+    pub seconds: u64,
+    /// A sender name, or `any`.
+    pub sender: String,
+    pub prefix: Option<String>,
+    pub limit: usize,
+}
+
+struct Message {
+    sender: &'static str,
+    timestamp: String,
+    byte_start: u64,
+    byte_len: u64,
+    text: String,
+}
+
+struct Target {
+    source_id: String,
+    path: PathBuf,
+    origin: SourceOrigin,
+}
+
+pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
+    let target = resolve_target(root, request)?;
+    let path = target.path.as_path();
+    let size = fs::metadata(path)?.len();
+    let start = request.after_byte.unwrap_or(size).min(size);
+    let mut cursor = align_to_line_start(path, start)?;
+    let deadline = Instant::now() + Duration::from_secs(request.seconds);
+    loop {
+        let (messages, next) = scan(path, target.origin, cursor, request)?;
+        if !messages.is_empty() {
+            print_result("received", &target, next, &messages);
+            return Ok(());
+        }
+        cursor = next;
+        if Instant::now() >= deadline {
+            print_result("waiting", &target, cursor, &messages);
+            return Ok(());
+        }
+        sleep(Duration::from_millis(500));
+    }
+}
+
+/// `--source` wins, then `--source-id` through the catalog, then `--session`
+/// by file name under the registered source roots (newest file wins).
+fn resolve_target(root: &Path, request: &FollowRequest) -> io::Result<Target> {
+    if let Some(path) = &request.path {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("transcript not found: {}", path.display()),
+            ));
+        }
+        return Ok(target(String::new(), path));
+    }
+    if let Some(source_id) = &request.source_id {
+        let catalog = corpus::source_catalog(root)?;
+        let entry = catalog.get(source_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown source id: {}", source_id),
+            )
+        })?;
+        return Ok(target(entry.source_id.clone(), PathBuf::from(&entry.path)));
+    }
+    if let Some(session) = &request.session {
+        if session.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--session is empty",
+            ));
+        }
+        let mut found: Vec<(u64, PathBuf)> = Vec::new();
+        for input in corpus::registered_sources(root)? {
+            collect_session_files(Path::new(&input), session, &mut found, 0)?;
+        }
+        found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        let Some((_, path)) = found.into_iter().next() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no transcript file named by session {}", session),
+            ));
+        };
+        return Ok(target(String::new(), path));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "follow needs --session, --source-id or --source",
+    ))
+}
+
+fn target(source_id: String, path: PathBuf) -> Target {
+    let origin = corpus::origin_for_path(&path);
+    Target {
+        source_id,
+        path,
+        origin,
+    }
+}
+
+fn collect_session_files(
+    dir: &Path,
+    session: &str,
+    found: &mut Vec<(u64, PathBuf)>,
+    depth: usize,
+) -> io::Result<()> {
+    if depth > 8 {
+        return Ok(());
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_files(&path, session, found, depth + 1)?;
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if name.ends_with(".jsonl") && name.contains(session) {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            found.push((modified, path));
+        }
+    }
+    Ok(())
+}
+
+/// Move a caller-supplied boundary forward to the start of the next line.
+fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
+    if cursor == 0 {
+        return Ok(0);
+    }
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if cursor >= size {
+        return Ok(size);
+    }
+    file.seek(SeekFrom::Start(cursor - 1))?;
+    let mut previous = [0u8; 1];
+    file.read_exact(&mut previous)?;
+    if previous[0] == b'\n' {
+        return Ok(cursor);
+    }
+    let mut position = cursor;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(size);
+        }
+        if let Some(index) = buffer[..read].iter().position(|byte| *byte == b'\n') {
+            return Ok(position + index as u64 + 1);
+        }
+        position += read as u64;
+    }
+}
+
+/// Read every complete line after `cursor`; return the messages found and the
+/// boundary after the last line consumed.
+fn scan(
+    path: &Path,
+    origin: SourceOrigin,
+    cursor: u64,
+    request: &FollowRequest,
+) -> io::Result<(Vec<Message>, u64)> {
+    let size = fs::metadata(path)?.len();
+    if size <= cursor {
+        return Ok((Vec::new(), cursor));
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(cursor))?;
+    let mut bytes = Vec::with_capacity((size - cursor) as usize);
+    file.read_to_end(&mut bytes)?;
+    let complete = match bytes.iter().rposition(|byte| *byte == b'\n') {
+        Some(index) => index + 1,
+        None => return Ok((Vec::new(), cursor)),
+    };
+    let mut messages = Vec::new();
+    let mut offset = 0usize;
+    while offset < complete {
+        let end = bytes[offset..complete]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| offset + index)
+            .unwrap_or(complete);
+        let line = trim_cr(&bytes[offset..end]);
+        if !line.is_empty() {
+            let base = cursor + offset as u64;
+            if let Ok(fields) = parse_record(line, base) {
+                if let Some(message) =
+                    message_from_fields(&fields, origin, request, base, line.len() as u64)
+                {
+                    messages.push(message);
+                    if messages.len() >= request.limit {
+                        return Ok((messages, cursor + end as u64 + 1));
+                    }
+                }
+            }
+        }
+        offset = end + 1;
+    }
+    Ok((messages, cursor + complete as u64))
+}
+
+fn trim_cr(line: &[u8]) -> &[u8] {
+    match line.last() {
+        Some(b'\r') => &line[..line.len() - 1],
+        _ => line,
+    }
+}
+
+fn value<'a>(fields: &'a [Field], path: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|field| field.path == path)
+        .map(|field| field.value.as_str())
+}
+
+/// Recognise a message in either transcript format and decide who sent it.
+///
+/// Codex: `/type = response_item`, `/payload/type = message`, text parts under
+/// `/payload/content/<n>/text`. Claude Code: `/type = assistant|user`, text
+/// parts under `/message/content/<n>/text` whose type is `text`, or a plain
+/// string content. A person's message loses the blocks the tools inject into it.
+fn message_from_fields(
+    fields: &[Field],
+    origin: SourceOrigin,
+    request: &FollowRequest,
+    byte_start: u64,
+    byte_len: u64,
+) -> Option<Message> {
+    let record_type = value(fields, "/type")?;
+    let text = if record_type == "response_item" {
+        if value(fields, "/payload/type") != Some("message") {
+            return None;
+        }
+        collect_text(fields, "/payload/content/", &["input_text", "output_text"])
+    } else if record_type == "assistant" || record_type == "user" {
+        let plain = fields
+            .iter()
+            .find(|field| field.path == "/message/content" && field.kind == ScalarKind::String)
+            .map(|field| field.value.clone());
+        match plain {
+            Some(text) => text,
+            None => collect_text(fields, "/message/content/", &["text"]),
+        }
+    } else {
+        return None;
+    };
+    let mut meta = record_meta(fields);
+    classify_sender(origin, fields, &mut meta);
+    if request.sender != "any" && meta.sender.as_str() != request.sender {
+        return None;
+    }
+    let text = if meta.sender == Sender::Human {
+        human_text_from_body(&select_body(fields, &meta, 0)).0
+    } else {
+        text
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    if let Some(prefix) = &request.prefix {
+        if !text.trim_start().starts_with(prefix.as_str()) {
+            return None;
+        }
+    }
+    Some(Message {
+        sender: meta.sender.as_str(),
+        timestamp: value(fields, "/timestamp").unwrap_or("").to_string(),
+        byte_start,
+        byte_len,
+        text,
+    })
+}
+
+/// Join the text parts of a content array whose part type is one of `kinds`.
+fn collect_text(fields: &[Field], content_prefix: &str, kinds: &[&str]) -> String {
+    let mut parts = Vec::new();
+    for field in fields {
+        let Some(rest) = field.path.strip_prefix(content_prefix) else {
+            continue;
+        };
+        let Some(index) = rest.strip_suffix("/text") else {
+            continue;
+        };
+        if index.contains('/') {
+            continue;
+        }
+        let type_path = format!("{}{}/type", content_prefix, index);
+        let part_type = value(fields, &type_path).unwrap_or("");
+        if !kinds.contains(&part_type) {
+            continue;
+        }
+        parts.push(field.value.as_str());
+    }
+    parts.join("\n")
+}
+
+fn print_result(disposition: &str, target: &Target, after_byte: u64, messages: &[Message]) {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "{{\"disposition\":{},\"source_id\":{},\"source_path\":{},\"after_byte\":{},\"messages\":[",
+        json_string(disposition),
+        json_string(&target.source_id),
+        json_string(&target.path.to_string_lossy()),
+        after_byte
+    ));
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&format!(
+            "{{\"sender\":{},\"timestamp\":{},\"byte_start\":{},\"byte_len\":{},\"text\":{}}}",
+            json_string(message.sender),
+            json_string(&message.timestamp),
+            message.byte_start,
+            message.byte_len,
+            json_string(&message.text)
+        ));
+    }
+    output.push_str("]}");
+    println!("{}", output);
+}

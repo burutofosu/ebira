@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ebira full survey"
+  short_description: "Research a scoped historical question"
+  default_prompt: "Use $ebira-full-survey to answer the requested historical question with original sources and relevant coverage."

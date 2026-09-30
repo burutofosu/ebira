@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ebira recent recall"
+  short_description: "Recover missing current-task context"
+  default_prompt: "Use $ebira-recent-recall to recover only the context missing for the next action, then continue the current task."

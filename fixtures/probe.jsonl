@@ -1,0 +1,9 @@
+{"type":"turn_started","session_id":"s1","turn_id":"t1","timestamp":"2026-08-16T00:00:00Z","cwd":"workspace","repository":"workspace"}
+{"event_msg":{"type":"user_message","message":"literal corpus \u65e5\u672c\u8a9e"},"role":"user","session_id":"s1","turn_id":"t1"}
+{"response_item":{"type":"function_call","call_id":"call-1","name":"echo","arguments":{"command":"echo full command"}},"turn_id":"t1"}
+{"response_item":{"type":"function_call_output","call_id":"call-1","stdout":"FULL OUTPUT \u65e5\u672c\u8a9e and the tail must remain searchable: END-OF-OUTPUT"},"turn_id":"t1"}
+{"response_item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant response with the complete context"}]},"turn_id":"t1"}
+{"type":"turn_started","session_id":"s1","turn_id":"t2","timestamp":"2026-08-16T00:01:00Z"}
+{"event_msg":{"type":"user_message","message":"second turn"},"role":"user","session_id":"s1","turn_id":"t2"}
+{"response_item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second answer"}]},"turn_id":"t2"}
+{"type":"broken","message":"unterminated"
