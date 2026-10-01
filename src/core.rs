@@ -1232,294 +1232,6 @@ fn normalize_key(value: &str) -> String {
         .collect()
 }
 
-pub fn civil_from_unix_ms(unix_ms: i64, offset_minutes: i64) -> (i64, u32, u32, u32, u32, u32) {
-    let shifted = unix_ms + offset_minutes * 60_000;
-    let seconds = shifted.div_euclid(1000);
-    let days = seconds.div_euclid(86_400);
-    let second_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    (
-        year,
-        month,
-        day,
-        (second_of_day / 3600) as u32,
-        ((second_of_day % 3600) / 60) as u32,
-        (second_of_day % 60) as u32,
-    )
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    }
-    .div_euclid(146_097);
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_position = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
-    let month = if month_position < 10 {
-        month_position + 3
-    } else {
-        month_position - 9
-    } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
-pub fn parse_timestamp_nanos(timestamp: &str) -> Option<i128> {
-    let timestamp = timestamp.trim();
-    if timestamp.is_empty() {
-        return None;
-    }
-    let date_text = timestamp.get(..10)?;
-    let (year, month, day) = parse_date_parts(date_text)?;
-    let days = days_from_civil(year, month, day);
-    let rest = timestamp.get(10..).unwrap_or_default();
-    if rest.is_empty() {
-        return Some(i128::from(days) * 86_400 * 1_000_000_000);
-    }
-    let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix(' '))?;
-    let timezone_start = rest.char_indices().skip(1).find_map(|(index, character)| {
-        (character == 'Z' || character == 'z' || character == '+' || character == '-')
-            .then_some(index)
-    });
-    let (clock, timezone) = timezone_start
-        .map(|index| (&rest[..index], &rest[index..]))
-        .unwrap_or((rest, ""));
-    let mut clock_parts = clock.split(':');
-    let hour = parse_fixed_u32(clock_parts.next()?)?;
-    let minute = parse_fixed_u32(clock_parts.next()?)?;
-    let second_text = clock_parts.next().unwrap_or("0");
-    if clock_parts.next().is_some() {
-        return None;
-    }
-    let (second_text, fraction_text) = second_text
-        .split_once('.')
-        .map(|(second, fraction)| (second, Some(fraction)))
-        .unwrap_or((second_text, None));
-    let second = parse_fixed_u32(second_text)?;
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let fraction = match fraction_text {
-        Some(text) => parse_fraction_nanos(text)?,
-        None => 0,
-    };
-    let timezone_offset = parse_timezone_offset(timezone)?;
-    let local_seconds = i128::from(days) * 86_400
-        + i128::from(hour) * 3_600
-        + i128::from(minute) * 60
-        + i128::from(second);
-    Some((local_seconds - i128::from(timezone_offset)) * 1_000_000_000 + fraction)
-}
-
-pub fn parse_date_parts(text: &str) -> Option<(i64, u32, u32)> {
-    if text.len() != 10 {
-        return None;
-    }
-    let (year, month, day) =
-        if text.as_bytes().get(4) == Some(&b'-') && text.as_bytes().get(7) == Some(&b'-') {
-            (
-                parse_fixed_u32(text.get(..4)?)? as i64,
-                parse_fixed_u32(text.get(5..7)?)?,
-                parse_fixed_u32(text.get(8..10)?)?,
-            )
-        } else if text.as_bytes().get(2) == Some(&b'/') && text.as_bytes().get(5) == Some(&b'/') {
-            (
-                parse_fixed_u32(text.get(6..10)?)? as i64,
-                parse_fixed_u32(text.get(..2)?)?,
-                parse_fixed_u32(text.get(3..5)?)?,
-            )
-        } else {
-            return None;
-        };
-    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
-        return None;
-    }
-    Some((year, month, day))
-}
-
-pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = (if year >= 0 { year } else { year - 399 }) / 400;
-    let year_of_era = year - era * 400;
-    let month = i64::from(month);
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
-pub fn parse_fixed_u32(text: &str) -> Option<u32> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok()
-}
-
-pub fn parse_fraction_nanos(text: &str) -> Option<i128> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let prefix = &text[..text.len().min(9)];
-    let value = prefix.parse::<i128>().ok()?;
-    let scale = 9usize.saturating_sub(prefix.len());
-    Some(value * 10i128.pow(scale as u32))
-}
-
-pub fn parse_timezone_offset(timezone: &str) -> Option<i64> {
-    if timezone.is_empty() || timezone == "Z" || timezone == "z" {
-        return Some(0);
-    }
-    let sign = match timezone.as_bytes().first()? {
-        b'+' => 1i64,
-        b'-' => -1i64,
-        _ => return None,
-    };
-    let digits = timezone[1..].replace(':', "");
-    if digits.len() != 2 && digits.len() != 4 {
-        return None;
-    }
-    let hour = digits.get(..2)?.parse::<i64>().ok()?;
-    let minute = if digits.len() == 4 {
-        digits.get(2..)?.parse::<i64>().ok()?
-    } else {
-        0
-    };
-    if hour > 23 || minute > 59 {
-        return None;
-    }
-    Some(sign * (hour * 3_600 + minute * 60))
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-pub fn parse_utc_offset(value: &str) -> Option<i64> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("z") || value == "+00:00" || value == "-00:00" {
-        return Some(0);
-    }
-    let bytes = value.as_bytes();
-    if bytes.len() != 6 || (bytes[0] != b'+' && bytes[0] != b'-') || bytes[3] != b':' {
-        return None;
-    }
-    let hours: i64 = value.get(1..3)?.parse().ok()?;
-    let minutes: i64 = value.get(4..6)?.parse().ok()?;
-    if hours > 23 || minutes > 59 {
-        return None;
-    }
-    let magnitude = hours * 60 + minutes;
-    Some(if bytes[0] == b'-' {
-        -magnitude
-    } else {
-        magnitude
-    })
-}
-
-pub fn rfc3339_from_unix_ms(unix_ms: i64, offset_minutes: i64) -> String {
-    let (year, month, day, hour, minute, second) = civil_from_unix_ms(unix_ms, offset_minutes);
-    let sign = if offset_minutes < 0 { '-' } else { '+' };
-    let magnitude = offset_minutes.abs();
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        sign,
-        magnitude / 60,
-        magnitude % 60
-    )
-}
-
-fn ends_in_zulu(timestamp: &str) -> bool {
-    matches!(timestamp.as_bytes().last(), Some(b'Z') | Some(b'z'))
-}
-
-fn is_iso_date(bytes: &[u8]) -> bool {
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[..4].iter().all(u8::is_ascii_digit)
-        && bytes[5..7].iter().all(u8::is_ascii_digit)
-        && bytes[8..].iter().all(u8::is_ascii_digit)
-}
-
-pub fn timestamp_states_offset(timestamp: &str) -> bool {
-    let timestamp = timestamp.trim();
-    let Some(rest) = timestamp.get(10..) else {
-        return false;
-    };
-    let Some(rest) = rest.strip_prefix('T').or_else(|| rest.strip_prefix(' ')) else {
-        return false;
-    };
-    rest.char_indices()
-        .skip(1)
-        .any(|(_, character)| matches!(character, 'Z' | 'z' | '+' | '-'))
-}
-
-pub fn timeline_date(timestamp: &str, offset_minutes: i64) -> String {
-    if offset_minutes == 0 && ends_in_zulu(timestamp) {
-        if let Some(date) = timestamp.get(..10) {
-            if is_iso_date(date.as_bytes()) {
-                return date.to_string();
-            }
-        }
-    }
-    if timestamp_states_offset(timestamp) {
-        if let Some(nanos) = parse_timestamp_nanos(timestamp) {
-            let unix_ms =
-                (nanos / 1_000_000).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-            let (year, month, day, ..) = civil_from_unix_ms(unix_ms, offset_minutes);
-            return format!("{:04}-{:02}-{:02}", year, month, day);
-        }
-    }
-    let Some(date) = timestamp.get(..10) else {
-        return "undated".to_string();
-    };
-    let bytes = date.as_bytes();
-    if bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[..4].iter().all(u8::is_ascii_digit)
-        && bytes[5..7].iter().all(u8::is_ascii_digit)
-        && bytes[8..].iter().all(u8::is_ascii_digit)
-    {
-        date.to_string()
-    } else if bytes.len() == 10
-        && bytes[4] == b'/'
-        && bytes[7] == b'/'
-        && bytes[..4].iter().all(u8::is_ascii_digit)
-        && bytes[5..7].iter().all(u8::is_ascii_digit)
-        && bytes[8..].iter().all(u8::is_ascii_digit)
-    {
-        format!("{}-{}-{}", &date[..4], &date[5..7], &date[8..])
-    } else if bytes.len() == 10
-        && bytes[2] == b'/'
-        && bytes[5] == b'/'
-        && bytes[..2].iter().all(u8::is_ascii_digit)
-        && bytes[3..5].iter().all(u8::is_ascii_digit)
-        && bytes[6..].iter().all(u8::is_ascii_digit)
-    {
-        format!("{}-{}-{}", &date[6..], &date[..2], &date[3..5])
-    } else {
-        "undated".to_string()
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct SourceRef {
     pub source_id: String,
@@ -1925,37 +1637,6 @@ mod tests {
         assert_eq!(meta.event_kind, EventKind::Unknown);
         assert_eq!(meta.role, None);
         assert_eq!(meta.turn, None);
-    }
-
-    #[test]
-    fn civil_conversion_matches_known_instants() {
-        use super::{civil_from_unix_ms, rfc3339_from_unix_ms};
-
-        assert_eq!(civil_from_unix_ms(0, 0), (1970, 1, 1, 0, 0, 0));
-        assert_eq!(
-            rfc3339_from_unix_ms(0, 0),
-            "1970-01-01T00:00:00+00:00".to_string()
-        );
-        let instant = 1_787_011_200_000i64;
-        assert_eq!(civil_from_unix_ms(instant, 0), (2026, 8, 18, 0, 0, 0));
-        assert_eq!(civil_from_unix_ms(instant, 9 * 60), (2026, 8, 18, 9, 0, 0));
-        assert_eq!(
-            civil_from_unix_ms(instant, -5 * 60),
-            (2026, 8, 17, 19, 0, 0)
-        );
-        assert_eq!(
-            rfc3339_from_unix_ms(instant, 9 * 60),
-            "2026-08-18T09:00:00+09:00".to_string()
-        );
-        assert_eq!(
-            rfc3339_from_unix_ms(instant, -5 * 60),
-            "2026-08-17T19:00:00-05:00".to_string()
-        );
-        assert_eq!(
-            civil_from_unix_ms(1_709_164_800_000, 0),
-            (2024, 2, 29, 0, 0, 0)
-        );
-        assert_eq!(civil_from_unix_ms(-1, 0), (1969, 12, 31, 23, 59, 59));
     }
 
     #[test]
@@ -2592,7 +2273,7 @@ mod tests {
     /// how representative records are classified and projected changes with any change to
     /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
     /// here: the next sync then rebuilds every corpus made under the old rules.
-    const RULES_FINGERPRINT: (&str, u64, &str) = ("7", 2, "40eb632a4a07b829");
+    const RULES_FINGERPRINT: (&str, u64, &str) = ("7", 3, "7021927ff4debeec");
 
     #[test]
     fn reading_rules_are_versioned() {
@@ -2844,14 +2525,37 @@ mod tests {
                 vec![("/type", "note"), ("/text", "a format without senders")],
             ),
         ];
-        let mut digest = 0xcbf29ce484222325u64;
+        let mut lines = Vec::new();
         for (origin, pairs) in &records {
             let (sender, via, kind, body) = classified(*origin, pairs);
-            let line = format!("{}|{}|{}|{}\n", sender.as_str(), via, kind.as_str(), body);
-            for byte in line.bytes() {
-                digest ^= u64::from(byte);
-                digest = digest.wrapping_mul(0x100000001b3);
+            lines.push(format!(
+                "{}|{}|{}|{}\n",
+                sender.as_str(),
+                via,
+                kind.as_str(),
+                body
+            ));
+        }
+        // A sync also puts every record on a date for the timeline.
+        for offset_minutes in [0, 9 * 60] {
+            for timestamp in [
+                "2026-08-17T15:00:00Z",
+                "2026-08-17T23:00:00",
+                "2026/08/17 10:00:00",
+                "08/17/2026",
+                "2026-08-17T25:00:00Z",
+                "",
+            ] {
+                lines.push(format!(
+                    "{}\n",
+                    crate::time::date_bucket(timestamp, offset_minutes)
+                ));
             }
+        }
+        let mut digest = 0xcbf29ce484222325u64;
+        for byte in lines.concat().bytes() {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(0x100000001b3);
         }
         let fingerprint = format!("{:016x}", digest);
         assert_eq!(

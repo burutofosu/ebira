@@ -11,6 +11,7 @@ source retrieval. All commands run locally.
 | `jsonl.rs` | JSON parsing and scalar field extraction |
 | `core.rs` | Event classification, field selection, and turn state |
 | `format.rs` | Corpus record encoding and decoding |
+| `time.rs` | Timestamps, dates, offsets, and `--from`/`--to` ranges |
 | `corpus.rs` | Source discovery, indexing, checkpoints, and generated files |
 | `imports.rs` | Managed JSONL imports and provenance records |
 | `search.rs` | Literal search, timeline reads, raw scans, and context reads |
@@ -63,8 +64,8 @@ The logs are the source of truth. The catalog header records the storage format
 made under. A sync that finds another format or other rules rebuilds the corpus
 in full and names the `rebuild_cause`; the rules version changes with any change
 to what a sync writes for the same logs, and a test of `core.rs` fingerprints the
-classification of representative records so that such a change cannot go
-unversioned. An incremental sync keeps the corpus's date offset.
+classification and the dates of representative records so that such a change
+cannot go unversioned. An incremental sync keeps the corpus's date offset.
 
 Each source file goes through these operations:
 
@@ -195,8 +196,13 @@ record locations. The corpus header records a fixed timezone offset. A build fro
 scratch uses `EBIRA_TZ_OFFSET`; incremental syncs and reads use the offset stored
 in the corpus.
 
-Timestamps with an explicit zone are converted to the corpus offset. Timestamps
-without a zone keep their written calendar date.
+Time has one reading, in `time.rs`, used for dates, ordering, and ranges alike. A
+timestamp names an instant; one written without a zone is local time at the corpus
+offset. A record whose timestamp cannot be read is `undated`: it is outside every
+date and every bounded range, and it sorts after the dated records. A `--from` or
+`--to` written as a date is that whole local day; one written as a time is that
+instant. A bound that cannot be read is an error, and so is an `EBIRA_TZ_OFFSET`
+that is not an offset.
 
 ## Turn recovery
 

@@ -29,6 +29,7 @@ pub struct SaidRequest {
     pub fold_ascii_case: bool,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub range: crate::time::Range,
     pub limit: usize,
     pub offset: u64,
     pub newest_first: bool,
@@ -87,10 +88,13 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
         })?;
     }
     found.sort_by(|left, right| {
-        let ordering =
-            crate::search::timestamp_cmp(&left.header.timestamp, &right.header.timestamp)
-                .then_with(|| left.header.source_id.cmp(&right.header.source_id))
-                .then_with(|| left.header.event_index.cmp(&right.header.event_index));
+        let ordering = crate::time::compare(
+            &left.header.timestamp,
+            &right.header.timestamp,
+            request.offset_minutes,
+        )
+        .then_with(|| left.header.source_id.cmp(&right.header.source_id))
+        .then_with(|| left.header.event_index.cmp(&right.header.event_index));
         if request.newest_first {
             ordering.reverse()
         } else {
@@ -316,17 +320,9 @@ fn header_matches(header: &EventHeader, request: &SaidRequest) -> bool {
             return false;
         }
     }
-    if let Some(from) = request.from.as_deref() {
-        if !crate::search::at_or_after(&header.timestamp, from, request.offset_minutes) {
-            return false;
-        }
-    }
-    if let Some(to) = request.to.as_deref() {
-        if !crate::search::at_or_before(&header.timestamp, to, request.offset_minutes) {
-            return false;
-        }
-    }
-    true
+    request
+        .range
+        .contains(&header.timestamp, request.offset_minutes)
 }
 
 fn skip<R: Read>(reader: &mut R, length: u64) -> io::Result<()> {
@@ -365,23 +361,8 @@ fn freshness(scope: &[&SourceEntry]) -> (u64, u64) {
 }
 
 fn local_time(timestamp: &str, offset_minutes: i64) -> String {
-    let Some(nanos) = crate::core::parse_timestamp_nanos(timestamp) else {
-        return timestamp.chars().take(16).collect();
-    };
-    if !crate::core::timestamp_states_offset(timestamp) {
-        return timestamp
-            .chars()
-            .take(16)
-            .collect::<String>()
-            .replace('T', " ");
-    }
-    let unix_ms = (nanos / 1_000_000).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-    let (year, month, day, hour, minute, _) =
-        crate::core::civil_from_unix_ms(unix_ms, offset_minutes);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        year, month, day, hour, minute
-    )
+    crate::time::local_minute(timestamp, offset_minutes)
+        .unwrap_or_else(|| timestamp.chars().take(16).collect())
 }
 
 fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> String {

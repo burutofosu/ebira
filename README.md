@@ -182,7 +182,8 @@ ebira timeline --date 2026-09-14
 
 Queries are literal text; `--ignore-case` folds ASCII letters only. Filters are
 `--session`, `--source-id`, `--sender`, `--role`, `--kind`, `--from`, and `--to`,
-and pages continue with `--offset`. The corpus keeps selected fields and shortens
+and pages continue with `--offset`. A `--from` or `--to` date covers that whole
+local day, and a time such as `2026-09-01T12:00:00+09:00` is that instant. The corpus keeps selected fields and shortens
 tool output (`sync --tool-output-chars`, default 300), so `--raw` compares the
 query with the original records instead:
 
@@ -234,8 +235,9 @@ The corpus is the directory in `EBIRA_CORPUS`, or by default:
 | Linux and macOS | `${XDG_DATA_HOME:-~/.local/share}/ebira/corpus` |
 
 `--corpus <dir>` selects another one. `EBIRA_TZ_OFFSET` (for example `+09:00`)
-sets the offset of the date buckets when the corpus is built; the default is UTC.
-A corpus keeps its offset until it is rebuilt.
+is the local time of the corpus when it is built; the default is UTC. Dates,
+timestamps written without a zone, and `--from`/`--to` dates are read at that
+offset, and a corpus keeps it until it is rebuilt.
 
 The logs are the source of truth and the corpus is a projection of them:
 `sources.tsv` (source catalog and checkpoints), `source-inputs.tsv` (the

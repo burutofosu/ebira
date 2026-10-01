@@ -1,6 +1,7 @@
-use crate::core::{timeline_date, TimelineRef};
+use crate::core::TimelineRef;
 use crate::corpus::{self, SourceEntry, TimelineRun};
 use crate::format::{json_string, parse_event_header, EventHeader};
+use crate::time::{self, Range};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -33,6 +34,8 @@ pub struct SearchRequest {
     pub sender: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// `from` and `to` read as one range (`time::Range`).
+    pub range: Range,
     pub date_limit: usize,
     pub date_offset: u64,
     pub offset_minutes: i64,
@@ -48,6 +51,7 @@ pub struct TimelineRequest {
     pub date: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub range: Range,
     pub source_id: Option<String>,
     pub session: Option<String>,
     pub role: Option<String>,
@@ -114,6 +118,8 @@ struct SearchHit {
     header: EventHeader,
     source_path: String,
     snippet: String,
+    /// The instant of `header.timestamp` at the corpus offset, for ordering.
+    instant: Option<i128>,
 }
 
 #[derive(Default)]
@@ -229,12 +235,12 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
             continue;
         }
         for run in runs {
-            if !timeline_date_in_range(
-                &run.date,
-                request.from.as_deref(),
-                request.to.as_deref(),
-                request.offset_minutes,
-            ) {
+            if !request.range.is_unbounded()
+                && (run.date == "undated"
+                    || !request
+                        .range
+                        .touches_date(&run.date, request.offset_minutes))
+            {
                 continue;
             }
             let bucket = dates.entry(run.date.clone()).or_default();
@@ -259,14 +265,14 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
             if let Some(reference) = run.bucket.first.as_ref() {
                 choose_timeline_pointer(
                     &mut bucket.first,
-                    timeline_hit(source_id, &source_path, reference),
+                    timeline_hit(source_id, &source_path, reference, request.offset_minutes),
                     false,
                 );
             }
             if let Some(reference) = run.bucket.last.as_ref() {
                 choose_timeline_pointer(
                     &mut bucket.last,
-                    timeline_hit(source_id, &source_path, reference),
+                    timeline_hit(source_id, &source_path, reference, request.offset_minutes),
                     true,
                 );
             }
@@ -293,27 +299,6 @@ struct TimelineMapBucket {
     last: Option<SearchHit>,
 }
 
-fn timeline_date_in_range(
-    date: &str,
-    from: Option<&str>,
-    to: Option<&str>,
-    offset_minutes: i64,
-) -> bool {
-    let from = from.map(|bound| timeline_bound_date(bound, offset_minutes));
-    let to = to.map(|bound| timeline_bound_date(bound, offset_minutes));
-    if let Some(from) = from {
-        if date == "undated" || date < from.as_str() {
-            return false;
-        }
-    }
-    if let Some(to) = to {
-        if date == "undated" || date > to.as_str() {
-            return false;
-        }
-    }
-    true
-}
-
 fn timeline_date_order(left: &str, right: &str, order: TimelineOrder) -> Ordering {
     match (left == "undated", right == "undated") {
         (true, true) => Ordering::Equal,
@@ -328,13 +313,6 @@ fn timeline_date_order(left: &str, right: &str, order: TimelineOrder) -> Orderin
             }
         }
     }
-}
-
-fn timeline_bound_date(bound: &str, offset_minutes: i64) -> String {
-    bound
-        .get(..10)
-        .map(|value| timeline_date(value, offset_minutes))
-        .unwrap_or_else(|| bound.to_string())
 }
 
 fn choose_timeline_pointer(target: &mut Option<SearchHit>, candidate: SearchHit, latest: bool) {
@@ -354,19 +332,24 @@ fn choose_timeline_pointer(target: &mut Option<SearchHit>, candidate: SearchHit,
     }
 }
 
+/// Hits in time order: by the instant they name, then by source and position. Records whose
+/// timestamp cannot be read come last.
 fn timeline_hit_order(left: &SearchHit, right: &SearchHit) -> Ordering {
-    let timestamp_order = match (
-        left.header.timestamp.is_empty(),
-        right.header.timestamp.is_empty(),
-    ) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        (false, false) => timestamp_order(&left.header.timestamp, &right.header.timestamp),
-    };
-    timestamp_order
+    instant_order(left, right)
         .then_with(|| left.header.source_id.cmp(&right.header.source_id))
         .then_with(|| left.header.event_index.cmp(&right.header.event_index))
+}
+
+fn instant_order(left: &SearchHit, right: &SearchHit) -> Ordering {
+    match (left.instant, right.instant) {
+        (Some(left_at), Some(right_at)) => left_at
+            .cmp(&right_at)
+            .then_with(|| left.header.timestamp.cmp(&right.header.timestamp)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => (left.header.timestamp.is_empty(), &left.header.timestamp)
+            .cmp(&(right.header.timestamp.is_empty(), &right.header.timestamp)),
+    }
 }
 
 /// Search pages: chronological by default, newest first with `--order desc`. Records without
@@ -375,17 +358,8 @@ fn search_hit_order(left: &SearchHit, right: &SearchHit, newest_first: bool) -> 
     if !newest_first {
         return timeline_hit_order(left, right);
     }
-    match (
-        left.header.timestamp.is_empty(),
-        right.header.timestamp.is_empty(),
-    ) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        (false, false) => timestamp_order(&right.header.timestamp, &left.header.timestamp),
-    }
-    .then_with(|| right.header.source_id.cmp(&left.header.source_id))
-    .then_with(|| right.header.event_index.cmp(&left.header.event_index))
+    let readable_first = left.instant.is_none().cmp(&right.instant.is_none());
+    readable_first.then_with(|| timeline_hit_order(right, left))
 }
 
 fn timeline_order(left: &SearchHit, right: &SearchHit, order: TimelineOrder) -> Ordering {
@@ -451,8 +425,14 @@ impl TimelinePage {
     }
 }
 
-fn timeline_hit(source_id: &str, source_path: &str, reference: &TimelineRef) -> SearchHit {
+fn timeline_hit(
+    source_id: &str,
+    source_path: &str,
+    reference: &TimelineRef,
+    offset_minutes: i64,
+) -> SearchHit {
     SearchHit {
+        instant: time::instant(&reference.timestamp, offset_minutes),
         header: EventHeader {
             event_index: reference.event_index,
             source_id: source_id.to_string(),
@@ -729,7 +709,7 @@ fn scan_timeline_run(
             ));
         }
         current_offset = current_offset.saturating_add(1);
-        if timeline_date(&header.timestamp, request.offset_minutes) != run.date
+        if time::date_bucket(&header.timestamp, request.offset_minutes) != run.date
             || request
                 .session
                 .as_deref()
@@ -750,20 +730,14 @@ fn scan_timeline_run(
                 .as_deref()
                 .map(|sender| header.sender != sender)
                 .unwrap_or(false)
-            || request
-                .from
-                .as_deref()
-                .map(|from| !timestamp_at_or_after(&header.timestamp, from, request.offset_minutes))
-                .unwrap_or(false)
-            || request
-                .to
-                .as_deref()
-                .map(|to| !timestamp_at_or_before(&header.timestamp, to, request.offset_minutes))
-                .unwrap_or(false)
+            || !request
+                .range
+                .contains(&header.timestamp, request.offset_minutes)
         {
             continue;
         }
         page.push(SearchHit {
+            instant: time::instant(&header.timestamp, request.offset_minutes),
             header,
             source_path: source_path.to_string(),
             snippet: head,
@@ -1654,9 +1628,10 @@ fn scan_file(
                 .sender
                 .entry(header.sender.clone())
                 .or_default() += 1;
-            let date = date_key(&header.timestamp, request.offset_minutes);
+            let date = time::date_bucket(&header.timestamp, request.offset_minutes);
             *stats.facets.date.entry(date.clone()).or_default() += 1;
             let hit = SearchHit {
+                instant: time::instant(&header.timestamp, request.offset_minutes),
                 header,
                 source_path,
                 snippet,
@@ -1748,6 +1723,7 @@ struct Coverage {
     unscanned_source_bytes: u64,
     scanned_records: u64,
     raw: bool,
+    offset_minutes: i64,
 }
 
 impl Coverage {
@@ -1821,8 +1797,7 @@ impl Coverage {
             number(output, "scanned_records", self.scanned_records);
         }
         field(output, "coverage_disposition", self.disposition(), false);
-        let offset = display_offset_minutes();
-        let render = |instant: u64| crate::core::rfc3339_from_unix_ms(instant as i64, offset);
+        let render = |instant: u64| time::rfc3339_from_unix_ms(instant as i64, self.offset_minutes);
         optional_field(
             output,
             "synced_through",
@@ -1834,13 +1809,6 @@ impl Coverage {
             self.absence_settled_through_ms().map(render).as_deref(),
         );
     }
-}
-
-fn display_offset_minutes() -> i64 {
-    std::env::var("EBIRA_TZ_OFFSET")
-        .ok()
-        .and_then(|value| crate::core::parse_utc_offset(&value))
-        .unwrap_or(0)
 }
 
 fn coverage_stats(
@@ -1866,6 +1834,7 @@ fn coverage_stats(
         synced_through_ms: None,
         scanned_records: stats.scanned_records,
         raw: request.raw,
+        offset_minutes: request.offset_minutes,
     };
     let mut unreachable = stats.unreachable_sources.clone();
     let availability = corpus::source_availability(root)?;
@@ -1983,94 +1952,9 @@ fn matches_filters(header: &EventHeader, request: &SearchRequest) -> bool {
             return false;
         }
     }
-    if let Some(from) = request.from.as_deref() {
-        if !timestamp_at_or_after(&header.timestamp, from, request.offset_minutes) {
-            return false;
-        }
-    }
-    if let Some(to) = request.to.as_deref() {
-        if !timestamp_at_or_before(&header.timestamp, to, request.offset_minutes) {
-            return false;
-        }
-    }
-    true
-}
-
-pub(crate) fn timestamp_cmp(left: &str, right: &str) -> Ordering {
-    timestamp_order(left, right)
-}
-
-pub(crate) fn at_or_after(timestamp: &str, bound: &str, offset_minutes: i64) -> bool {
-    timestamp_at_or_after(timestamp, bound, offset_minutes)
-}
-
-pub(crate) fn at_or_before(timestamp: &str, bound: &str, offset_minutes: i64) -> bool {
-    timestamp_at_or_before(timestamp, bound, offset_minutes)
-}
-
-fn date_key(timestamp: &str, offset_minutes: i64) -> String {
-    timeline_date(timestamp, offset_minutes)
-}
-
-fn timestamp_order(left: &str, right: &str) -> Ordering {
-    match (
-        crate::core::parse_timestamp_nanos(left),
-        crate::core::parse_timestamp_nanos(right),
-    ) {
-        (Some(left_value), Some(right_value)) => {
-            left_value.cmp(&right_value).then_with(|| left.cmp(right))
-        }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => left.cmp(right),
-    }
-}
-
-fn instant_nanos(value: &str, offset_minutes: i64) -> Option<i128> {
-    let nanos = crate::core::parse_timestamp_nanos(value)?;
-    if crate::core::timestamp_states_offset(value) {
-        Some(nanos)
-    } else {
-        Some(nanos - i128::from(offset_minutes) * 60_000_000_000)
-    }
-}
-
-fn timestamp_at_or_after(timestamp: &str, bound: &str, offset_minutes: i64) -> bool {
-    if timestamp.is_empty() {
-        return false;
-    }
-    if bound.len() == 10 {
-        let date = date_key(timestamp, offset_minutes);
-        let bound = date_key(bound, offset_minutes);
-        date != "undated" && bound != "undated" && date >= bound
-    } else {
-        match (
-            instant_nanos(timestamp, offset_minutes),
-            instant_nanos(bound, offset_minutes),
-        ) {
-            (Some(timestamp), Some(bound)) => timestamp >= bound,
-            _ => timestamp >= bound,
-        }
-    }
-}
-
-fn timestamp_at_or_before(timestamp: &str, bound: &str, offset_minutes: i64) -> bool {
-    if timestamp.is_empty() {
-        return false;
-    }
-    if bound.len() == 10 {
-        let date = date_key(timestamp, offset_minutes);
-        let bound = date_key(bound, offset_minutes);
-        date != "undated" && bound != "undated" && date <= bound
-    } else {
-        match (
-            instant_nanos(timestamp, offset_minutes),
-            instant_nanos(bound, offset_minutes),
-        ) {
-            (Some(timestamp), Some(bound)) => timestamp <= bound,
-            _ => timestamp <= bound,
-        }
-    }
+    request
+        .range
+        .contains(&header.timestamp, request.offset_minutes)
 }
 
 fn scan_body<R: Read>(
@@ -2257,7 +2141,7 @@ fn boolean(output: &mut String, key: &str, value: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        date_key, history_map_json, run, scan_sequential, scan_timeline_run, search_page, Coverage,
+        history_map_json, run, scan_sequential, scan_timeline_run, search_page, Coverage,
         SearchHit, SearchRequest, SearchStats, TimelineBucket as SearchTimelineBucket,
         TimelineOrder, TimelinePage, TimelineRequest,
     };
@@ -2266,60 +2150,6 @@ mod tests {
     use crate::format::{event_header_line, EventHeader};
     use std::fs::{self, File};
     use std::io::Write;
-
-    #[test]
-    fn date_key_normalizes_common_log_timestamp_shapes() {
-        assert_eq!(date_key("2026-02-22T10:21:39Z", 0), "2026-02-22");
-        assert_eq!(date_key("2026/02/22 10:21:39", 0), "2026-02-22");
-        assert_eq!(date_key("02/22/2026 10:21:39", 0), "2026-02-22");
-        assert_eq!(date_key("not-a-date", 0), "undated");
-
-        assert_eq!(date_key("2026-08-18T01:00:00+09:00", 0), "2026-08-17");
-        assert_eq!(date_key("2026-08-18T01:00:00+09:00", 9 * 60), "2026-08-18");
-        assert_eq!(date_key("2026-02-22 23:30:00", 9 * 60), "2026-02-22");
-    }
-
-    #[test]
-    fn zoneless_timestamp_uses_bucket_offset() {
-        let offset = 540;
-        let zoneless = "2026-08-18T20:00:00";
-        assert_eq!(super::date_key(zoneless, offset), "2026-08-18");
-        assert!(super::timestamp_at_or_after(
-            zoneless,
-            "2026-08-18T00:00:00+09:00",
-            offset
-        ));
-        assert!(super::timestamp_at_or_before(
-            zoneless,
-            "2026-08-18T23:59:59+09:00",
-            offset
-        ));
-        assert!(!super::timestamp_at_or_after(
-            zoneless,
-            "2026-08-19T00:00:00+09:00",
-            offset
-        ));
-        let zoned = "2026-08-18T20:00:00Z";
-        assert_eq!(super::date_key(zoned, offset), "2026-08-19");
-        assert!(super::timestamp_at_or_after(
-            zoned,
-            "2026-08-19T00:00:00+09:00",
-            offset
-        ));
-    }
-
-    #[test]
-    fn timestamp_order_uses_the_instant_when_offsets_differ() {
-        assert_eq!(
-            super::timestamp_order("2026-02-22T00:00:00+09:00", "2026-02-21T16:00:00Z"),
-            std::cmp::Ordering::Less
-        );
-        assert!(super::timestamp_at_or_after(
-            "2026-02-22T00:00:00+09:00",
-            "2026-02-21T14:59:59Z",
-            0
-        ));
-    }
 
     #[test]
     fn timeline_defaults_to_recent_dates_first() {
@@ -2339,6 +2169,7 @@ mod tests {
             synced_through_ms: Some(1_787_011_200_000),
             scanned_records: 1,
             raw,
+            offset_minutes: 0,
         }
     }
 
@@ -2470,6 +2301,7 @@ mod tests {
             ..SearchRequest::default()
         };
         let hit = |timestamp: &str, event_index: u64| SearchHit {
+            instant: crate::time::instant(timestamp, 0),
             header: EventHeader {
                 timestamp: timestamp.to_string(),
                 event_index,
@@ -2546,6 +2378,8 @@ mod tests {
         let request = TimelineRequest {
             date: Some("2026-02-22".to_string()),
             from: Some("2026-02-22T10:30:00Z".to_string()),
+            range: crate::time::Range::parse(Some("2026-02-22T10:30:00Z"), None, 0)
+                .expect("parse range"),
             limit: 10,
             ..TimelineRequest::default()
         };

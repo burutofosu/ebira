@@ -1,7 +1,6 @@
 use crate::core::{
-    classify_sender, record_meta, select_body, timeline_date, EventKind, IngestCheckpoint,
-    IngestStateMachine, RecordMeta, SessionTurn, SourceOrigin, TimelineBucket, TimelineRef,
-    TurnReducerState,
+    classify_sender, record_meta, select_body, EventKind, IngestCheckpoint, IngestStateMachine,
+    RecordMeta, SessionTurn, SourceOrigin, TimelineBucket, TimelineRef, TurnReducerState,
 };
 use crate::format::{
     decode_token, encode_token, event_header_line, json_string, parse_event_header, push_field,
@@ -231,7 +230,7 @@ pub fn build_with_preview(
     let offset_minutes = if incremental && !previous.is_empty() {
         corpus_offset_minutes(corpus)?
     } else {
-        configured_offset_minutes()
+        crate::time::configured_offset_minutes()?
     };
     let catalog_path = corpus.join("sources.tsv");
     let catalog_partial_path = corpus.join("sources.tsv.partial");
@@ -897,7 +896,7 @@ impl TimelineAccumulator {
     }
 
     fn observe(&mut self, corpus_start: u64, corpus_end: u64, header: &EventHeader) {
-        let date = timeline_date(&header.timestamp, self.offset_minutes);
+        let date = crate::time::date_bucket(&header.timestamp, self.offset_minutes);
         let new_run = self
             .current
             .as_ref()
@@ -1201,33 +1200,22 @@ fn process_source(
     })
 }
 
-pub fn configured_offset_minutes() -> i64 {
-    std::env::var("EBIRA_TZ_OFFSET")
-        .ok()
-        .and_then(|value| crate::core::parse_utc_offset(&value))
-        .unwrap_or(0)
-}
-
 fn source_catalog_header(offset_minutes: i64) -> String {
-    let sign = if offset_minutes < 0 { '-' } else { '+' };
-    let magnitude = offset_minutes.abs();
     format!(
-        "{}\ttz={}{:02}:{:02}\trules={}",
+        "{}\ttz={}\trules={}",
         source_catalog_version(),
-        sign,
-        magnitude / 60,
-        magnitude % 60,
+        crate::time::format_offset(offset_minutes),
         RULES_VERSION
     )
 }
 
 /// The version of how records are read: which fields are kept, who sent each record, how
-/// turns are told apart. The logs are the source of truth and the corpus is a projection of
+/// turns are told apart, which date each record is on. The logs are the source of truth and the corpus is a projection of
 /// them, so a corpus made under other rules is rebuilt by the next `ebira sync`.
 ///
 /// Increase it with every change to what a sync writes for the same logs, together with
 /// `RULES_FINGERPRINT` in the tests of `core.rs`, which fails until both are updated.
-pub const RULES_VERSION: u64 = 2;
+pub const RULES_VERSION: u64 = 3;
 
 /// How a corpus on disk relates to this build of Ebira.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1310,7 +1298,7 @@ fn parse_catalog_header(line: &str, path: &Path) -> io::Result<i64> {
     let offset = parts
         .next()
         .and_then(|part| part.strip_prefix("tz="))
-        .and_then(crate::core::parse_utc_offset);
+        .and_then(crate::time::parse_offset);
     offset.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

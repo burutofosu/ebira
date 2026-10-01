@@ -28,6 +28,8 @@ pub struct CommitRequest {
     pub repo: String,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub range: crate::time::Range,
+    pub offset_minutes: i64,
     pub limit: usize,
     pub offset: u64,
 }
@@ -276,24 +278,7 @@ fn take_run(body: &[u8], begin: usize, end: usize, has_letter: bool, found: &mut
 }
 
 fn timestamp_within(timestamp: &str, request: &CommitRequest) -> bool {
-    if request.from.is_none() && request.to.is_none() {
-        return true;
-    }
-    if timestamp.is_empty() {
-        return false;
-    }
-    let day = timestamp.get(..10).unwrap_or("");
-    if let Some(from) = request.from.as_deref() {
-        if day < from.get(..10).unwrap_or(from) {
-            return false;
-        }
-    }
-    if let Some(to) = request.to.as_deref() {
-        if day > to.get(..10).unwrap_or(to) {
-            return false;
-        }
-    }
-    true
+    request.range.contains(timestamp, request.offset_minutes)
 }
 
 fn read_body<R: Read>(

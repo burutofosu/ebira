@@ -57,8 +57,9 @@ pub fn resume(
     brief: bool,
 ) -> io::Result<()> {
     let catalog = corpus::source_catalog(root)?;
+    let offset_minutes = corpus::corpus_offset_minutes(root)?;
     let last_event_at = if requested_source_id.is_none() {
-        candidate_last_event_times(root)?
+        candidate_last_event_times(root, offset_minutes)?
     } else {
         BTreeMap::new()
     };
@@ -72,11 +73,11 @@ pub fn resume(
         }
         None => {
             let candidates = if let Some(session) = requested_session {
-                session_candidates(&catalog, &last_event_at, session)
+                session_candidates(&catalog, &last_event_at, session, offset_minutes)
             } else {
                 {
                     let mut all = catalog.keys().cloned().collect::<Vec<_>>();
-                    sort_by_recency(&catalog, &last_event_at, &mut all);
+                    sort_by_recency(&catalog, &last_event_at, &mut all, offset_minutes);
                     all
                 }
             };
@@ -836,34 +837,40 @@ fn sort_by_recency(
     catalog: &BTreeMap<String, SourceEntry>,
     last_event_at: &BTreeMap<String, String>,
     candidates: &mut [String],
+    offset_minutes: i64,
 ) {
     candidates.sort_by(|left, right| {
-        candidate_event_order(last_event_at.get(right), last_event_at.get(left))
-            .then_with(|| {
-                let modified =
-                    |id: &String| catalog.get(id).map(|entry| entry.modified_ms).unwrap_or(0);
-                modified(right).cmp(&modified(left))
-            })
-            .then_with(|| left.cmp(right))
+        candidate_event_order(
+            last_event_at.get(right),
+            last_event_at.get(left),
+            offset_minutes,
+        )
+        .then_with(|| {
+            let modified =
+                |id: &String| catalog.get(id).map(|entry| entry.modified_ms).unwrap_or(0);
+            modified(right).cmp(&modified(left))
+        })
+        .then_with(|| left.cmp(right))
     });
 }
 
-fn candidate_event_order(left: Option<&String>, right: Option<&String>) -> std::cmp::Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => match (
-            crate::core::parse_timestamp_nanos(left),
-            crate::core::parse_timestamp_nanos(right),
-        ) {
-            (Some(left), Some(right)) => left.cmp(&right),
-            _ => left.cmp(right),
-        },
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (None, None) => std::cmp::Ordering::Equal,
-    }
+/// Which of two last-event timestamps is later; one that is absent or cannot be read is the
+/// earlier.
+fn candidate_event_order(
+    left: Option<&String>,
+    right: Option<&String>,
+    offset_minutes: i64,
+) -> std::cmp::Ordering {
+    let at = |value: Option<&String>| {
+        value.and_then(|timestamp| crate::time::instant(timestamp, offset_minutes))
+    };
+    at(left).cmp(&at(right))
 }
 
-fn candidate_last_event_times(root: &Path) -> io::Result<BTreeMap<String, String>> {
+fn candidate_last_event_times(
+    root: &Path,
+    offset_minutes: i64,
+) -> io::Result<BTreeMap<String, String>> {
     let timeline = corpus::timeline_catalog(root)?;
     let mut times = BTreeMap::new();
     for (source_id, runs) in timeline {
@@ -876,8 +883,11 @@ fn candidate_last_event_times(root: &Path) -> io::Result<BTreeMap<String, String
             let replace = times
                 .get(&source_id)
                 .map(|current| {
-                    candidate_event_order(Some(&timestamp.to_string()), Some(current))
-                        == std::cmp::Ordering::Greater
+                    candidate_event_order(
+                        Some(&timestamp.to_string()),
+                        Some(current),
+                        offset_minutes,
+                    ) == std::cmp::Ordering::Greater
                 })
                 .unwrap_or(true);
             if replace {
@@ -892,6 +902,7 @@ fn session_candidates(
     catalog: &BTreeMap<String, SourceEntry>,
     last_event_at: &BTreeMap<String, String>,
     session: &str,
+    offset_minutes: i64,
 ) -> Vec<String> {
     let mut candidates = Vec::new();
     for entry in catalog.values() {
@@ -901,7 +912,7 @@ fn session_candidates(
     }
     candidates.sort();
     candidates.dedup();
-    sort_by_recency(catalog, last_event_at, &mut candidates);
+    sort_by_recency(catalog, last_event_at, &mut candidates, offset_minutes);
     candidates
 }
 

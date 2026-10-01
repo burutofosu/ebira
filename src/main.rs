@@ -8,6 +8,7 @@ mod jsonl;
 mod resume;
 mod said;
 mod search;
+mod time;
 
 use search::SearchRequest;
 use std::io;
@@ -490,10 +491,14 @@ fn run(args: &[String]) -> io::Result<()> {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
             let _lock = corpus::lock_shared(&root)?;
+            let offset_minutes = corpus::corpus_offset_minutes(&root)?;
+            let (from, to, range) = range_options(args, offset_minutes)?;
             let request = commits::CommitRequest {
                 repo: one_option(args, "--repo")?,
-                from: option_values(args, "--from").into_iter().next(),
-                to: option_values(args, "--to").into_iter().next(),
+                from,
+                to,
+                range,
+                offset_minutes,
                 limit: number_option(args, "--limit", 50)?,
                 offset: number_option_u64_optional(args, "--offset")?,
             };
@@ -516,6 +521,8 @@ fn run(args: &[String]) -> io::Result<()> {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
             let _lock = corpus::lock_shared(&root)?;
+            let offset_minutes = corpus::corpus_offset_minutes(&root)?;
+            let (from, to, range) = range_options(args, offset_minutes)?;
             let request = said::SaidRequest {
                 session: option_values(args, "--session").into_iter().next(),
                 source_id: option_values(args, "--source-id").into_iter().next(),
@@ -523,8 +530,9 @@ fn run(args: &[String]) -> io::Result<()> {
                 agent: option_values(args, "--agent").into_iter().next(),
                 query: option_values(args, "--query").into_iter().next(),
                 fold_ascii_case: has_flag(args, "--ignore-case"),
-                from: option_values(args, "--from").into_iter().next(),
-                to: option_values(args, "--to").into_iter().next(),
+                from,
+                to,
+                range,
                 // Defaults keep one page inside a 30,000-character tool output in either format.
                 limit: number_option(args, "--limit", 30)?,
                 offset: number_option_u64_optional(args, "--offset")?,
@@ -544,7 +552,7 @@ fn run(args: &[String]) -> io::Result<()> {
                         ))
                     }
                 },
-                offset_minutes: corpus::corpus_offset_minutes(&root)?,
+                offset_minutes,
                 include_imported: has_flag(args, "--include-imported"),
             };
             if let Some(agent) = request.agent.as_deref() {
@@ -705,6 +713,7 @@ fn search_request(
     operation: &str,
     offset_minutes: i64,
 ) -> io::Result<SearchRequest> {
+    let (from, to, range) = range_options(args, offset_minutes)?;
     Ok(SearchRequest {
         offset_minutes,
         query: one_option(args, "--query")?,
@@ -716,14 +725,26 @@ fn search_request(
         role: option_values(args, "--role").into_iter().next(),
         kind: option_values(args, "--kind").into_iter().next(),
         sender: sender_option(args)?,
-        from: option_values(args, "--from").into_iter().next(),
-        to: option_values(args, "--to").into_iter().next(),
+        from,
+        to,
+        range,
         date_limit: number_option(args, "--date-limit", 12)?,
         date_offset: number_option_u64_optional(args, "--date-offset")?,
         raw: has_flag(args, "--raw"),
         fold_ascii_case: has_flag(args, "--ignore-case"),
         newest_first: order_option(args, false)?,
     })
+}
+
+/// `--from` and `--to` as typed, for echoing back in next actions, and the range they name.
+fn range_options(
+    args: &[String],
+    offset_minutes: i64,
+) -> io::Result<(Option<String>, Option<String>, time::Range)> {
+    let from = option_values(args, "--from").into_iter().next();
+    let to = option_values(args, "--to").into_iter().next();
+    let range = time::Range::parse(from.as_deref(), to.as_deref(), offset_minutes)?;
+    Ok((from, to, range))
 }
 
 /// `--order desc` puts the newest first; `default_newest` applies when --order is absent.
@@ -803,11 +824,13 @@ fn timeline_request(args: &[String], offset_minutes: i64) -> io::Result<search::
             ))
         }
     };
+    let (from, to, range) = range_options(args, offset_minutes)?;
     Ok(search::TimelineRequest {
         offset_minutes,
         date: date.clone(),
-        from: option_values(args, "--from").into_iter().next(),
-        to: option_values(args, "--to").into_iter().next(),
+        from,
+        to,
+        range,
         source_id: option_values(args, "--source-id").into_iter().next(),
         session: option_values(args, "--session").into_iter().next(),
         role: option_values(args, "--role").into_iter().next(),
