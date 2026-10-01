@@ -107,7 +107,9 @@ transcript itself while it waits. It reads with the reader a sync uses
 (`corpus::LogReader`), starting from the checkpoint the catalog holds for that
 transcript while the transcript is still the file the corpus read, and from its
 start otherwise. Its messages carry the sender, channel, timestamp, and byte
-range the corpus gives the same records.
+range the corpus gives the same records. Before it reads on from a cursor, it
+reads the person's messages in the last lines before it, so a message written as
+two records is returned once even when an earlier call returned the first.
 
 ## Senders
 

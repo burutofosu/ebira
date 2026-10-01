@@ -897,3 +897,80 @@ fn follow_does_not_carry_the_state_of_a_replaced_log() {
     );
     std::fs::remove_dir_all(root).expect("remove test root");
 }
+
+/// The value of `"after_byte"` in a follow result.
+fn after_byte(output: &str) -> String {
+    let start = output.find("\"after_byte\":").expect("after_byte") + "\"after_byte\":".len();
+    output[start..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .expect("a number")
+        .to_string()
+}
+
+#[test]
+fn follow_returns_a_message_written_twice_once_across_calls() {
+    let root = std::env::temp_dir().join(format!("ebira-sender-across-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let sessions = root.join(".codex").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create session directory");
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    let event = |text: &str| {
+        format!(
+            r#"{{"timestamp":"2026-09-01T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"{text}"}}}}"#
+        )
+    };
+    let item = |text: &str| {
+        format!(
+            r#"{{"timestamp":"2026-09-01T00:00:01Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
+        )
+    };
+    let meta = r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"c-across","originator":"Codex Desktop","source":"vscode"}}"#;
+    // Either record of the message can be written first.
+    for (first, second) in [
+        (event("hello"), item("hello")),
+        (item("hello"), event("hello")),
+    ] {
+        let log = sessions.join("rollout-2026-09-01T00-00-00-c-across.jsonl");
+        std::fs::write(&log, format!("{meta}\n{first}\n")).expect("write rollout");
+        run(&[
+            "sync",
+            "--corpus",
+            corpus,
+            "--source",
+            sessions.to_str().expect("utf-8 path"),
+        ]);
+        let follow = |after: &str| {
+            run(&[
+                "follow",
+                "--corpus",
+                corpus,
+                "--source",
+                log.to_str().expect("utf-8 path"),
+                "--after-byte",
+                after,
+                "--seconds",
+                "0",
+                "--sender",
+                "human",
+            ])
+        };
+        let returned = follow("0");
+        assert!(returned.contains("\"text\":\"hello\""), "{returned}");
+        // The other record of the same message arrives after the call, then a new message.
+        let mut contents = std::fs::read_to_string(&log).expect("read rollout");
+        contents.push_str(&format!("{second}\n{}\n", item("next")));
+        std::fs::write(&log, contents).expect("append to rollout");
+        let continued = follow(&after_byte(&returned));
+        assert!(
+            !continued.contains("\"text\":\"hello\"") && continued.contains("\"text\":\"next\""),
+            "a message already returned is not returned again: {continued}"
+        );
+        let said = run(&["said", "--corpus", corpus]);
+        assert!(said.contains("\"total_messages\":1"), "{said}");
+        std::fs::remove_file(&log).expect("remove rollout");
+        let _ = std::fs::remove_dir_all(root.join("corpus"));
+    }
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
