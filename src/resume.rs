@@ -1,9 +1,9 @@
 use crate::core::{
-    body_fields, human_text_from_body, EventKind, RecoveryEvent, RecoverySnapshot, RecoveryState,
+    human_text_from_body, is_tool_call, EventKind, RecoveryEvent, RecoverySnapshot, RecoveryState,
     Sender, SourceRef,
 };
 use crate::corpus::{self, SourceEntry};
-use crate::format::{json_string, parse_event_header};
+use crate::format::{body_fields, json_string, parse_event_header, push_field};
 use crate::jsonl::{parse_record, Field};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -264,7 +264,8 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
                 skip_body_and_separator(&mut reader, header.body_len)?;
                 continue;
             }
-            let (body, body_truncated) = read_body(&mut reader, header.body_len)?;
+            let (body, read_truncated) = read_body(&mut reader, header.body_len)?;
+            let body_truncated = read_truncated || header.body_cut;
             let event = RecoveryEvent {
                 event_index: header.event_index,
                 source_ref: SourceRef {
@@ -296,8 +297,7 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
                 keep_last(&mut recent_assistants, &event, KEPT_RECENT_ASSISTANTS);
             }
             // The call itself (Claude tool_use, Codex *_call), not begin/end progress events.
-            let is_call = (event.kind == EventKind::Command && event.event_type.ends_with("call"))
-                || (event.kind == EventKind::Assistant && event.body.contains("\ttool_use\n"));
+            let is_call = is_tool_call(event.kind, &event.event_type, &event.body);
             if is_call {
                 keep_last(&mut recent_commands, &event, BRIEF_COMMANDS);
             }
@@ -651,10 +651,7 @@ fn embedded_messages(event: &RecoveryEvent) -> Vec<RecoveryEvent> {
             if field_path == &format!("{}/text", prefix)
                 || field_path == &format!("{}/message", prefix)
             {
-                body.push_str(field_path);
-                body.push('\t');
-                body.push_str(field_value);
-                body.push('\n');
+                push_field(&mut body, field_path, field_value);
             }
         }
         if body.is_empty() {
@@ -699,9 +696,7 @@ fn read_body<R: Read>(reader: &mut R, body_len: u64) -> io::Result<(String, bool
             "corpus event separator is missing",
         ));
     }
-    let body = String::from_utf8_lossy(&bytes).into_owned();
-    let truncated = read_truncated || body.contains(crate::core::PROJECTION_BOUND_MARKER);
-    Ok((body, truncated))
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), read_truncated))
 }
 
 fn skip_body_and_separator<R: Read>(reader: &mut R, body_len: u64) -> io::Result<()> {
@@ -1046,19 +1041,17 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn bounded_projection_body_is_reported_as_truncated() {
-        let bounded = format!("/output\tabc{}\n", crate::core::PROJECTION_BOUND_MARKER);
-        let mut reader = std::io::Cursor::new(format!("{}\n", bounded).into_bytes());
-        let (body, truncated) =
-            read_body(&mut reader, bounded.len() as u64).expect("read bounded body");
-        assert_eq!(body, bounded);
-        assert!(truncated);
-
-        let whole = "/output\tabc\n";
-        let mut reader = std::io::Cursor::new(format!("{}\n", whole).into_bytes());
-        let (body, truncated) =
-            read_body(&mut reader, whole.len() as u64).expect("read whole body");
-        assert_eq!(body, whole);
+    fn a_body_read_whole_is_not_truncated_by_its_text() {
+        // Text that happens to contain the marker is not a cut; the header says what was cut.
+        let mut body = String::new();
+        crate::format::push_field(
+            &mut body,
+            "/output",
+            &format!("abc{}", crate::core::PROJECTION_BOUND_MARKER),
+        );
+        let mut reader = std::io::Cursor::new(format!("{}\n", body).into_bytes());
+        let (read, truncated) = read_body(&mut reader, body.len() as u64).expect("read body");
+        assert_eq!(read, body);
         assert!(!truncated);
     }
 
@@ -1130,7 +1123,7 @@ mod tests {
     fn recent_resume_window_keeps_the_latest_turn() {
         let root =
             std::env::temp_dir().join(format!("ebira-resume-recent-window-{}", std::process::id()));
-        let corpus = root.join("corpus");
+        let corpus = root.join("segments");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&corpus).expect("create corpus directory");
         write_event(
@@ -1169,7 +1162,7 @@ mod tests {
     }
 
     fn write_event(path: &Path, event_index: u64, turn: &str, kind: &str, event_type: &str) {
-        let body = b"/message\tvalue\n";
+        let body = b"/message\t5\tvalue\n";
         let header = EventHeader {
             event_index,
             source_id: "source".to_string(),

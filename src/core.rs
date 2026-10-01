@@ -1,3 +1,4 @@
+use crate::format::{body_fields, push_field};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -370,45 +371,40 @@ pub fn record_meta<F: FieldView>(fields: &[F]) -> RecordMeta {
     }
 }
 
-pub fn select_body<F: FieldView>(fields: &[F], meta: &RecordMeta, output_preview: usize) -> String {
-    if is_compaction_event(meta.event_type.as_deref()) {
-        return select_compaction_body(fields, meta);
-    }
-    if meta.sender == Sender::Human {
-        return select_human_body(fields);
-    }
-    let mut body = String::new();
-    for field in fields {
-        if !should_render_field(field, meta) {
-            continue;
-        }
-        let value = if meta.event_kind == EventKind::Output && output_preview > 0 {
-            truncate_chars(field.value(), output_preview)
-        } else {
-            field.value().to_string()
-        };
-        body.push_str(field.path());
-        body.push('\t');
-        body.push_str(&value);
-        body.push('\n');
-    }
-    body
+/// What a sync keeps of one record: the fields worth reading, written with
+/// `format::push_field`, and whether a value was shortened on the way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Projection {
+    pub body: String,
+    pub cut: bool,
 }
 
-fn select_compaction_body<F: FieldView>(fields: &[F], meta: &RecordMeta) -> String {
-    let mut body = String::new();
+pub fn select_body<F: FieldView>(
+    fields: &[F],
+    meta: &RecordMeta,
+    tool_output_chars: usize,
+) -> Projection {
+    if meta.sender == Sender::Human && !is_compaction_event(meta.event_type.as_deref()) {
+        return Projection {
+            body: select_human_body(fields),
+            cut: false,
+        };
+    }
+    let shorten = meta.event_kind == EventKind::Output && tool_output_chars > 0;
+    let mut projection = Projection::default();
     for field in fields {
         if !should_render_field(field, meta) {
             continue;
         }
-        body.push_str(field.path());
-        body.push('\t');
-        body.push_str(&field.value().len().to_string());
-        body.push('\t');
-        body.push_str(field.value());
-        body.push('\n');
+        if shorten {
+            let (value, cut) = truncate_chars(field.value(), tool_output_chars);
+            projection.cut |= cut;
+            push_field(&mut projection.body, field.path(), &value);
+        } else {
+            push_field(&mut projection.body, field.path(), field.value());
+        }
     }
-    body
+    projection
 }
 
 /// A person's message keeps only its text: tool-injected blocks are removed, images are
@@ -420,7 +416,7 @@ fn select_human_body<F: FieldView>(fields: &[F]) -> String {
         let path = field.path();
         if is_human_text_path(path) {
             if let Some(value) = person_text(field.value()) {
-                push_delimited(&mut body, path, &value);
+                push_field(&mut body, path, &value);
             }
         } else if normalize_key(leaf(path)) == "type"
             && matches!(field.value(), "image" | "input_image")
@@ -429,73 +425,12 @@ fn select_human_body<F: FieldView>(fields: &[F]) -> String {
         }
     }
     if images > 0 {
-        push_delimited(&mut body, HUMAN_IMAGES_PATH, &images.to_string());
+        push_field(&mut body, HUMAN_IMAGES_PATH, &images.to_string());
     }
     body
 }
 
 pub const HUMAN_IMAGES_PATH: &str = "/images";
-
-fn push_delimited(body: &mut String, path: &str, value: &str) {
-    body.push_str(path);
-    body.push('\t');
-    body.push_str(&value.len().to_string());
-    body.push('\t');
-    body.push_str(value);
-    body.push('\n');
-}
-
-/// Reads a projected body back into (path, value) pairs. Length-delimited values
-/// (`path\tlen\tvalue`) are exact; plain values (`path\tvalue`) end at the next newline.
-pub fn body_fields(body: &str) -> Vec<(String, String)> {
-    let bytes = body.as_bytes();
-    let mut fields = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        let Some(path_end_relative) = bytes[cursor..].iter().position(|byte| *byte == b'\t') else {
-            break;
-        };
-        let path_end = cursor + path_end_relative;
-        let path = String::from_utf8_lossy(&bytes[cursor..path_end]).into_owned();
-        let value_start = path_end + 1;
-        let Some(line_end_relative) = bytes[value_start..].iter().position(|byte| *byte == b'\n')
-        else {
-            break;
-        };
-        let line_end = value_start + line_end_relative;
-        let delimited = bytes[value_start..line_end]
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .and_then(|length_end_relative| {
-                let length_end = value_start + length_end_relative;
-                let value_len = std::str::from_utf8(&bytes[value_start..length_end])
-                    .ok()?
-                    .parse::<usize>()
-                    .ok()?;
-                let encoded_start = length_end + 1;
-                let encoded_end = encoded_start.checked_add(value_len)?;
-                (encoded_end < bytes.len() && bytes[encoded_end] == b'\n')
-                    .then_some((encoded_start, encoded_end))
-            });
-        match delimited {
-            Some((start, end)) => {
-                fields.push((
-                    path,
-                    String::from_utf8_lossy(&bytes[start..end]).into_owned(),
-                ));
-                cursor = end + 1;
-            }
-            None => {
-                fields.push((
-                    path,
-                    String::from_utf8_lossy(&bytes[value_start..line_end]).into_owned(),
-                ));
-                cursor = line_end + 1;
-            }
-        }
-    }
-    fields
-}
 
 /// The text of a person's message as stored by `select_human_body`, and its image count.
 pub fn human_text_from_body(body: &str) -> (String, usize) {
@@ -884,13 +819,15 @@ fn strip_injected_blocks(value: &str) -> std::borrow::Cow<'_, str> {
 
 pub const PROJECTION_BOUND_MARKER: &str = "…[truncated]";
 
-fn truncate_chars(value: &str, limit: usize) -> String {
+/// The first `limit` characters, and whether anything was left out. A shortened value ends
+/// with the marker so that whoever reads it sees the cut.
+fn truncate_chars(value: &str, limit: usize) -> (String, bool) {
     let mut characters = value.chars();
     let prefix: String = characters.by_ref().take(limit).collect();
     if characters.next().is_some() {
-        format!("{}{}", prefix, PROJECTION_BOUND_MARKER)
+        (format!("{}{}", prefix, PROJECTION_BOUND_MARKER), true)
     } else {
-        prefix
+        (prefix, false)
     }
 }
 
@@ -1732,17 +1669,18 @@ fn add_recovery_category(current: &mut RecoverySnapshot, event: Arc<RecoveryEven
             current.assistants_seen += 1;
             current.assistants.push(Arc::clone(&event));
             trim_front(&mut current.assistants, MAX_RECOVERY_MESSAGES);
-            if body_declares_tool_use(&event.body) {
+            if is_tool_call(event.kind, &event.event_type, &event.body) {
                 current.commands_seen += 1;
                 current.commands.push(event);
                 trim_front(&mut current.commands, MAX_RECOVERY_MESSAGES);
             }
         }
-        EventKind::Command => {
+        EventKind::Command if is_tool_call(event.kind, &event.event_type, &event.body) => {
             current.commands_seen += 1;
             current.commands.push(event);
             trim_front(&mut current.commands, MAX_RECOVERY_MESSAGES);
         }
+        EventKind::Command => {}
         EventKind::Output => {
             current.outputs_seen += 1;
             current.outputs.push(event);
@@ -1752,12 +1690,16 @@ fn add_recovery_category(current: &mut RecoverySnapshot, event: Arc<RecoveryEven
     }
 }
 
-fn body_declares_tool_use(body: &str) -> bool {
-    body.lines().any(|line| {
-        line.split_once('\t')
-            .map(|(path, value)| value == "tool_use" && normalize_key(leaf(path)) == "type")
-            .unwrap_or(false)
-    })
+/// A request for a tool to run: a Claude Code assistant message with a `tool_use` item, or a
+/// Codex `*_call` record. Progress records (`exec_command_begin`, `_end`) are not calls.
+pub fn is_tool_call(kind: EventKind, event_type: &str, body: &str) -> bool {
+    match kind {
+        EventKind::Assistant => body_fields(body)
+            .iter()
+            .any(|(path, value)| value == "tool_use" && normalize_key(leaf(path)) == "type"),
+        EventKind::Command => event_type.ends_with("call"),
+        _ => false,
+    }
 }
 
 fn trim_front<T>(values: &mut Vec<T>, limit: usize) {
@@ -1820,7 +1762,7 @@ mod tests {
         ];
         let meta = record_meta(&fields);
         assert_eq!(meta.event_kind, EventKind::User);
-        assert!(select_body(&fields, &meta, 300).contains("日本語全文"));
+        assert!(select_body(&fields, &meta, 300).body.contains("日本語全文"));
     }
 
     #[test]
@@ -1837,7 +1779,9 @@ mod tests {
         ];
         let meta = record_meta(&fields);
         assert_eq!(meta.event_kind, EventKind::Output);
-        assert!(select_body(&fields, &meta, 4).contains("1234…[truncated]"));
+        assert!(select_body(&fields, &meta, 4)
+            .body
+            .contains("1234…[truncated]"));
     }
 
     #[test]
@@ -1933,7 +1877,7 @@ mod tests {
             },
         ];
         let meta = record_meta(&fields);
-        let body = select_body(&fields, &meta, 300);
+        let body = select_body(&fields, &meta, 300).body;
         assert!(body.contains("/replacement_history/1/text\t17\tline one\nline two\n"));
     }
 
@@ -2013,7 +1957,9 @@ mod tests {
         let meta = record_meta(&user);
         assert_eq!(meta.event_kind, EventKind::User);
         assert_eq!(meta.role.as_deref(), Some("user"));
-        assert!(select_body(&user, &meta, 300).contains("fix the limiter"));
+        assert!(select_body(&user, &meta, 300)
+            .body
+            .contains("fix the limiter"));
 
         let assistant = vec![
             TestField {
@@ -2044,7 +1990,7 @@ mod tests {
         let meta = record_meta(&assistant);
         assert_eq!(meta.event_kind, EventKind::Assistant);
         assert_eq!(meta.role.as_deref(), Some("assistant"));
-        let body = select_body(&assistant, &meta, 300);
+        let body = select_body(&assistant, &meta, 300).body;
         assert!(body.contains("looking at it now"));
         assert!(body.contains("grep -rn limiter src/"));
 
@@ -2108,7 +2054,7 @@ mod tests {
         ];
         let meta = record_meta(&fields);
         assert_eq!(meta.event_kind, EventKind::Command);
-        let body = select_body(&fields, &meta, 300);
+        let body = select_body(&fields, &meta, 300).body;
         for (path, value) in [
             ("/response_item/name", "schedule_meeting"),
             ("/response_item/arguments/date", "argument-date"),
@@ -2117,7 +2063,7 @@ mod tests {
             ("/response_item/arguments/command", "argument-command"),
         ] {
             assert!(
-                body.contains(&format!("{}\t{}", path, value)),
+                crate::format::body_fields(&body).contains(&(path.to_string(), value.to_string())),
                 "projection dropped {}",
                 path
             );
@@ -2140,7 +2086,12 @@ mod tests {
         ];
         let meta = record_meta(&fields);
         assert_eq!(meta.event_kind, EventKind::Unknown);
-        assert!(select_body(&fields, &meta, 300).contains("/arbitrary/deep/value\tpreserve-me"));
+        assert!(
+            crate::format::body_fields(&select_body(&fields, &meta, 300).body).contains(&(
+                "/arbitrary/deep/value".to_string(),
+                "preserve-me".to_string()
+            ))
+        );
     }
 
     #[test]
@@ -2182,8 +2133,12 @@ mod tests {
     fn reply_with_tool_call_is_recovered_in_both_categories() {
         let mut state = RecoveryState::default();
         let mut reply = recovery_event(0, "turn@0", EventKind::Assistant);
-        reply.body = "/message/content/0/type\ttext\n/message/content/0/text\ton it\n                      /message/content/1/type\ttool_use\n/message/content/1/input/command\tls -la\n"
-            .to_string();
+        reply.body = encoded(&[
+            ("/message/content/0/type", "text"),
+            ("/message/content/0/text", "on it"),
+            ("/message/content/1/type", "tool_use"),
+            ("/message/content/1/input/command", "ls -la"),
+        ]);
         state.accept(reply, Vec::new());
 
         let current = state.current().expect("current turn");
@@ -2195,7 +2150,10 @@ mod tests {
         );
 
         let mut plain = recovery_event(1, "turn@0", EventKind::Assistant);
-        plain.body = "/message/content/0/type\ttext\n/message/content/0/text\tdone\n".to_string();
+        plain.body = encoded(&[
+            ("/message/content/0/type", "text"),
+            ("/message/content/0/text", "done"),
+        ]);
         state.accept(plain, Vec::new());
         let current = state.current().expect("current turn");
         assert_eq!(current.assistants.len(), 2);
@@ -2300,12 +2258,22 @@ mod tests {
             recovery_event(1, "turn-1", EventKind::Assistant),
             Vec::new(),
         );
-        state.accept(recovery_event(2, "turn-2", EventKind::Command), Vec::new());
+        let mut call = recovery_event(2, "turn-2", EventKind::Command);
+        call.event_type = "function_call".to_string();
+        state.accept(call, Vec::new());
         state.finish();
         assert_eq!(state.matched_events(), 3);
         assert_eq!(state.current().expect("current").turn, "turn-2");
         assert_eq!(state.previous().expect("previous").turn, "turn-1");
         assert_eq!(state.current().expect("current").commands.len(), 1);
+    }
+
+    fn encoded(pairs: &[(&str, &str)]) -> String {
+        let mut body = String::new();
+        for (path, value) in pairs {
+            crate::format::push_field(&mut body, path, value);
+        }
+        body
     }
 
     fn classified(
@@ -2318,7 +2286,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut meta = record_meta(&fields);
         super::classify_sender(origin, &fields, &mut meta);
-        let body = select_body(&fields, &meta, 300);
+        let body = select_body(&fields, &meta, 300).body;
         (meta.sender, meta.via, meta.event_kind, body)
     }
 
@@ -2600,7 +2568,7 @@ mod tests {
     /// how representative records are classified and projected changes with any change to
     /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
     /// here: the next sync then rebuilds every corpus made under the old rules.
-    const RULES_FINGERPRINT: (u64, &str) = (1, "644c98ff872d783a");
+    const RULES_FINGERPRINT: (&str, u64, &str) = ("7", 1, "5b8a7e002824d976");
 
     #[test]
     fn reading_rules_are_versioned() {
@@ -2811,10 +2779,14 @@ mod tests {
         }
         let fingerprint = format!("{:016x}", digest);
         assert_eq!(
-            (crate::corpus::RULES_VERSION, fingerprint.as_str()),
+            (
+                crate::format::FORMAT_VERSION,
+                crate::corpus::RULES_VERSION,
+                fingerprint.as_str()
+            ),
             RULES_FINGERPRINT,
-            "the reading rules changed: increase corpus::RULES_VERSION, then record \
-             RULES_FINGERPRINT = (<that version>, \"{}\")",
+            "what a sync writes changed: increase corpus::RULES_VERSION (or format::FORMAT_VERSION \
+             for a storage change), then record the versions with fingerprint \"{}\"",
             fingerprint
         );
     }

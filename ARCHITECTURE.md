@@ -25,27 +25,29 @@ modules.
 
 ## Storage
 
-Ebira stores durable imports and generated corpus data under one data directory.
+Everything a corpus needs lives in its directory, the `--corpus` path:
 
-### Durable files
+- `ebira.lock`: the lock that orders writers and readers
+- `sources.tsv`, `source-inputs.tsv`, `source-availability.tsv`, `timeline.tsv`:
+  the catalog, the registered sources, their availability, and the date map
+- `segments/*.corpus`: the projected events
+- `managed-imports.tsv` and `managed-imports/<import-id>/{files.tsv,jsonl/**}`:
+  copies of imported logs and their provenance
 
-- `managed-imports.tsv`
-- `managed-imports/<import-id>/files.tsv`
-- `managed-imports/<import-id>/jsonl/**`
+The managed imports are durable: they are the only copy of logs whose originals
+are gone. Everything else is generated from the logs and the imports, carries
+the storage format version, and is rebuilt by `ebira sync` when the format or
+the reading rules change. Paths to managed files are relative to the corpus
+directory, so the directory can be moved as a whole.
 
-Registry entries preserve supplied provenance and original source paths. Paths
-to managed files are relative to the data directory.
+### Events
 
-### Generated files
-
-- `corpus/sources.tsv`
-- `corpus/source-inputs.tsv`
-- `corpus/source-availability.tsv`
-- `corpus/timeline.tsv`
-- `corpus/corpus/*.corpus`
-
-Generated files are tied to a corpus format version. An unsupported version
-returns an error and requires a rebuild from the source JSONL.
+A segment holds events, each an `@ebira` header line of tab-separated
+`key=value` fields followed by a body of `body_len` bytes and a newline. The
+header names the source reference, session, turn, kind, sender, channel, and
+whether the projection cut a value (`cut=1`). The body is a list of fields, each
+`path\tlen\tvalue\n` with `len` the byte length of the value, so any value,
+newlines included, reads back exactly (`format::push_field`, `format::body_fields`).
 
 ## Indexing
 

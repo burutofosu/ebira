@@ -93,12 +93,10 @@ struct ImportFile {
     modified_ms: u64,
 }
 
+/// Managed imports live inside the corpus directory, beside the files generated from them, so
+/// one directory holds everything a corpus needs and the corpus lock covers both.
 pub fn store_root(corpus: &Path) -> PathBuf {
-    corpus
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
+    corpus.to_path_buf()
 }
 
 pub fn inventory(corpus: &Path) -> io::Result<ImportInventory> {

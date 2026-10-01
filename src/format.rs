@@ -18,17 +18,21 @@ pub struct EventHeader {
     pub call_id: String,
     pub sender: String,
     pub via: String,
+    /// Some value of the record was shortened when it was projected (tool output beyond
+    /// `--tool-output-chars`, or a record too large to project).
+    pub body_cut: bool,
     pub body_len: u64,
 }
 
-/// v6 adds `sender` and `via`: who put the record into the log and through which channel.
-pub const FORMAT_VERSION: &str = "6";
+/// v7: every body field is length-delimited, the header says whether the body was cut, the
+/// segments live in `segments/`, and managed imports live inside the corpus directory.
+pub const FORMAT_VERSION: &str = "7";
 
 pub fn event_header_line(header: &EventHeader) -> String {
     let mut line = String::with_capacity(256);
     writeln!(
         line,
-        "@ebira\tv={}\tevent={}\tsource_id={}\tline={}\tbyte={}\tlen={}\tsession={}\tturn={}\trole={}\tkind={}\ttype={}\ttimestamp={}\tcwd={}\trepository={}\tcall_id={}\tsender={}\tvia={}\tbody_len={}",
+        "@ebira\tv={}\tevent={}\tsource_id={}\tline={}\tbyte={}\tlen={}\tsession={}\tturn={}\trole={}\tkind={}\ttype={}\ttimestamp={}\tcwd={}\trepository={}\tcall_id={}\tsender={}\tvia={}\tcut={}\tbody_len={}",
         FORMAT_VERSION,
         header.event_index,
         encode_token(&header.source_id),
@@ -46,6 +50,7 @@ pub fn event_header_line(header: &EventHeader) -> String {
         encode_token(&header.call_id),
         encode_token(&header.sender),
         encode_token(&header.via),
+        u8::from(header.body_cut),
         header.body_len,
     )
     .expect("writing to String cannot fail");
@@ -82,12 +87,13 @@ pub fn parse_event_header(line: &[u8]) -> Result<EventHeader, String> {
             "call_id" => header.call_id = decode_token(value)?,
             "sender" => header.sender = decode_token(value)?,
             "via" => header.via = decode_token(value)?,
+            "cut" => header.body_cut = value == "1",
             "body_len" => header.body_len = parse_u64(value, key)?,
             "v" if value != FORMAT_VERSION => {
                 return Err(format!(
-                    "corpus format is v={}, this build writes v={}; rebuild the corpus",
-                    value, FORMAT_VERSION
-                ))
+                "corpus format is v={}, this build reads v={}; run `ebira sync`, which rebuilds it",
+                value, FORMAT_VERSION
+            ))
             }
             "v" => {}
             _ => {}
@@ -103,6 +109,53 @@ fn parse_u64(value: &str, key: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| format!("invalid {} value: {}", key, value))
+}
+
+/// The body of a projected event is a list of fields, each written as `path\tlen\tvalue\n`,
+/// where `len` is the byte length of `value`; values may hold any character, newlines included.
+pub fn push_field(body: &mut String, path: &str, value: &str) {
+    body.push_str(path);
+    body.push('\t');
+    body.push_str(&value.len().to_string());
+    body.push('\t');
+    body.push_str(value);
+    body.push('\n');
+}
+
+/// Reads a body written by `push_field` back into its fields.
+pub fn body_fields(body: &str) -> Vec<(String, String)> {
+    let bytes = body.as_bytes();
+    let mut fields = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let Some(path_end) = bytes[cursor..].iter().position(|byte| *byte == b'\t') else {
+            break;
+        };
+        let path_end = cursor + path_end;
+        let Some(length_end) = bytes[path_end + 1..].iter().position(|byte| *byte == b'\t') else {
+            break;
+        };
+        let length_end = path_end + 1 + length_end;
+        let Some(value_len) = std::str::from_utf8(&bytes[path_end + 1..length_end])
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+        else {
+            break;
+        };
+        let value_start = length_end + 1;
+        let Some(value_end) = value_start.checked_add(value_len) else {
+            break;
+        };
+        if value_end >= bytes.len() || bytes[value_end] != b'\n' {
+            break;
+        }
+        fields.push((
+            String::from_utf8_lossy(&bytes[cursor..path_end]).into_owned(),
+            String::from_utf8_lossy(&bytes[value_start..value_end]).into_owned(),
+        ));
+        cursor = value_end + 1;
+    }
+    fields
 }
 
 pub fn encode_token(value: &str) -> String {
@@ -178,7 +231,26 @@ pub fn json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_token, encode_token};
+    use super::{body_fields, decode_token, encode_token, push_field};
+
+    #[test]
+    fn body_fields_read_back_exactly() {
+        let mut body = String::new();
+        push_field(&mut body, "/message/content", "two\nlines\twith a tab\n");
+        push_field(&mut body, "/payload/output", "");
+        push_field(&mut body, "/a", "日本語");
+        assert_eq!(
+            body_fields(&body),
+            vec![
+                (
+                    "/message/content".to_string(),
+                    "two\nlines\twith a tab\n".to_string()
+                ),
+                ("/payload/output".to_string(), String::new()),
+                ("/a".to_string(), "日本語".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn token_round_trip_preserves_delimiters() {

@@ -454,7 +454,7 @@ fn commits_rejects_a_corrupt_segment() {
         .status()
         .expect("git init runs");
     assert!(git.success(), "git init failed");
-    let segment = std::fs::read_dir(fixture.path().join("corpus").join("corpus"))
+    let segment = std::fs::read_dir(fixture.path().join("corpus").join("segments"))
         .expect("read corpus segments")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -891,6 +891,14 @@ fn sync_rebuilds_a_corpus_written_in_another_format() {
             .collect::<Vec<_>>()
             .join("\t")
     });
+    // Format 6 kept its segments in `corpus/`; a rebuild clears what an older format left.
+    let legacy = Path::new(&corpus).join("corpus");
+    std::fs::create_dir_all(&legacy).expect("create legacy segment directory");
+    std::fs::write(
+        legacy.join("claude-0000000000000000.corpus"),
+        "old segment\n",
+    )
+    .expect("write legacy segment");
     let refused = run_failure(&["search", "--corpus", &corpus, "--query", "probe"]);
     assert!(
         refused.contains("run `ebira sync`, which rebuilds it"),
@@ -901,6 +909,7 @@ fn sync_rebuilds_a_corpus_written_in_another_format() {
         rebuilt.contains("\"rebuild_cause\":\"format_changed\""),
         "{rebuilt}"
     );
+    assert!(!legacy.exists(), "the legacy segment directory is gone");
     let found = run(&["search", "--corpus", &corpus, "--query", "surface probe"]);
     assert!(found.contains("\"total_candidates\":1"), "{found}");
 }
@@ -1030,4 +1039,52 @@ fn an_unreadable_directory_keeps_its_projection() {
         "the projection of an unreadable directory is kept: {found}"
     );
     std::fs::remove_dir_all(&root).expect("remove temp directory");
+}
+
+#[test]
+fn a_shortened_tool_output_is_marked_in_the_event_header() {
+    let root =
+        std::env::temp_dir().join(format!("ebira-surface-cut-header-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create temp directory");
+    let source = root.join("log.jsonl");
+    std::fs::write(
+        &source,
+        concat!(
+            r#"{"response_item":{"type":"function_call_output","call_id":"c1","output":"0123456789 well past the limit"},"turn_id":"t1"}"#,
+            "\n",
+            r#"{"response_item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"short"}]},"turn_id":"t1"}"#,
+            "\n",
+        ),
+    )
+    .expect("write source");
+    let corpus = root.join("corpus");
+    run(&[
+        "sync",
+        "--source",
+        source.to_str().expect("utf-8 path"),
+        "--corpus",
+        corpus.to_str().expect("utf-8 path"),
+        "--tool-output-chars",
+        "10",
+    ]);
+    let segment = std::fs::read_dir(corpus.join("segments"))
+        .expect("read segments")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("corpus"))
+        .expect("a segment");
+    let text = std::fs::read_to_string(segment).expect("read segment");
+    let headers = text
+        .lines()
+        .filter(|line| line.starts_with("@ebira\t"))
+        .collect::<Vec<_>>();
+    assert_eq!(headers.len(), 2, "{text}");
+    assert!(
+        headers[0].contains("\tkind=output\t") && headers[0].contains("\tcut=1\t"),
+        "{}",
+        headers[0]
+    );
+    assert!(headers[1].contains("\tcut=0\t"), "{}", headers[1]);
+    std::fs::remove_dir_all(root).expect("remove temp directory");
 }

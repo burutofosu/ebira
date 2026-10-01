@@ -206,7 +206,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "import",
         synopsis: "--source <path> --provenance <text> --label <text> [--source-computer <text>]",
-        summary: "Copy JSONL logs into the data directory so they outlive the originals",
+        summary: "Copy JSONL logs into the corpus directory so they outlive the originals",
         details: &["Run `ebira sync` afterwards to add them to the corpus."],
         values: &[
             "--corpus",
@@ -695,7 +695,7 @@ fn sync(args: &[String]) -> io::Result<()> {
         rebuild_cause
             .map(format::json_string)
             .unwrap_or_else(|| "null".to_string()),
-        format::json_string(&report.output),
+        format::json_string(&report.corpus),
     );
     Ok(())
 }

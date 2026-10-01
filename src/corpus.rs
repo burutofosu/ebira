@@ -4,7 +4,8 @@ use crate::core::{
     TurnReducerState,
 };
 use crate::format::{
-    decode_token, encode_token, event_header_line, json_string, parse_event_header, EventHeader,
+    decode_token, encode_token, event_header_line, json_string, parse_event_header, push_field,
+    EventHeader,
 };
 use crate::jsonl::parse_record;
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,7 +50,7 @@ pub struct BuildReport {
     pub unreadable_source_paths: u64,
     pub changed_sources: Vec<SourceChange>,
     pub changed_sources_total: u64,
-    pub output: String,
+    pub corpus: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -130,14 +131,14 @@ struct SourceReport {
 #[cfg(test)]
 pub fn build(
     sources: &[String],
-    output: &Path,
+    corpus: &Path,
     incremental: bool,
     output_preview: usize,
     force_paths: &[String],
 ) -> io::Result<BuildReport> {
     build_with_preview(
         sources,
-        output,
+        corpus,
         incremental,
         Some(output_preview),
         force_paths,
@@ -146,13 +147,16 @@ pub fn build(
 
 pub fn build_with_preview(
     sources: &[String],
-    output: &Path,
+    corpus: &Path,
     incremental: bool,
     requested_preview: Option<usize>,
     force_paths: &[String],
 ) -> io::Result<BuildReport> {
+    if !incremental {
+        remove_legacy_segments(corpus)?;
+    }
     let mut registered_inputs = if incremental {
-        load_source_inputs(output)?
+        load_source_inputs(corpus)?
     } else {
         Vec::new()
     };
@@ -163,12 +167,12 @@ pub fn build_with_preview(
         }
     }
     let previous = if incremental {
-        load_source_catalog(output)?
+        load_source_catalog(corpus)?
     } else {
         BTreeMap::new()
     };
     let previous_availability = if incremental {
-        load_source_availability(output)?
+        load_source_availability(corpus)?
     } else {
         SourceAvailabilitySnapshot::default()
     };
@@ -180,9 +184,9 @@ pub fn build_with_preview(
         sources,
         &registered_inputs,
     );
-    if !collection.paths.is_empty() || (incremental && output.is_dir()) {
-        fs::create_dir_all(output)?;
-        write_source_availability(output, &availability)?;
+    if !collection.paths.is_empty() || (incremental && corpus.is_dir()) {
+        fs::create_dir_all(corpus)?;
+        write_source_availability(corpus, &availability)?;
     }
     let unreadable_source_paths = availability_entries_for_inputs(&availability, sources)
         .filter(|entry| source_path_is_unavailable(entry))
@@ -196,7 +200,7 @@ pub fn build_with_preview(
     }
 
     let previous_timeline = if incremental {
-        load_timeline_catalog(output)?
+        load_timeline_catalog(corpus)?
     } else {
         BTreeMap::new()
     };
@@ -205,11 +209,11 @@ pub fn build_with_preview(
         .iter()
         .map(|path| source_entry_for_preview(path, requested_preview, &previous))
         .collect::<io::Result<Vec<_>>>()?;
-    let corpus_root = output.join("corpus");
-    fs::create_dir_all(output)?;
-    fs::create_dir_all(&corpus_root)?;
-    write_source_inputs_partial(output, &registered_inputs)?;
-    let mut existing_files = corpus_file_map(&corpus_root)?;
+    let segment_dir = segment_dir(corpus);
+    fs::create_dir_all(corpus)?;
+    fs::create_dir_all(&segment_dir)?;
+    write_source_inputs_partial(corpus, &registered_inputs)?;
+    let mut existing_files = corpus_file_map(&segment_dir)?;
     for files in existing_files.values_mut() {
         discard_partial_corpus_files(files)?;
     }
@@ -220,12 +224,12 @@ pub fn build_with_preview(
     // The date offset is fixed when the corpus is built: an incremental sync keeps the one in
     // the catalog, so every segment of one corpus puts records on the same dates.
     let offset_minutes = if incremental && !previous.is_empty() {
-        corpus_offset_minutes(output)?
+        corpus_offset_minutes(corpus)?
     } else {
         configured_offset_minutes()
     };
-    let catalog_path = output.join("sources.tsv");
-    let catalog_partial_path = output.join("sources.tsv.partial");
+    let catalog_path = corpus.join("sources.tsv");
+    let catalog_partial_path = corpus.join("sources.tsv.partial");
     let mut timeline_by_source = if incremental {
         previous_timeline.clone()
     } else {
@@ -264,7 +268,7 @@ pub fn build_with_preview(
         disposition: "complete",
         sources_seen: snapshot.len() as u64,
         unreadable_source_paths: unreadable_source_paths as u64,
-        output: output.to_string_lossy().into_owned(),
+        corpus: corpus.to_string_lossy().into_owned(),
         ..BuildReport::default()
     };
 
@@ -363,7 +367,7 @@ pub fn build_with_preview(
         .map(|count| count.get())
         .unwrap_or(4)
         .min(reads.len().max(1));
-    let corpus_root_ref = &corpus_root;
+    let segment_dir_ref = &segment_dir;
     let read_slice = &reads[..];
     let next_read = AtomicUsize::new(0);
     let mut completed = 0usize;
@@ -380,7 +384,7 @@ pub fn build_with_preview(
                 let result = process_source(
                     read.entry,
                     read.old,
-                    corpus_root_ref,
+                    segment_dir_ref,
                     &read.active_files,
                     read.operation_disposition,
                     offset_minutes,
@@ -444,7 +448,7 @@ pub fn build_with_preview(
     drop(catalog);
     let final_entries = load_source_catalog_paths(std::slice::from_ref(&catalog_partial_path))?;
     collect_changed_sources(&mut report, &snapshot, &previous, &final_entries);
-    let normalized_catalog_path = output.join("sources.tsv.normalized");
+    let normalized_catalog_path = corpus.join("sources.tsv.normalized");
     let mut normalized_catalog =
         BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&normalized_catalog_path)?);
     writeln!(
@@ -469,9 +473,9 @@ pub fn build_with_preview(
     } else {
         "incomplete"
     };
-    write_timeline_catalog(output, &final_entries, &timeline_by_source)?;
-    write_source_inputs(output, &registered_inputs)?;
-    remove_corpus_files_not_in_catalog(&corpus_root, &final_entries)?;
+    write_timeline_catalog(corpus, &final_entries, &timeline_by_source)?;
+    write_source_inputs(corpus, &registered_inputs)?;
+    remove_corpus_files_not_in_catalog(&segment_dir, &final_entries)?;
     Ok(report)
 }
 
@@ -521,13 +525,13 @@ fn collect_changed_sources(
 }
 
 pub fn status(path: &Path) -> io::Result<()> {
-    let output = resolve_output(path);
-    let rules_version = corpus_rules_version(&output)?;
-    let managed = crate::imports::inventory(&output)?;
-    let corpus_root = output.join("corpus");
-    let sources = load_source_catalog(&output)?;
-    let registered_inputs = load_source_inputs(&output)?;
-    let availability = load_source_availability(&output)?;
+    let corpus = path.to_path_buf();
+    let rules_version = corpus_rules_version(&corpus)?;
+    let managed = crate::imports::inventory(&corpus)?;
+    let segment_dir = segment_dir(&corpus);
+    let sources = load_source_catalog(&corpus)?;
+    let registered_inputs = load_source_inputs(&corpus)?;
+    let availability = load_source_availability(&corpus)?;
     let unavailable_source_paths = availability
         .entries
         .iter()
@@ -539,13 +543,13 @@ pub fn status(path: &Path) -> io::Result<()> {
         .filter(|entry| source_is_complete(entry))
         .count();
     let incomplete_sources = sources.len().saturating_sub(complete_sources);
-    let timeline = load_timeline_catalog(&output)?;
+    let timeline = load_timeline_catalog(&corpus)?;
     let timeline_runs = timeline.values().map(Vec::len).sum::<usize>();
     let mut files = 0u64;
     let mut partial_files = 0u64;
     let mut bytes = 0u64;
-    if corpus_root.is_dir() {
-        for entry in fs::read_dir(&corpus_root)? {
+    if segment_dir.is_dir() {
+        for entry in fs::read_dir(&segment_dir)? {
             let path = entry?.path();
             let name = path
                 .file_name()
@@ -578,7 +582,7 @@ pub fn status(path: &Path) -> io::Result<()> {
         } else {
             "observed"
         }),
-        json_string(&output.to_string_lossy()),
+        json_string(&corpus.to_string_lossy()),
         rules_version,
         rules_version == RULES_VERSION,
         sources.len(),
@@ -587,13 +591,13 @@ pub fn status(path: &Path) -> io::Result<()> {
         files,
         partial_files,
         bytes,
-        fs::metadata(output.join("sources.tsv"))
+        fs::metadata(corpus.join("sources.tsv"))
             .map(|metadata| metadata.len())
             .unwrap_or(0),
-        timeline_catalog_present(&output),
+        timeline_catalog_present(&corpus),
         timeline.len(),
         timeline_runs,
-        fs::metadata(output.join("timeline.tsv"))
+        fs::metadata(corpus.join("timeline.tsv"))
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         registered_inputs.len(),
@@ -605,7 +609,7 @@ pub fn status(path: &Path) -> io::Result<()> {
         availability.entries.len(),
         availability.entries.len() > SOURCE_AVAILABILITY_OUTPUT_LIMIT,
         source_availability_json(&availability),
-        fs::metadata(output.join(SOURCE_AVAILABILITY_FILE))
+        fs::metadata(corpus.join(SOURCE_AVAILABILITY_FILE))
             .map(|metadata| metadata.len())
             .unwrap_or(0),
     );
@@ -643,16 +647,12 @@ pub fn source_is_complete(entry: &SourceEntry) -> bool {
         )
 }
 
-pub fn resolve_output(path: &Path) -> PathBuf {
-    path.to_path_buf()
-}
-
 pub fn require_corpus(path: &Path) -> io::Result<()> {
-    let output = resolve_output(path);
-    if !output.is_dir() {
-        return Err(no_corpus_here(&output));
+    let corpus = path.to_path_buf();
+    if !corpus.is_dir() {
+        return Err(no_corpus_here(&corpus));
     }
-    let catalog_path = output.join("sources.tsv");
+    let catalog_path = corpus.join("sources.tsv");
     let file = File::open(&catalog_path).map_err(|_| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -699,7 +699,7 @@ const LOCK_FILE: &str = "ebira.lock";
 /// interleave their updates of one catalog or registry. The lock is released when the returned
 /// file is dropped, also when the process ends abnormally.
 pub fn lock_exclusive(path: &Path) -> io::Result<File> {
-    let root = resolve_output(path);
+    let root = path.to_path_buf();
     fs::create_dir_all(&root)?;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -713,7 +713,7 @@ pub fn lock_exclusive(path: &Path) -> io::Result<File> {
 
 /// A corpus that no writer has locked yet has no lock file; reading it needs none.
 pub fn lock_shared(path: &Path) -> io::Result<Option<File>> {
-    let Ok(file) = File::open(resolve_output(path).join(LOCK_FILE)) else {
+    let Ok(file) = File::open(path.join(LOCK_FILE)) else {
         return Ok(None);
     };
     file.lock_shared()?;
@@ -760,17 +760,41 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-pub fn corpus_root(path: &Path) -> PathBuf {
-    resolve_output(path).join("corpus")
+/// The directory that holds the projected event segments, `<corpus>/segments`.
+pub fn segment_dir(path: &Path) -> PathBuf {
+    path.join(SEGMENT_DIR)
+}
+
+const SEGMENT_DIR: &str = "segments";
+
+/// Before format 7 the segments lived in `corpus/`. A rebuild removes what is left there; the
+/// segments are generated from the logs and cannot be read by this build.
+fn remove_legacy_segments(corpus: &Path) -> io::Result<()> {
+    let legacy = corpus.join("corpus");
+    let Ok(entries) = fs::read_dir(&legacy) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if name.ends_with(".corpus") || name.ends_with(".corpus.partial") {
+            fs::remove_file(&path)?;
+        }
+    }
+    let _ = fs::remove_dir(&legacy);
+    Ok(())
 }
 
 pub fn source_catalog(path: &Path) -> io::Result<BTreeMap<String, SourceEntry>> {
-    load_source_catalog(&resolve_output(path))
+    load_source_catalog(path)
 }
 
 pub fn registered_sources(path: &Path) -> io::Result<Vec<String>> {
-    let output = resolve_output(path);
-    let inputs = load_source_inputs(&output)?;
+    let corpus = path.to_path_buf();
+    let inputs = load_source_inputs(&corpus)?;
     if !inputs.is_empty() {
         return Ok(inputs);
     }
@@ -785,8 +809,8 @@ pub fn registered_sources(path: &Path) -> io::Result<Vec<String>> {
 }
 
 pub fn corpus_files(path: &Path) -> io::Result<Vec<PathBuf>> {
-    let root = corpus_root(path);
-    let catalog = load_source_catalog(&resolve_output(path))?;
+    let root = segment_dir(path);
+    let catalog = load_source_catalog(path)?;
     let mut files = Vec::new();
     if !root.is_dir() {
         return Ok(files);
@@ -811,7 +835,7 @@ pub fn corpus_files(path: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 pub fn source_files(path: &Path, source_id: &str) -> io::Result<Vec<PathBuf>> {
-    Ok(corpus_source_files(&corpus_root(path), source_id)?
+    Ok(corpus_source_files(&segment_dir(path), source_id)?
         .into_iter()
         .filter(|path| is_complete_corpus_file(path))
         .collect())
@@ -966,7 +990,7 @@ fn read_bounded_line<R: BufRead>(
 fn process_source(
     entry: &SourceEntry,
     old: Option<&SourceEntry>,
-    corpus_root: &Path,
+    segment_dir: &Path,
     active_files: &[PathBuf],
     operation_disposition: &'static str,
     offset_minutes: i64,
@@ -981,16 +1005,16 @@ fn process_source(
             entry.source_id, start_offset, entry.size
         )
     } else {
-        rebuild_output_name(corpus_root, entry)
+        rebuild_output_name(segment_dir, entry)
     };
-    let output_path = corpus_root.join(&output_name);
+    let output_path = segment_dir.join(&output_name);
     let partial_path = output_path.with_extension("corpus.partial");
     let input = File::open(&entry.path)?;
     let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, input);
     reader.seek(SeekFrom::Start(start_offset))?;
     let mut bounded = reader.take(entry.size.saturating_sub(start_offset));
-    let output = File::create(&partial_path)?;
-    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
+    let segment = File::create(&partial_path)?;
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, segment);
     let mut line = Vec::new();
     let mut committed_byte_end = start_offset;
     let mut line_number = old.map(|old| old.last_line).unwrap_or(0);
@@ -1018,22 +1042,27 @@ fn process_source(
             break;
         }
         line_number += 1;
+        let mut body_cut = false;
         let event = if line_read.oversized {
             invalid_records += 1;
             let meta = RecordMeta {
                 event_kind: EventKind::Invalid,
                 ..RecordMeta::default()
             };
-            let mut body = String::from_utf8_lossy(&line).into_owned();
-            body.push_str(crate::core::PROJECTION_BOUND_MARKER);
+            let mut text = String::from_utf8_lossy(&line).into_owned();
+            text.push_str(crate::core::PROJECTION_BOUND_MARKER);
+            let mut body = String::new();
+            push_field(&mut body, "/raw", &text);
+            body_cut = true;
             machine.apply(&entry.fallback_session, meta, body, record_start)
         } else {
             match parse_record(&line, record_start) {
                 Ok(fields) => {
                     let mut meta = record_meta(&fields);
                     classify_sender(origin, &fields, &mut meta);
-                    let body = select_body(&fields, &meta, entry.output_preview as usize);
-                    machine.apply(&entry.fallback_session, meta, body, record_start)
+                    let projection = select_body(&fields, &meta, entry.output_preview as usize);
+                    body_cut = projection.cut;
+                    machine.apply(&entry.fallback_session, meta, projection.body, record_start)
                 }
                 Err(_) => {
                     invalid_records += 1;
@@ -1041,12 +1070,9 @@ fn process_source(
                         event_kind: EventKind::Invalid,
                         ..RecordMeta::default()
                     };
-                    machine.apply(
-                        &entry.fallback_session,
-                        meta,
-                        String::from_utf8_lossy(&line).into_owned(),
-                        record_start,
-                    )
+                    let mut body = String::new();
+                    push_field(&mut body, "/raw", &String::from_utf8_lossy(&line));
+                    machine.apply(&entry.fallback_session, meta, body, record_start)
                 }
             }
         };
@@ -1068,6 +1094,7 @@ fn process_source(
             call_id: event.meta.call_id.clone().unwrap_or_default(),
             sender: event.meta.sender.as_str().to_string(),
             via: event.meta.via.clone(),
+            body_cut,
             body_len: body_bytes.len() as u64,
         };
         let header_line = event_header_line(&header);
@@ -1097,7 +1124,7 @@ fn process_source(
     } else {
         output_name
     };
-    let output_path = corpus_root.join(&output_name);
+    let output_path = segment_dir.join(&output_name);
     let mut timeline_runs = timeline.finish();
     for run in timeline_runs.iter_mut() {
         run.corpus_file = output_name.clone();
@@ -1209,7 +1236,7 @@ pub enum CorpusState {
 }
 
 pub fn corpus_state(path: &Path) -> CorpusState {
-    let catalog_path = resolve_output(path).join("sources.tsv");
+    let catalog_path = path.join("sources.tsv");
     let Ok(file) = File::open(&catalog_path) else {
         return CorpusState::Missing;
     };
@@ -1236,15 +1263,15 @@ fn catalog_rules_version(header: &str) -> u64 {
 }
 
 pub fn corpus_rules_version(root: &Path) -> io::Result<u64> {
-    let file = File::open(resolve_output(root).join("sources.tsv"))?;
+    let file = File::open(root.join("sources.tsv"))?;
     let header = BufReader::new(file).lines().next().transpose()?;
     Ok(header.as_deref().map(catalog_rules_version).unwrap_or(0))
 }
 
 pub fn corpus_offset_minutes(root: &Path) -> io::Result<i64> {
-    let output = resolve_output(root);
+    let corpus = root.to_path_buf();
     for name in ["sources.tsv", "sources.tsv.partial"] {
-        let path = output.join(name);
+        let path = corpus.join(name);
         if !path.is_file() {
             continue;
         }
@@ -1463,11 +1490,11 @@ fn normalize_source_input(input: &str) -> String {
     input.to_string()
 }
 
-fn load_source_inputs(output: &Path) -> io::Result<Vec<String>> {
+fn load_source_inputs(corpus: &Path) -> io::Result<Vec<String>> {
     let mut inputs = Vec::new();
     for path in [
-        output.join(SOURCE_INPUTS_FILE),
-        output.join(format!("{}.partial", SOURCE_INPUTS_FILE)),
+        corpus.join(SOURCE_INPUTS_FILE),
+        corpus.join(format!("{}.partial", SOURCE_INPUTS_FILE)),
     ] {
         if !path.is_file() {
             continue;
@@ -1485,10 +1512,10 @@ fn load_source_inputs(output: &Path) -> io::Result<Vec<String>> {
     Ok(inputs)
 }
 
-fn write_source_inputs(output: &Path, inputs: &[String]) -> io::Result<()> {
-    let partial_path = output.join(format!("{}.partial", SOURCE_INPUTS_FILE));
-    let complete_path = output.join(SOURCE_INPUTS_FILE);
-    write_source_inputs_partial(output, inputs)?;
+fn write_source_inputs(corpus: &Path, inputs: &[String]) -> io::Result<()> {
+    let partial_path = corpus.join(format!("{}.partial", SOURCE_INPUTS_FILE));
+    let complete_path = corpus.join(SOURCE_INPUTS_FILE);
+    write_source_inputs_partial(corpus, inputs)?;
     if complete_path.exists() {
         fs::remove_file(&complete_path)?;
     }
@@ -1496,8 +1523,8 @@ fn write_source_inputs(output: &Path, inputs: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn write_source_inputs_partial(output: &Path, inputs: &[String]) -> io::Result<()> {
-    let partial_path = output.join(format!("{}.partial", SOURCE_INPUTS_FILE));
+fn write_source_inputs_partial(corpus: &Path, inputs: &[String]) -> io::Result<()> {
+    let partial_path = corpus.join(format!("{}.partial", SOURCE_INPUTS_FILE));
     let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&partial_path)?);
     let mut sorted = inputs.to_vec();
     sorted.sort();
@@ -1510,11 +1537,11 @@ fn write_source_inputs_partial(output: &Path, inputs: &[String]) -> io::Result<(
 }
 
 pub fn source_availability(path: &Path) -> io::Result<SourceAvailabilitySnapshot> {
-    load_source_availability(&resolve_output(path))
+    load_source_availability(path)
 }
 
-fn load_source_availability(output: &Path) -> io::Result<SourceAvailabilitySnapshot> {
-    let path = output.join(SOURCE_AVAILABILITY_FILE);
+fn load_source_availability(corpus: &Path) -> io::Result<SourceAvailabilitySnapshot> {
+    let path = corpus.join(SOURCE_AVAILABILITY_FILE);
     if !path.is_file() {
         return Ok(SourceAvailabilitySnapshot::default());
     }
@@ -1586,11 +1613,11 @@ fn invalid_availability(path: &Path, message: &str) -> io::Error {
 }
 
 fn write_source_availability(
-    output: &Path,
+    corpus: &Path,
     snapshot: &SourceAvailabilitySnapshot,
 ) -> io::Result<()> {
-    let partial_path = output.join(format!("{}.partial", SOURCE_AVAILABILITY_FILE));
-    let complete_path = output.join(SOURCE_AVAILABILITY_FILE);
+    let partial_path = corpus.join(format!("{}.partial", SOURCE_AVAILABILITY_FILE));
+    let complete_path = corpus.join(SOURCE_AVAILABILITY_FILE);
     let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&partial_path)?);
     writeln!(
         writer,
@@ -1693,11 +1720,11 @@ fn attach_source_ids(
 }
 
 pub fn timeline_catalog(path: &Path) -> io::Result<BTreeMap<String, Vec<TimelineRun>>> {
-    load_timeline_catalog(&resolve_output(path))
+    load_timeline_catalog(path)
 }
 
 pub fn timeline_catalog_present(path: &Path) -> bool {
-    resolve_output(path).join("timeline.tsv").is_file()
+    path.join("timeline.tsv").is_file()
 }
 
 pub fn timeline_corpus_file(path: &Path, file_name: &str) -> io::Result<PathBuf> {
@@ -1708,14 +1735,14 @@ pub fn timeline_corpus_file(path: &Path, file_name: &str) -> io::Result<PathBuf>
             format!("invalid timeline corpus file name: {}", file_name),
         ));
     }
-    Ok(corpus_root(path).join(file))
+    Ok(segment_dir(path).join(file))
 }
 
 pub fn rebuild_timeline(path: &Path) -> io::Result<()> {
     let offset_minutes = corpus_offset_minutes(path)?;
-    let output = resolve_output(path);
-    let sources = load_source_catalog(&output)?;
-    let files = corpus_files(&output)?;
+    let corpus = path.to_path_buf();
+    let sources = load_source_catalog(&corpus)?;
+    let files = corpus_files(&corpus)?;
     let mut runs_by_source = BTreeMap::<String, Vec<TimelineRun>>::new();
     let mut scanned_bytes = 0u64;
     for (index, file) in files.iter().enumerate() {
@@ -1733,14 +1760,14 @@ pub fn rebuild_timeline(path: &Path) -> io::Result<()> {
             );
         }
     }
-    write_timeline_catalog(&output, &sources, &runs_by_source)?;
+    write_timeline_catalog(&corpus, &sources, &runs_by_source)?;
     let run_count = runs_by_source.values().map(Vec::len).sum::<usize>();
     println!(
-        "{{\"disposition\":\"timeline_rebuilt\",\"mode\":\"timeline_catalog\",\"files\":{},\"runs\":{},\"scanned_bytes\":{},\"output\":{}}}",
+        "{{\"disposition\":\"timeline_rebuilt\",\"mode\":\"timeline_catalog\",\"files\":{},\"runs\":{},\"scanned_bytes\":{},\"corpus\":{}}}",
         files.len(),
         run_count,
         scanned_bytes,
-        json_string(&output.to_string_lossy()),
+        json_string(&corpus.to_string_lossy()),
     );
     Ok(())
 }
@@ -1864,12 +1891,12 @@ fn corpus_source_id_from_path(path: &Path) -> Option<String> {
 }
 
 fn write_timeline_catalog(
-    output: &Path,
+    corpus: &Path,
     sources: &BTreeMap<String, SourceEntry>,
     runs_by_source: &BTreeMap<String, Vec<TimelineRun>>,
 ) -> io::Result<()> {
-    let path = output.join("timeline.tsv");
-    let partial_path = output.join("timeline.tsv.partial");
+    let path = corpus.join("timeline.tsv");
+    let partial_path = corpus.join("timeline.tsv.partial");
     let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&partial_path)?);
     writeln!(writer, "{}", timeline_header())?;
     for source_id in sources.keys() {
@@ -1954,8 +1981,8 @@ fn timeline_ref_values(reference: Option<&TimelineRef>) -> (u8, [String; 9]) {
     )
 }
 
-fn load_timeline_catalog(output: &Path) -> io::Result<BTreeMap<String, Vec<TimelineRun>>> {
-    let path = output.join("timeline.tsv");
+fn load_timeline_catalog(corpus: &Path) -> io::Result<BTreeMap<String, Vec<TimelineRun>>> {
+    let path = corpus.join("timeline.tsv");
     let mut result = BTreeMap::new();
     if !path.is_file() {
         return Ok(result);
@@ -2048,9 +2075,9 @@ fn parse_timeline_ref(parts: &[&str], start: usize) -> Option<Option<TimelineRef
     }))
 }
 
-fn load_source_catalog(output: &Path) -> io::Result<BTreeMap<String, SourceEntry>> {
-    let complete_path = output.join("sources.tsv");
-    let partial_path = output.join("sources.tsv.partial");
+fn load_source_catalog(corpus: &Path) -> io::Result<BTreeMap<String, SourceEntry>> {
+    let complete_path = corpus.join("sources.tsv");
+    let partial_path = corpus.join("sources.tsv.partial");
     let mut catalog = load_source_catalog_paths(&[complete_path])?;
     if let Ok(resumed) = load_source_catalog_paths(std::slice::from_ref(&partial_path)) {
         catalog.extend(resumed);
@@ -2330,7 +2357,7 @@ fn file_identity(_path: &Path) -> (u64, u64) {
     (0, 0)
 }
 
-fn rebuild_output_name(corpus_root: &Path, entry: &SourceEntry) -> String {
+fn rebuild_output_name(segment_dir: &Path, entry: &SourceEntry) -> String {
     let prefix = format!(
         "{}--rewrite-{}-{}",
         entry.source_id, entry.modified_ms, entry.size
@@ -2339,7 +2366,7 @@ fn rebuild_output_name(corpus_root: &Path, entry: &SourceEntry) -> String {
     let mut attempt = 0u64;
     loop {
         let name = format!("{}{}.corpus", prefix, suffix);
-        let path = corpus_root.join(&name);
+        let path = segment_dir.join(&name);
         let partial = path.with_extension("corpus.partial");
         if !path.exists() && !partial.exists() {
             return name;
@@ -3625,9 +3652,9 @@ truncated-header",
         let root =
             std::env::temp_dir().join(format!("ebira-rebuild-preserve-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let corpus_root = root.join("corpus");
-        fs::create_dir_all(&corpus_root).expect("create corpus directory");
-        let old = corpus_root.join("source.corpus");
+        let segment_dir = root.join("corpus");
+        fs::create_dir_all(&segment_dir).expect("create corpus directory");
+        let old = segment_dir.join("source.corpus");
         fs::write(&old, b"old projection").expect("write old projection");
         let entry = SourceEntry {
             source_id: "source".to_string(),
@@ -3639,7 +3666,7 @@ truncated-header",
         let result = process_source(
             &entry,
             None,
-            &corpus_root,
+            &segment_dir,
             std::slice::from_ref(&old),
             "source_rewritten",
             0,
@@ -3678,7 +3705,7 @@ truncated-header",
         let second_sync = build(&registered, &output, true, 300, &[]).expect("second tail sync");
         assert_eq!(second_sync.disposition, "incomplete");
         assert_eq!(source_catalog(&output).unwrap()[&source_id].last_line, 1);
-        let partial_files = fs::read_dir(output.join("corpus"))
+        let partial_files = fs::read_dir(super::segment_dir(&output))
             .expect("read corpus directory")
             .filter_map(Result::ok)
             .filter(|entry| {

@@ -109,7 +109,7 @@ unless `EBIRA_TZ_OFFSET` is set. Delete `demo-corpus` afterwards.
 | `context` | Read an original record, and its neighbours, from a source reference |
 | `follow` | Wait for the next message written to another session's transcript |
 | `commits` | Find the commit ids mentioned in the records and resolve them with Git |
-| `import` | Copy JSONL logs into the data directory so they outlive the originals |
+| `import` | Copy JSONL logs into the corpus directory so they outlive the originals |
 
 `ebira help <command>` lists a command's options. Every command writes one JSON
 object (`said --format text` prints plain text instead). An error is
@@ -233,7 +233,7 @@ A corpus keeps its offset until it is rebuilt.
 The logs are the source of truth and the corpus is a projection of them:
 `sources.tsv` (source catalog and checkpoints), `source-inputs.tsv` (the
 registered sources), `source-availability.tsv`, `timeline.tsv`, and
-`corpus/*.corpus` (the projected events). The catalog records the storage format
+`segments/*.corpus` (the projected events). The catalog records the storage format
 and the reading rules the corpus was made under. When an Ebira update changes
 either, the next `ebira sync` rebuilds the corpus from the logs in full and
 reports `rebuild_cause`; otherwise a sync reads only what the logs gained, and
@@ -246,11 +246,11 @@ another one runs, and the commands that read the corpus wait for a sync in
 progress, so none of them sees a half-written corpus.
 
 `ebira import --source <path> --provenance <text> --label <text>` copies JSONL
-logs into `managed-imports/` beside the corpus, with their original paths, sizes,
+logs into `managed-imports/` inside the corpus directory, with their original paths, sizes,
 and times, so they stay available after the originals are gone; the next
-`ebira sync` indexes them and `ebira status` lists them. The whole data directory
-can be moved: import paths are relative. Back up the imports with your other
-data; the rest is generated.
+`ebira sync` indexes them and `ebira status` lists them. The corpus directory can
+be moved as a whole: import paths are relative to it. Back up `managed-imports/`
+with your other data; everything else in the directory is generated.
 
 The corpus holds the text of your conversations, including anything pasted into
 them. It never leaves the machine; keep it as private as the logs themselves.

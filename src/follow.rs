@@ -351,7 +351,7 @@ fn message_from_fields(
         return None;
     }
     let text = if meta.sender == Sender::Human {
-        human_text_from_body(&select_body(fields, &meta, 0)).0
+        human_text_from_body(&select_body(fields, &meta, 0).body).0
     } else {
         text
     };

@@ -54,8 +54,9 @@ fn text(path: &Path) -> &str {
     path.to_str().expect("test path is UTF-8")
 }
 
-fn imported_directory(home: &Path) -> PathBuf {
-    std::fs::read_dir(home.join("managed-imports"))
+/// Managed imports live inside the corpus directory.
+fn imported_directory(corpus: &Path) -> PathBuf {
+    std::fs::read_dir(corpus.join("managed-imports"))
         .expect("read managed imports")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -102,7 +103,7 @@ fn import_preserves_records_provenance_and_portability() {
         "import reports the copy and its provenance: {imported}"
     );
 
-    let managed = imported_directory(&home);
+    let managed = imported_directory(&corpus);
     let copied = managed
         .join("jsonl")
         .join("02")
@@ -252,7 +253,7 @@ fn missing_managed_copy_remains_registered() {
         text(&corpus),
     ]);
     run(&["sync", "--source", text(&live), "--corpus", text(&corpus)]);
-    std::fs::remove_dir_all(imported_directory(&home)).expect("remove managed copy");
+    std::fs::remove_dir_all(imported_directory(&corpus)).expect("remove managed copy");
     let immediate_status = run(&["status", "--corpus", text(&corpus)]);
     assert!(
         immediate_status.contains("\"disposition\":\"managed_imports_unavailable\"")
@@ -305,7 +306,8 @@ fn removed_import_is_one_missing_source_under_any_spelling() {
         text(&corpus),
     ]);
     run(&["sync", "--source", text(&live), "--corpus", text(&corpus)]);
-    std::fs::remove_dir_all(imported_directory(&real.join("home"))).expect("remove managed copy");
+    std::fs::remove_dir_all(imported_directory(&real.join("home").join("corpus")))
+        .expect("remove managed copy");
     let build = run(&["sync", "--corpus", text(&corpus)]);
     assert!(
         build.contains("\"unavailable_managed_imports\":1")
@@ -319,10 +321,9 @@ fn removed_import_is_one_missing_source_under_any_spelling() {
 #[test]
 fn invalid_registry_returns_an_error() {
     let root = root("registry-not-file");
-    let home = root.join("home");
-    std::fs::create_dir_all(home.join("managed-imports.tsv"))
+    let corpus = root.join("home").join("corpus");
+    std::fs::create_dir_all(corpus.join("managed-imports.tsv"))
         .expect("create a non-file registry path");
-    let corpus = home.join("corpus");
 
     let observed = run_failure(&["sync", "--corpus", text(&corpus)]);
     assert!(
