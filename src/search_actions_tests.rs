@@ -174,14 +174,23 @@ fn history_actions_execute_for_matches_dates_and_time_buckets() {
         assert!(actions
             .iter()
             .any(|args| args.contains(&"--date-offset=1".into())));
-        for args in actions {
-            assert_eq!(args[0], "history");
+        for (index, args) in actions.into_iter().enumerate() {
+            assert_eq!(args[0], if index < 3 { "search" } else { "history" });
             assert!(args.contains(&"--query=--Needle".into()));
             assert!(args.contains(&"--session=s1".into()));
             assert!(args.contains(&"--sender=human".into()));
             assert_eq!(args.iter().any(|arg| arg == "--raw"), raw);
-            let next = crate::search_request(&args, "history", request.offset_minutes).unwrap();
-            assert!(fixture.result(&next).contains("\"returned\":1"));
+            let next = crate::search_request(&args, &args[0], request.offset_minutes).unwrap();
+            let result = fixture.result(&next);
+            assert!(result.contains("\"returned\":1"));
+            if args[0] == "search" {
+                for following in fixture.follow(&result) {
+                    assert!(
+                        following.contains(&"--offset=1".into()),
+                        "a bucket must advance into its records: {following:?}"
+                    );
+                }
+            }
         }
     }
 }
@@ -231,7 +240,7 @@ fn history_time_bucket_actions_keep_tighter_timestamp_bounds() {
     let actions = fixture.follow(&fixture.result(&request));
     assert_eq!(actions.len(), 4, "two dates, a match page, and a date page");
     for args in actions {
-        let next = crate::search_request(&args, "history", request.offset_minutes).unwrap();
+        let next = crate::search_request(&args, &args[0], request.offset_minutes).unwrap();
         for timestamp in ["2026-08-16T10:00:00Z", "2026-08-18T10:00:00Z"] {
             assert!(
                 !next.range.contains(timestamp, next.offset_minutes),

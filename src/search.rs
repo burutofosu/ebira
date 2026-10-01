@@ -1152,7 +1152,7 @@ fn history_next_actions(
         }
         actions.push(
             json::Object::new()
-                .name("action", "history")
+                .name("action", "search")
                 .text("query", &request.query)
                 .name("from", date)
                 .name("to", date)
