@@ -84,6 +84,31 @@ jobs:
       - name: Build
         run: cargo +"$RUST_TOOLCHAIN" build --locked --release --target "${{ matrix.target }}"
 
+      - name: Check the release binary with a closed output pipe
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python - <<'PY'
+          import os, subprocess, tempfile
+          from pathlib import Path
+
+          target = os.environ["TARGET"]
+          binary = "ebira.exe" if "windows" in target else "ebira"
+          executable = str((Path("target") / target / "release" / binary).resolve())
+          with tempfile.TemporaryDirectory(prefix="ebira-pipe-check-") as directory:
+              corpus = str(Path(directory) / "corpus")
+              subprocess.run([executable, "sync", "--corpus", corpus, "--source", "examples/claude-session.jsonl"],
+                             check=True, stdout=subprocess.DEVNULL)
+              for args in (["help"], ["said", "--corpus", corpus], ["said", "--corpus", corpus, "--format", "text"]):
+                  reader, writer = os.pipe()
+                  os.close(reader)
+                  with os.fdopen(writer, "wb") as closed_pipe:
+                      result = subprocess.run([executable, *args], stdout=closed_pipe, stderr=subprocess.PIPE)
+                  if result.returncode != 0 or result.stderr:
+                      raise SystemExit(f"Closed-pipe check failed for {args}: {result.returncode}, {result.stderr.decode(errors='replace')}")
+          print("Release binary exits cleanly when the output reader closes.")
+          PY
+
       - name: Package and checksum
         env:
           VERSION: ${{ steps.version.outputs.version }}

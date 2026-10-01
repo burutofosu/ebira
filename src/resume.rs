@@ -4,8 +4,8 @@ use crate::core::{
 };
 use crate::corpus::{self, SourceEntry};
 use crate::format::{body_fields, parse_event_header, push_field};
-use crate::json;
 use crate::jsonl::{parse_record, Field};
+use crate::{json, output};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek};
@@ -70,8 +70,7 @@ pub fn resume(
     let source_id = match requested_source_id {
         Some(source_id) => {
             if !catalog.contains_key(source_id) {
-                print_not_found("source_id", source_id);
-                return Ok(());
+                return print_not_found("source_id", source_id);
             }
             source_id.to_string()
         }
@@ -89,9 +88,9 @@ pub fn resume(
             sort_by_recency(&catalog, &last_event_at, &mut candidates, offset_minutes);
             if candidates.is_empty() {
                 if let Some(session) = requested_session {
-                    print_not_found("session", session);
+                    print_not_found("session", session)?;
                 } else {
-                    print_not_found("source_id", "");
+                    print_not_found("source_id", "")?;
                 }
                 return Ok(());
             }
@@ -102,8 +101,12 @@ pub fn resume(
                 Some(source_id) => source_id,
                 None if candidates.len() == 1 => candidates[0].clone(),
                 None => {
-                    print_ambiguous(&catalog, &last_event_at, &candidates, requested_session);
-                    return Ok(());
+                    return print_ambiguous(
+                        &catalog,
+                        &last_event_at,
+                        &candidates,
+                        requested_session,
+                    );
                 }
             }
         }
@@ -118,15 +121,14 @@ pub fn resume(
     }
     let Some(current) = scanned.current.take() else {
         if let Some(session) = requested_session {
-            print_not_found("session", session);
+            print_not_found("session", session)?;
         } else {
-            print_not_found("source_id", &source_id);
+            print_not_found("source_id", &source_id)?;
         }
         return Ok(());
     };
     if brief {
-        print!("{}", brief_json(&source_id, entry, &current, &scanned));
-        return Ok(());
+        return output::write(&brief_json(&source_id, entry, &current, &scanned));
     }
 
     let boundary_reached = corpus::source_is_complete(entry);
@@ -198,8 +200,7 @@ pub fn resume(
             ),
         )
         .raw("next_cursor", &next_cursor);
-    println!("{}", output.finish());
-    Ok(())
+    output::write_line(&output.finish())
 }
 
 /// Every segment of the source is read, however the source was named: the person's messages
@@ -834,7 +835,7 @@ fn print_ambiguous(
     last_event_at: &BTreeMap<String, String>,
     candidates: &[String],
     requested_session: Option<&str>,
-) {
+) -> io::Result<()> {
     let listed = candidates.iter().take(50).filter_map(|source_id| {
         let entry = catalog.get(source_id)?;
         Some(
@@ -852,33 +853,31 @@ fn print_ambiguous(
                 .finish(),
         )
     });
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name("disposition", "ambiguous_current_session")
             .name("mode", "resume")
             .optional("requested_session", requested_session)
             .name(
                 "candidate_order",
-                "last_event_at_desc_then_modified_ms_desc"
+                "last_event_at_desc_then_modified_ms_desc",
             )
             .number("candidate_count", candidates.len() as u64)
             .number("candidates_returned", candidates.len().min(50) as u64)
             .boolean("candidates_truncated", candidates.len() > 50)
             .raw("candidates", &json::array(listed))
-            .finish()
-    );
+            .finish(),
+    )
 }
 
-fn print_not_found(kind: &str, value: &str) {
-    println!(
-        "{}",
-        json::Object::new()
+fn print_not_found(kind: &str, value: &str) -> io::Result<()> {
+    output::write_line(
+        &json::Object::new()
             .name("disposition", "not_found")
             .name("mode", "resume")
             .name(kind, value)
-            .finish()
-    );
+            .finish(),
+    )
 }
 
 fn resume_disposition(entry: &SourceEntry) -> &'static str {

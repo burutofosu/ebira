@@ -303,6 +303,9 @@ The action is a CLI subcommand. Convert underscores in request keys to hyphens
 and null values. Each request includes the selected corpus. A search of the
 original records uses `search` or `history` with `raw: true`.
 
+If the standard output reader closes the pipe, the command exits quietly with
+status 0. Other command and output errors retain status 1.
+
 The same things look the same in every result. A value that is not there is
 `null`, never `""`; text is written as it is, empty or not. A record is named by
 one `source_ref`, `{source_id, source_path, line, byte_start, byte_len}`, whose

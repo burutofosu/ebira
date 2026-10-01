@@ -1,6 +1,6 @@
 use crate::corpus::{self, SourceEntry};
 use crate::format::parse_event_header;
-use crate::json;
+use crate::{json, output};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -115,8 +115,7 @@ pub fn run(root: &Path, request: &CommitRequest) -> io::Result<()> {
             resolved_names: resolved.len() as u64,
             total,
         },
-    );
-    Ok(())
+    )
 }
 
 struct Counts {
@@ -505,7 +504,7 @@ fn print_result(
     resolved: &BTreeMap<String, String>,
     page: &[(String, CommitFacts)],
     counts: Counts,
-) {
+) -> io::Result<()> {
     let mut by_object: BTreeMap<&str, Vec<&Candidate>> = BTreeMap::new();
     for (written, object) in resolved {
         if let Some(candidate) = candidates.get(written) {
@@ -572,9 +571,8 @@ fn print_result(
         .finish();
     let next_offset = request.offset.saturating_add(page.len() as u64);
     let has_more = next_offset < counts.total;
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name("disposition", "commits_joined")
             .name("mode", "commit_join")
             .name("repo", &request.repo)
@@ -591,8 +589,8 @@ fn print_result(
             .optional_number("next_offset", has_more.then_some(next_offset))
             .raw("applied_filters", &filters)
             .raw("commits", &json::array(commits))
-            .finish()
-    );
+            .finish(),
+    )
 }
 
 #[cfg(test)]

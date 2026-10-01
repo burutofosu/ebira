@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use crate::core::{human_text_from_body, persons_message, PersonsMessage, SeenMessages};
 use crate::corpus::{self, LogReader, ReadRecord, SourceEntry};
-use crate::json;
 use crate::jsonl::{Field, ScalarKind};
+use crate::{json, output};
 
 pub struct FollowRequest {
     pub source_id: Option<String>,
@@ -82,13 +82,11 @@ pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
             None => (Vec::new(), cursor),
         };
         if !messages.is_empty() {
-            print_result("received", &target, next, &messages);
-            return Ok(());
+            return print_result("received", &target, next, &messages);
         }
         cursor = next;
         if Instant::now() >= deadline {
-            print_result("waiting", &target, cursor, &messages);
-            return Ok(());
+            return print_result("waiting", &target, cursor, &messages);
         }
         sleep(Duration::from_millis(500));
     }
@@ -489,7 +487,12 @@ fn collect_text(fields: &[Field], content_prefix: &str, kinds: &[&str]) -> Strin
     parts.join("\n")
 }
 
-fn print_result(disposition: &str, target: &Target, after_byte: u64, messages: &[Message]) {
+fn print_result(
+    disposition: &str,
+    target: &Target,
+    after_byte: u64,
+    messages: &[Message],
+) -> io::Result<()> {
     let source_path = target.path.to_string_lossy();
     let messages = messages.iter().map(|message| {
         json::Object::new()
@@ -510,16 +513,15 @@ fn print_result(disposition: &str, target: &Target, after_byte: u64, messages: &
             )
             .finish()
     });
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name("disposition", disposition)
             .name("source_id", &target.source_id)
             .name("source_path", &source_path)
             .number("after_byte", after_byte)
             .raw("messages", &json::array(messages))
-            .finish()
-    );
+            .finish(),
+    )
 }
 
 #[cfg(test)]

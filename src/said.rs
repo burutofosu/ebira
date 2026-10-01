@@ -8,7 +8,7 @@
 use crate::core::{human_text_from_body, persons_message, PersonsMessage, SeenMessages, Sender};
 use crate::corpus::{self, SourceEntry};
 use crate::format::{parse_event_header, EventHeader};
-use crate::json;
+use crate::{json, output};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -140,19 +140,15 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
     let duration_ms = started.elapsed().as_millis() as u64;
 
     if request.text_format {
-        print!(
-            "{}",
-            text_output(
-                request,
-                &page,
-                total,
-                next_offset,
-                has_more,
-                copies + imported,
-                stale_sources
-            )
-        );
-        return Ok(());
+        return output::write(&text_output(
+            request,
+            &page,
+            total,
+            next_offset,
+            has_more,
+            copies + imported,
+            stale_sources,
+        ));
     }
     let filters = json::Object::new()
         .optional("session", request.session.as_deref())
@@ -196,8 +192,7 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
         .number("duration_ms", duration_ms)
         .raw("messages", &json::array(messages))
         .finish();
-    println!("{}", output);
-    Ok(())
+    output::write_line(&output)
 }
 
 fn scan_file(

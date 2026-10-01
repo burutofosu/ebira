@@ -714,6 +714,170 @@ fn next_action_contains_only_request_fields() {
     }
 }
 
+fn run_with_closed_stdout(args: &[&str]) -> std::process::Output {
+    let (reader, writer) = std::io::pipe().expect("create pipe");
+    drop(reader);
+    ebira()
+        .args(args)
+        .stdout(writer)
+        .output()
+        .expect("ebira runs with an already closed reader")
+}
+
+#[test]
+fn commands_exit_cleanly_when_the_output_reader_closes() {
+    let fixture = Fixture::new("closed-stdout");
+    let corpus = fixture.corpus();
+    let source = fixture.path().join("log.jsonl");
+    let found = run(&["search", "--corpus", &corpus, "--query", "probe"]);
+    let source_id = found
+        .split("\"source_id\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let repo = fixture.path().join("git-repo");
+    let initialized = Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&repo)
+        .output()
+        .expect("git init runs");
+    assert!(initialized.status.success());
+    let commands = [
+        vec!["said", "--corpus", &corpus, "--format", "text"],
+        vec!["said", "--corpus", &corpus],
+        vec![],
+        vec!["help"],
+        vec!["help", "search"],
+        vec!["search", "--help"],
+        vec!["--version"],
+        vec!["search", "--corpus", &corpus, "--query", "probe"],
+        vec!["history", "--corpus", &corpus, "--query", "probe"],
+        vec!["timeline", "--corpus", &corpus],
+        vec!["timeline", "--corpus", &corpus, "--date", "2026-08-16"],
+        vec!["resume", "--corpus", &corpus, "--session", "s1"],
+        vec!["resume", "--corpus", &corpus, "--brief"],
+        vec!["resume", "--corpus", &corpus, "--session", "missing"],
+        vec!["resume", "--corpus", &corpus, "--source-id", "missing"],
+        vec!["status", "--corpus", &corpus],
+        vec![
+            "context",
+            "--corpus",
+            &corpus,
+            "--source-id",
+            source_id,
+            "--byte-start",
+            "0",
+            "--byte-len",
+            "1",
+        ],
+        vec![
+            "follow",
+            "--corpus",
+            &corpus,
+            "--source",
+            source.to_str().unwrap(),
+            "--after-byte",
+            "0",
+            "--seconds",
+            "0",
+        ],
+        vec![
+            "follow",
+            "--corpus",
+            &corpus,
+            "--source",
+            source.to_str().unwrap(),
+            "--seconds",
+            "0",
+        ],
+        vec![
+            "commits",
+            "--corpus",
+            &corpus,
+            "--repo",
+            repo.to_str().unwrap(),
+        ],
+        vec![
+            "import",
+            "--corpus",
+            &corpus,
+            "--source",
+            source.to_str().unwrap(),
+            "--provenance",
+            "test",
+            "--label",
+            "pipe",
+        ],
+        vec!["sync", "--corpus", &corpus],
+        vec!["timeline", "--corpus", &corpus, "--rebuild"],
+    ];
+    for args in commands {
+        let output = run_with_closed_stdout(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{args:?}: {:?}: {stderr}",
+            output.status.code()
+        );
+        assert!(
+            !stderr.contains("panicked")
+                && !stderr.contains("Broken pipe")
+                && !stderr.contains("failed printing"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_closed_stdout_does_not_hide_command_errors() {
+    let output = run_with_closed_stdout(&["unknown-command"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("unknown command: unknown-command"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn closed_stderr_cannot_panic_during_progress_or_error_reporting() {
+    let fixture = Fixture::new("closed-stderr");
+    let corpus = fixture.corpus();
+    for (args, code) in [
+        (vec!["sync", "--corpus", &corpus], 0),
+        (vec!["timeline", "--corpus", &corpus, "--rebuild"], 0),
+        (vec!["unknown-command"], 1),
+    ] {
+        let (reader, writer) = std::io::pipe().expect("create pipe");
+        drop(reader);
+        let output = ebira()
+            .args(&args)
+            .stderr(writer)
+            .output()
+            .expect("ebira runs");
+        assert_eq!(output.status.code(), Some(code), "{args:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"disposition\":"), "{args:?}: {stdout}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn other_stdout_errors_remain_failures() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = ebira().arg("help").stdout(full).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("ebira:"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
 #[test]
 fn first_sync_reads_the_default_transcript_directories() {
     let root = std::env::temp_dir().join(format!(

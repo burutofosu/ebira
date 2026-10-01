@@ -6,6 +6,7 @@ mod format;
 mod imports;
 mod json;
 mod jsonl;
+mod output;
 mod private_fs;
 mod resume;
 mod said;
@@ -423,20 +424,18 @@ fn validate_options(spec: &CommandSpec, args: &[String]) -> io::Result<()> {
 
 fn run(args: &[String]) -> io::Result<()> {
     let Some(command) = args.first().map(String::as_str) else {
-        println!("{}", usage());
-        return Ok(());
+        return output::write_line(&usage());
     };
     match command {
         "--version" | "-V" => {
-            println!("ebira {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            return output::write_line(&format!("ebira {}", env!("CARGO_PKG_VERSION")));
         }
         "help" | "--help" | "-h" => {
             match args.get(1) {
-                None => println!("{}", usage()),
+                None => output::write_line(&usage())?,
                 Some(name) => {
                     let spec = command_spec(name).ok_or_else(|| unknown_command(name))?;
-                    println!("{}", command_usage(spec));
+                    output::write_line(&command_usage(spec))?;
                 }
             }
             return Ok(());
@@ -448,8 +447,7 @@ fn run(args: &[String]) -> io::Result<()> {
         .iter()
         .any(|argument| argument == "--help" || argument == "-h")
     {
-        println!("{}", command_usage(spec));
-        return Ok(());
+        return output::write_line(&command_usage(spec));
     }
     validate_options(spec, args)?;
     match command {
@@ -465,8 +463,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 .unwrap_or_default();
             let _lock = corpus::lock_exclusive(&corpus)?;
             let report = imports::import(&corpus, &source, &provenance, &label, &source_computer)?;
-            println!("{}", report.json());
-            Ok(())
+            output::write_line(&report.json())
         }
         "search" | "history" => {
             let root = corpus_path(args)?;
@@ -680,9 +677,8 @@ fn sync(args: &[String]) -> io::Result<()> {
         optional_number_option(args, "--tool-output-chars")?,
         &option_values(args, "--rebuild-source"),
     )?;
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name("disposition", report.disposition)
             .name("mode", "compact_literal_corpus")
             .name("counter_scope", "this_command")
@@ -711,9 +707,8 @@ fn sync(args: &[String]) -> io::Result<()> {
             )
             .optional("rebuild_cause", rebuild_cause)
             .name("corpus", &report.corpus)
-            .finish()
-    );
-    Ok(())
+            .finish(),
+    )
 }
 
 fn search_request(
@@ -872,14 +867,17 @@ fn number_option_u64(args: &[String], name: &str) -> io::Result<u64> {
 
 fn main() {
     if let Err(error) = run(&std::env::args().skip(1).collect::<Vec<_>>()) {
-        println!(
-            "{}",
-            json::Object::new()
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return;
+        }
+        // Preserve the command failure even if its error output has no reader.
+        let _ = output::write_line(
+            &json::Object::new()
                 .name("disposition", "error")
                 .text("reason", &error.to_string())
-                .finish()
+                .finish(),
         );
-        eprintln!("ebira: {}", error);
+        output::diagnostic(format_args!("ebira: {}", error));
         std::process::exit(1);
     }
 }

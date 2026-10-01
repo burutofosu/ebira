@@ -1,8 +1,8 @@
 use crate::core::TimelineRef;
 use crate::corpus::{self, SourceEntry, TimelineRun};
 use crate::format::{self, parse_event_header, EventHeader};
-use crate::json;
 use crate::time::{self, Range};
+use crate::{json, output};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -218,8 +218,7 @@ pub fn run(root: &Path, request: SearchRequest) -> io::Result<()> {
     } else {
         search_json(root, &request, &scope, &files, &stats, duration_ms)?
     };
-    print!("{}", output);
-    Ok(())
+    output::write(&output)
 }
 
 pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
@@ -308,8 +307,7 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
         &dates,
         &request,
         started.elapsed().as_millis() as u64,
-    );
-    Ok(())
+    )
 }
 
 #[derive(Default)]
@@ -483,7 +481,7 @@ fn print_timeline_map(
     dates: &BTreeMap<String, TimelineMapBucket>,
     request: &TimelineRequest,
     duration_ms: u64,
-) {
+) -> io::Result<()> {
     let expected_sources = scope
         .sources
         .iter()
@@ -546,9 +544,8 @@ fn print_timeline_map(
         .skip(page_start)
         .take(limit.min(12))
         .map(|date| timeline_next_action(root, request, date));
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name("disposition", disposition)
             .name("mode", "timeline_map")
             .name("order", request.order.as_str())
@@ -574,8 +571,8 @@ fn print_timeline_map(
             .optional_number("next_offset", has_more.then_some(page_end))
             .raw("dates", &json::array(listed))
             .raw("next_actions", &json::array(actions))
-            .finish()
-    );
+            .finish(),
+    )
 }
 
 fn timeline_events(
@@ -642,9 +639,8 @@ fn timeline_events(
         "timeline_events_ready"
     };
     let staleness = corpus::Staleness::of(scope.sources.iter().copied());
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name("disposition", disposition)
             .name("mode", "timeline_events")
             .name("date", date)
@@ -660,9 +656,8 @@ fn timeline_events(
             .boolean("truncated", has_more)
             .optional_number("next_offset", has_more.then_some(page_end))
             .raw("events", &hits_json(&page_hits))
-            .finish()
-    );
-    Ok(())
+            .finish(),
+    )
 }
 
 fn scan_timeline_run(
@@ -1507,9 +1502,8 @@ pub fn context(
             .number("modified_ms", modified_ms)
             .finish()
     };
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name(
                 "disposition",
                 if read.is_some() {
@@ -1533,7 +1527,7 @@ pub fn context(
             .raw("source_recorded", &state(entry.size, entry.modified_ms))
             .raw(
                 "source_observed",
-                &state(observed_size, observed_modified_ms)
+                &state(observed_size, observed_modified_ms),
             )
             .raw(
                 "raw",
@@ -1543,9 +1537,8 @@ pub fn context(
                 ),
             )
             .raw("next_actions", &json::array(next_actions))
-            .finish()
-    );
-    Ok(())
+            .finish(),
+    )
 }
 
 /// The bytes of a log from `byte_start`, `byte_len` of them, within the log and the context

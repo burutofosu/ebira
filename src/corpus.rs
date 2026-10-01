@@ -6,9 +6,9 @@ use crate::core::{
 use crate::format::{
     decode_token, encode_token, event_header_line, parse_event_header, push_field, EventHeader,
 };
-use crate::json;
 use crate::jsonl::{parse_record, Field};
 use crate::private_fs;
+use crate::{json, output};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -461,14 +461,14 @@ pub fn build_with_preview(
 
             completed += 1;
             if completed.is_multiple_of(100) || completed == read_slice.len() {
-                eprintln!(
+                output::diagnostic(format_args!(
                     "corpus: {}/{} sources read, rebuilt={}, appended={}, reused={}",
                     completed,
                     read_slice.len(),
                     report.sources_processed,
                     report.sources_appended,
                     report.sources_reused,
-                );
+                ));
             }
         }
         Ok(())
@@ -601,9 +601,8 @@ pub fn status(path: &Path) -> io::Result<()> {
             .map(|metadata| metadata.len())
             .unwrap_or(0)
     };
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name(
                 "disposition",
                 if managed.unavailable_imports != 0 {
@@ -640,7 +639,7 @@ pub fn status(path: &Path) -> io::Result<()> {
             )
             .number(
                 "source_availability_total",
-                availability.entries.len() as u64
+                availability.entries.len() as u64,
             )
             .boolean(
                 "source_availability_truncated",
@@ -648,15 +647,14 @@ pub fn status(path: &Path) -> io::Result<()> {
             )
             .raw(
                 "source_availability",
-                &source_availability_json(&availability)
+                &source_availability_json(&availability),
             )
             .number(
                 "source_availability_bytes",
                 file_len(SOURCE_AVAILABILITY_FILE),
             )
-            .finish()
-    );
-    Ok(())
+            .finish(),
+    )
 }
 
 fn source_availability_json(snapshot: &SourceAvailabilitySnapshot) -> String {
@@ -2106,27 +2104,25 @@ pub fn rebuild_timeline(path: &Path) -> io::Result<()> {
         scanned_bytes = scanned_bytes.saturating_add(bytes);
         runs_by_source.entry(source_id).or_default().extend(runs);
         if (index + 1) % 100 == 0 || index + 1 == files.len() {
-            eprintln!(
+            output::diagnostic(format_args!(
                 "timeline: {}/{} corpus files scanned",
                 index + 1,
                 files.len()
-            );
+            ));
         }
     }
     write_timeline_catalog(&corpus, &sources, &runs_by_source)?;
     let run_count = runs_by_source.values().map(Vec::len).sum::<usize>();
-    println!(
-        "{}",
-        json::Object::new()
+    output::write_line(
+        &json::Object::new()
             .name("disposition", "timeline_rebuilt")
             .name("mode", "timeline_catalog")
             .number("files", files.len() as u64)
             .number("runs", run_count as u64)
             .number("scanned_bytes", scanned_bytes)
             .name("corpus", &corpus.to_string_lossy())
-            .finish()
-    );
-    Ok(())
+            .finish(),
+    )
 }
 
 fn scan_existing_timeline_file(
