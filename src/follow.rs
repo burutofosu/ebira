@@ -8,8 +8,9 @@
 //! holds at that boundary, so a message has the sender, `via`, timestamp, and
 //! byte range the corpus gives the same record.
 //!
-//! The transcript is named by a registered source id, by a session id whose
-//! file lives under one of the registered source roots, or by a path.
+//! The transcript is named by a registered source id, by a session id (its
+//! transcript in the corpus, else a file named by it under the registered
+//! source roots, for a session the corpus has not read yet), or by a path.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -83,8 +84,9 @@ pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
     }
 }
 
-/// `--source` wins, then `--source-id` through the catalog, then `--session`
-/// by file name under the registered source roots (newest file wins).
+/// `--source` wins, then `--source-id` through the catalog, then `--session`:
+/// the session's transcript in the corpus (`corpus::session_sources`), else the
+/// newest file named by it under the registered source roots.
 fn resolve_target(
     root: &Path,
     catalog: &BTreeMap<String, SourceEntry>,
@@ -121,6 +123,12 @@ fn resolve_target(
                 io::ErrorKind::InvalidInput,
                 "--session is empty",
             ));
+        }
+        if let Some(entry) = corpus::session_sources(catalog, session).main {
+            return Ok(Target {
+                source_id: entry.source_id.clone(),
+                path: PathBuf::from(&entry.path),
+            });
         }
         let mut found: Vec<(u64, PathBuf)> = Vec::new();
         for input in corpus::registered_sources(root)? {
@@ -184,9 +192,9 @@ fn collect_session_files(
 }
 
 fn names_session(path: &Path, session: &str) -> bool {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl") && name.contains(session))
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
+        && corpus::file_names_session(path, session)
 }
 
 fn modified_ms(metadata: &fs::Metadata) -> u64 {

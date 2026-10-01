@@ -75,15 +75,17 @@ pub fn resume(
             source_id.to_string()
         }
         None => {
-            let candidates = if let Some(session) = requested_session {
-                session_candidates(&catalog, &last_event_at, session, offset_minutes)
-            } else {
-                {
-                    let mut all = catalog.keys().cloned().collect::<Vec<_>>();
-                    sort_by_recency(&catalog, &last_event_at, &mut all, offset_minutes);
-                    all
-                }
+            let session =
+                requested_session.map(|session| corpus::session_sources(&catalog, session));
+            let mut candidates = match &session {
+                Some(session) => session
+                    .sources
+                    .iter()
+                    .map(|entry| entry.source_id.clone())
+                    .collect(),
+                None => catalog.keys().cloned().collect::<Vec<_>>(),
             };
+            sort_by_recency(&catalog, &last_event_at, &mut candidates, offset_minutes);
             if candidates.is_empty() {
                 if let Some(session) = requested_session {
                     print_not_found("session", session);
@@ -92,8 +94,9 @@ pub fn resume(
                 }
                 return Ok(());
             }
-            let chosen = requested_session
-                .and_then(|session| main_transcript(&catalog, &candidates, session));
+            let chosen = session
+                .and_then(|session| session.main)
+                .map(|entry| entry.source_id.clone());
             match chosen {
                 Some(source_id) => source_id,
                 None if candidates.len() == 1 => candidates[0].clone(),
@@ -337,34 +340,6 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
         recent_assistants,
         recent_commands,
     })
-}
-
-/// A session id names the main transcript and the transcripts of the agents it started:
-/// Claude Code subagent transcripts under `subagents/`, and Codex child threads that record
-/// their parent's session. The main transcript is the one outside `subagents/` whose file
-/// name carries the session id (`<session-id>.jsonl`, `rollout-<time>-<thread-id>.jsonl`).
-fn main_transcript(
-    catalog: &BTreeMap<String, SourceEntry>,
-    candidates: &[String],
-    session: &str,
-) -> Option<String> {
-    let main = candidates
-        .iter()
-        .filter(|source_id| {
-            catalog
-                .get(*source_id)
-                .map(|entry| {
-                    let path = Path::new(&entry.path);
-                    let named = path
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .is_some_and(|stem| stem.contains(session));
-                    named && !entry.path.replace('\\', "/").contains("/subagents/")
-                })
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    (main.len() == 1).then(|| main[0].clone())
 }
 
 fn compactions_json(scanned: &ScanResult) -> String {
@@ -904,24 +879,6 @@ fn candidate_last_event_times(
         }
     }
     Ok(times)
-}
-
-fn session_candidates(
-    catalog: &BTreeMap<String, SourceEntry>,
-    last_event_at: &BTreeMap<String, String>,
-    session: &str,
-    offset_minutes: i64,
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for entry in catalog.values() {
-        if corpus::source_declares_session(entry, session) {
-            candidates.push(entry.source_id.clone());
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    sort_by_recency(catalog, last_event_at, &mut candidates, offset_minutes);
-    candidates
 }
 
 fn print_ambiguous(

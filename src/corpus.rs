@@ -1429,7 +1429,47 @@ fn encode_turn_state(entry: &mut SourceEntry, state: &TurnReducerState) {
     );
 }
 
-pub fn source_declares_session(entry: &SourceEntry, session: &str) -> bool {
+/// The sources of a session, as every command resolves a `--session`.
+pub struct SessionSources<'a> {
+    /// The sources whose records declare the session. They take in the transcripts of the
+    /// agents it started: Claude Code subagents and Codex child threads record their parent's
+    /// session.
+    pub sources: Vec<&'a SourceEntry>,
+    /// The session's own transcript: the one source outside `subagents/` whose file name
+    /// carries the session id (`<session-id>.jsonl`, `rollout-<time>-<thread-id>.jsonl`).
+    pub main: Option<&'a SourceEntry>,
+}
+
+pub fn session_sources<'a>(
+    catalog: &'a BTreeMap<String, SourceEntry>,
+    session: &str,
+) -> SessionSources<'a> {
+    let sources = catalog
+        .values()
+        .filter(|entry| source_declares_session(entry, session))
+        .collect::<Vec<_>>();
+    let named = sources
+        .iter()
+        .copied()
+        .filter(|entry| file_names_session(Path::new(&entry.path), session))
+        .collect::<Vec<_>>();
+    let main = (named.len() == 1).then(|| named[0]);
+    SessionSources { sources, main }
+}
+
+/// Whether a transcript is named by the session: its file name carries the session id and it
+/// lies outside `subagents/`.
+pub fn file_names_session(path: &Path, session: &str) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.contains(session))
+        && !path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .contains("/subagents/")
+}
+
+fn source_declares_session(entry: &SourceEntry, session: &str) -> bool {
     decode_turn_state(entry)
         .sessions
         .iter()

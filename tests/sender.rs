@@ -442,13 +442,31 @@ fn follow_finds_a_session_registered_as_a_file_or_in_a_directory() {
     let by_file = follow("s-file");
     assert!(
         by_file.contains("\"disposition\":\"received\"")
-            && by_file.contains("registered as one file"),
-        "a session registered as a file: {by_file}"
+            && by_file.contains("registered as one file")
+            && by_file.contains("\"source_id\":\"claude-"),
+        "a session in the corpus is its transcript there: {by_file}"
     );
     let by_directory = follow("s-main");
     assert!(
         by_directory.contains("please build the map"),
         "a session found inside a registered directory: {by_directory}"
+    );
+    // A session the corpus has not read yet is found by its file name.
+    std::fs::write(
+        logs.root
+            .join(".claude/projects/C--work-game")
+            .join("s-new.jsonl"),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"written after the sync"},"sessionId":"s-new","uuid":"u9","timestamp":"2026-09-03T00:00:00Z"}"#,
+            "
+"
+        ),
+    )
+    .expect("write a new transcript");
+    let unread = follow("s-new");
+    assert!(
+        unread.contains("written after the sync") && unread.contains("\"source_id\":\"\""),
+        "{unread}"
     );
 }
 

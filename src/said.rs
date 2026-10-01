@@ -209,8 +209,12 @@ fn scoped_sources<'a>(
     catalog: &'a BTreeMap<String, SourceEntry>,
     request: &SaidRequest,
 ) -> Vec<&'a SourceEntry> {
-    catalog
-        .values()
+    let sources = match request.session.as_deref() {
+        Some(session) => corpus::session_sources(catalog, session).sources,
+        None => catalog.values().collect(),
+    };
+    sources
+        .into_iter()
         .filter(|entry| {
             request
                 .source_id
@@ -223,13 +227,6 @@ fn scoped_sources<'a>(
                 .agent
                 .as_deref()
                 .map(|agent| entry.app == agent)
-                .unwrap_or(true)
-        })
-        .filter(|entry| {
-            request
-                .session
-                .as_deref()
-                .map(|session| corpus::source_declares_session(entry, session))
                 .unwrap_or(true)
         })
         .collect()
@@ -419,7 +416,7 @@ fn text_output(
             local_time(&header.timestamp, request.offset_minutes),
             said.app,
             header.via,
-            header.session.chars().take(8).collect::<String>(),
+            header.session,
             header.source_id,
             header.byte_start,
             header.byte_len,

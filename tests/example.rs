@@ -51,17 +51,17 @@ fn the_readme_demonstration_holds() {
     );
     let expected = [
         (
-            "[2026-09-01 09:32] claude typed session=9f1c2a7e",
+            "[2026-09-01 09:32] claude typed session=9f1c2a7e-4b1d-4c55-8a3e-2f6b1d0c7a91 source-id=",
             "byte=1854+214",
             "Now make the retry limit configurable.",
         ),
         (
-            "[2026-09-01 09:00] claude queued session=9f1c2a7e",
+            "[2026-09-01 09:00] claude queued session=9f1c2a7e-4b1d-4c55-8a3e-2f6b1d0c7a91 source-id=",
             "byte=872+201",
             "Log each retry with its delay.",
         ),
         (
-            "[2026-09-01 09:00] claude typed session=9f1c2a7e",
+            "[2026-09-01 09:00] claude typed session=9f1c2a7e-4b1d-4c55-8a3e-2f6b1d0c7a91 source-id=",
             "byte=0+279",
             "Add retries to the upload client. Keep the total wait under 30 seconds, and never retry a 4xx response.",
         ),

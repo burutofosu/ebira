@@ -191,8 +191,17 @@ The person's messages have one definition, in `core.rs`, which `said`,
 when the same text was stored twice with the same timestamp
 (`core::SeenMessages`). Imported copies (`via: imported`) are counted but listed
 only when requested. A message is read whole, however long. `said` reads only
-such events; a session scope reads the segments of the sources that declare the
-session, and the other filters apply to event headers.
+such events; a session scope reads the segments of the session's sources, and
+the other filters apply to event headers.
+
+A `--session` is resolved once, by `corpus::session_sources`: the session's
+sources are those whose records declare it, which takes in the transcripts of the
+agents it started (Claude Code subagents and Codex child threads record their
+parent's session), and its main transcript is the one source outside
+`subagents/` whose file name carries the session id. `said` reads all of them;
+`resume` and `follow` read the main transcript. `follow` looks for a file named by
+the session under the registered source roots only when the corpus has not read
+the session yet.
 
 ## Timeline and dates
 
@@ -216,9 +225,9 @@ interleaved. Inferred turn identifiers use the byte offset of the record that
 opened the turn, which keeps them stable across rebuilds.
 
 Resume output reports the observed source boundary, current turn state,
-retention counts, truncation flags, and the next read position. When a session
-id matches a main transcript and its subagent transcripts, the main transcript
-is used. Every segment of the source is read, whether it was named by session or
+retention counts, truncation flags, and the next read position. A session id
+resumes its main transcript; without one, a single source of the session, and
+otherwise the candidates are listed. Every segment of the source is read, whether it was named by session or
 by source id, so both give the same result. The scan also keeps the person's
 latest messages, the latest replies and tool calls across turns, and the
 compaction count; `--brief` prints only those, reading reply text and tool

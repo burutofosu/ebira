@@ -73,13 +73,13 @@ ebira said --corpus demo-corpus --format text
 ```text
 # ebira said: 3 of 3 messages from the person, newest first (copies and imports skipped: 0, stale sources: 0)
 
-[2026-09-01 09:32] claude typed session=9f1c2a7e source-id=claude-3edaca68d64ba0a1 byte=1854+214
+[2026-09-01 09:32] claude typed session=9f1c2a7e-4b1d-4c55-8a3e-2f6b1d0c7a91 source-id=claude-3edaca68d64ba0a1 byte=1854+214
 Now make the retry limit configurable.
 
-[2026-09-01 09:00] claude queued session=9f1c2a7e source-id=claude-3edaca68d64ba0a1 byte=872+201
+[2026-09-01 09:00] claude queued session=9f1c2a7e-4b1d-4c55-8a3e-2f6b1d0c7a91 source-id=claude-3edaca68d64ba0a1 byte=872+201
 Log each retry with its delay.
 
-[2026-09-01 09:00] claude typed session=9f1c2a7e source-id=claude-3edaca68d64ba0a1 byte=0+279
+[2026-09-01 09:00] claude typed session=9f1c2a7e-4b1d-4c55-8a3e-2f6b1d0c7a91 source-id=claude-3edaca68d64ba0a1 byte=0+279
 Add retries to the upload client. Keep the total wait under 30 seconds, and never retry a 4xx response.
 ```
 
