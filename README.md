@@ -17,7 +17,7 @@ with `SHA256SUMS.txt`. Extract the archive and put `ebira` or `ebira.exe` on
 To build from source, install Rust 1.89 or later:
 
 ```sh
-cargo install --git https://github.com/burutofosu/ebira
+cargo install --locked --git https://github.com/burutofosu/ebira --tag v0.1.0
 ebira sync
 ```
 
@@ -89,6 +89,14 @@ ebira said --corpus demo-corpus --format text
 
 This lists three messages from a made-up session, including retry conditions
 that its compaction summary left out.
+
+Excerpt (message text only, newest first):
+
+```text
+Now make the retry limit configurable.
+Log each retry with its delay.
+Add retries to the upload client. Keep the total wait under 30 seconds, and never retry a 4xx response.
+```
 
 ## Use with an agent
 
