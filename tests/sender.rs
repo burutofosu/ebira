@@ -645,3 +645,69 @@ fn said_resume_and_follow_mean_the_same_by_the_persons_messages() {
         "with --sender any the copy is listed and marked: {everything}"
     );
 }
+
+#[test]
+fn every_command_reports_what_the_corpus_has_not_read_the_same_way() {
+    let logs = Logs::new("freshness");
+    let transcript = logs.path(".claude/projects/C--work-game/s-main.jsonl");
+    let appended = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"one more thing"},"sessionId":"s-main","timestamp":"2026-09-01T00:00:09Z","cwd":"C:/work/game"}"#,
+        "\n"
+    );
+    let mut contents = std::fs::read_to_string(&transcript).expect("read transcript");
+    contents.push_str(appended);
+    std::fs::write(&transcript, contents).expect("append a message");
+    let behind = format!("\"unscanned_source_bytes\":{}", appended.len());
+
+    let corpus = logs.corpus();
+    let said = run(&["said", "--corpus", &corpus, "--session", "s-main"]);
+    let search = run(&[
+        "search",
+        "--corpus",
+        &corpus,
+        "--query",
+        "the",
+        "--session",
+        "s-main",
+    ]);
+    let timeline = run(&[
+        "timeline",
+        "--corpus",
+        &corpus,
+        "--date",
+        "2026-09-01",
+        "--session",
+        "s-main",
+    ]);
+    let resumed = run(&["resume", "--corpus", &corpus, "--session", "s-main"]);
+    for (command, output) in [
+        ("said", &said),
+        ("search", &search),
+        ("timeline", &timeline),
+    ] {
+        assert!(
+            output.contains("\"stale_sources\":1") && output.contains(&behind),
+            "{command}: {output}"
+        );
+    }
+    assert!(
+        search.contains("\"corpus_sources\":2"),
+        "the session's coverage is its own sources, the main transcript and its subagent: {search}"
+    );
+    assert!(
+        resumed.contains("\"source_freshness\":\"behind\"")
+            && resumed.contains(&behind)
+            && resumed.contains("\"next_recall\":\"sync_then_resume\""),
+        "{resumed}"
+    );
+
+    run(&["sync", "--corpus", &corpus]);
+    let said = run(&["said", "--corpus", &corpus, "--session", "s-main"]);
+    let resumed = run(&["resume", "--corpus", &corpus, "--session", "s-main"]);
+    assert!(said.contains("\"stale_sources\":0"), "{said}");
+    assert!(
+        resumed.contains("\"source_freshness\":\"current\"")
+            && resumed.contains("\"next_recall\":\"none\""),
+        "{resumed}"
+    );
+}

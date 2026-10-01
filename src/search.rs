@@ -178,18 +178,19 @@ pub fn run(root: &Path, request: SearchRequest) -> io::Result<()> {
     }
     let started = Instant::now();
     let catalog = corpus::source_catalog(root)?;
-    let files = if let Some(source_id) = request.source_id.as_deref() {
-        corpus::source_files(root, source_id)?
-    } else {
-        corpus::corpus_files(root)?
-    };
+    let scope = corpus::scope(
+        &catalog,
+        request.source_id.as_deref(),
+        request.session.as_deref(),
+    );
+    let files = scope.files(root)?;
     let stats = scan_parallel(&files, &catalog, &request)?;
 
     let duration_ms = started.elapsed().as_millis() as u64;
     let output = if is_history_request(&request) {
-        history_json(root, &request, &catalog, &files, &stats, duration_ms)?
+        history_json(root, &request, &scope, &files, &stats, duration_ms)?
     } else {
-        search_json(root, &request, &catalog, &files, &stats, duration_ms)?
+        search_json(root, &request, &scope, &files, &stats, duration_ms)?
     };
     print!("{}", output);
     Ok(())
@@ -224,14 +225,10 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
         );
         return Ok(());
     }
+    let scope = corpus::scope(&catalog, request.source_id.as_deref(), None);
     let mut dates = BTreeMap::<String, TimelineMapBucket>::new();
     for (source_id, runs) in &runs_by_source {
-        if request
-            .source_id
-            .as_deref()
-            .map(|requested| requested != source_id)
-            .unwrap_or(false)
-        {
+        if !scope.contains(source_id) {
             continue;
         }
         for run in runs {
@@ -279,7 +276,7 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
         }
     }
     print_timeline_map(
-        &catalog,
+        &scope,
         &runs_by_source,
         &dates,
         &request,
@@ -452,31 +449,30 @@ fn timeline_hit(
 }
 
 fn print_timeline_map(
-    catalog: &BTreeMap<String, SourceEntry>,
+    scope: &corpus::Scope,
     runs_by_source: &BTreeMap<String, Vec<TimelineRun>>,
     dates: &BTreeMap<String, TimelineMapBucket>,
     request: &TimelineRequest,
     duration_ms: u64,
 ) {
-    let expected_sources = catalog
-        .values()
+    let expected_sources = scope
+        .sources
+        .iter()
         .filter(|entry| entry.event_count > 0)
         .count();
-    let covered_sources = runs_by_source
-        .keys()
-        .filter(|source_id| {
-            catalog
-                .get(*source_id)
-                .map(|entry| entry.event_count > 0)
-                .unwrap_or(false)
-        })
+    let covered_sources = scope
+        .sources
+        .iter()
+        .filter(|entry| entry.event_count > 0 && runs_by_source.contains_key(&entry.source_id))
         .count();
-    let incomplete_sources = catalog
-        .values()
+    let incomplete_sources = scope
+        .sources
+        .iter()
         .filter(|entry| !corpus::source_is_complete(entry))
         .count();
+    let staleness = corpus::Staleness::of(scope.sources.iter().copied());
     let missing_sources = expected_sources.saturating_sub(covered_sources);
-    let disposition = if dates.is_empty() && (expected_sources > 0 || !catalog.is_empty()) {
+    let disposition = if dates.is_empty() && !scope.sources.is_empty() {
         "timeline_map_empty"
     } else if missing_sources > 0 || incomplete_sources > 0 {
         "timeline_map_partial"
@@ -523,6 +519,12 @@ fn print_timeline_map(
     number(&mut output, "covered_sources", covered_sources as u64);
     number(&mut output, "missing_sources", missing_sources as u64);
     number(&mut output, "incomplete_sources", incomplete_sources as u64);
+    number(&mut output, "stale_sources", staleness.stale_sources);
+    number(
+        &mut output,
+        "unscanned_source_bytes",
+        staleness.unscanned_source_bytes,
+    );
     number(&mut output, "date_count", dates.len() as u64);
     number(&mut output, "returned_dates", selected.len() as u64);
     number(&mut output, "offset", request.offset);
@@ -593,14 +595,14 @@ fn timeline_events(
     started: Instant,
 ) -> io::Result<()> {
     let date = request.date.as_deref().unwrap_or("undated");
+    let scope = corpus::scope(
+        catalog,
+        request.source_id.as_deref(),
+        request.session.as_deref(),
+    );
     let mut runs = Vec::new();
     for (source_id, source_runs) in runs_by_source {
-        if request
-            .source_id
-            .as_deref()
-            .map(|requested| requested != source_id)
-            .unwrap_or(false)
-        {
+        if !scope.contains(source_id) {
             continue;
         }
         for run in source_runs {
@@ -648,6 +650,7 @@ fn timeline_events(
     } else {
         "timeline_events_ready"
     };
+    let staleness = corpus::Staleness::of(scope.sources.iter().copied());
     let mut output = String::new();
     output.push('{');
     field(&mut output, "disposition", disposition, true);
@@ -655,6 +658,12 @@ fn timeline_events(
     field(&mut output, "date", date, false);
     number(&mut output, "scanned_runs", scanned_runs);
     number(&mut output, "scanned_bytes", scanned_bytes);
+    number(&mut output, "stale_sources", staleness.stale_sources);
+    number(
+        &mut output,
+        "unscanned_source_bytes",
+        staleness.unscanned_source_bytes,
+    );
     number(&mut output, "total_events", total);
     number(&mut output, "returned", page_hits.len() as u64);
     number(&mut output, "offset", request.offset);
@@ -935,14 +944,14 @@ fn is_history_request(request: &SearchRequest) -> bool {
 fn search_json(
     root: &Path,
     request: &SearchRequest,
-    catalog: &BTreeMap<String, SourceEntry>,
+    scope: &corpus::Scope,
     files: &[std::path::PathBuf],
     stats: &SearchStats,
     duration_ms: u64,
 ) -> io::Result<String> {
     let page_end = request.offset.saturating_add(stats.returned.len() as u64);
     let has_more = stats.matched_events > page_end;
-    let coverage = coverage_stats(root, catalog, files, request, stats)?;
+    let coverage = coverage_stats(root, scope, files, request, stats)?;
     let disposition = if stats.matched_events == 0 {
         coverage.empty_disposition()
     } else if stats.returned.is_empty() && request.offset > 0 {
@@ -1003,12 +1012,12 @@ fn search_json(
 fn history_json(
     root: &Path,
     request: &SearchRequest,
-    catalog: &BTreeMap<String, SourceEntry>,
+    scope: &corpus::Scope,
     files: &[std::path::PathBuf],
     stats: &SearchStats,
     duration_ms: u64,
 ) -> io::Result<String> {
-    let coverage = coverage_stats(root, catalog, files, request, stats)?;
+    let coverage = coverage_stats(root, scope, files, request, stats)?;
     let page_end = request.offset.saturating_add(stats.returned.len() as u64);
     let has_more = stats.matched_events > page_end;
     let disposition = if stats.matched_events == 0 {
@@ -1813,7 +1822,7 @@ impl Coverage {
 
 fn coverage_stats(
     root: &Path,
-    catalog: &BTreeMap<String, SourceEntry>,
+    scope: &corpus::Scope,
     files: &[std::path::PathBuf],
     request: &SearchRequest,
     stats: &SearchStats,
@@ -1842,25 +1851,16 @@ fn coverage_stats(
         if !corpus::source_path_is_unavailable(&entry) {
             continue;
         }
-        if let Some(requested) = request.source_id.as_deref() {
-            if entry.source_id != requested {
-                continue;
-            }
+        if !scope.whole && !scope.contains(&entry.source_id) {
+            continue;
         }
         coverage.unavailable_source_paths += 1;
         if !entry.source_id.is_empty() {
             unreachable.insert(entry.source_id);
         }
     }
-    for (source_id, entry) in catalog {
-        if request
-            .source_id
-            .as_deref()
-            .map(|requested| requested != source_id)
-            .unwrap_or(false)
-        {
-            continue;
-        }
+    let staleness = corpus::Staleness::of(scope.sources.iter().copied());
+    for entry in &scope.sources {
         coverage.corpus_sources += 1;
         coverage.synced_through_ms = Some(match coverage.synced_through_ms {
             Some(current) => current.min(entry.synced_at_ms),
@@ -1869,26 +1869,16 @@ fn coverage_stats(
         if entry.output_preview > 0 {
             coverage.output_bounded_sources += 1;
         }
-        match std::fs::metadata(&entry.path) {
-            Ok(metadata) => {
-                let pending = metadata.len().saturating_sub(entry.committed_byte_end);
-                if pending > 0 {
-                    coverage.stale_sources += 1;
-                    coverage.unscanned_source_bytes =
-                        coverage.unscanned_source_bytes.saturating_add(pending);
-                }
-            }
-            Err(_) => {
-                unreachable.insert(source_id.clone());
-            }
-        }
-        let incomplete = !available.contains(source_id)
+        let incomplete = !available.contains(&entry.source_id)
             || !corpus::source_is_complete(entry)
             || !corpus::source_projection_complete(entry, files)?;
         if incomplete {
             coverage.incomplete_sources += 1;
         }
     }
+    coverage.stale_sources = staleness.stale_sources;
+    coverage.unscanned_source_bytes = staleness.unscanned_source_bytes;
+    unreachable.extend(staleness.unreachable);
     coverage.unreachable_sources = unreachable.len() as u64;
     Ok(coverage)
 }

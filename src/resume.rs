@@ -129,6 +129,7 @@ pub fn resume(
     }
 
     let boundary_reached = corpus::source_is_complete(entry);
+    let freshness = corpus::freshness(entry);
     let disposition = resume_disposition(entry);
     let source_path = &entry.path;
     let latest_event = current.events.last();
@@ -156,16 +157,7 @@ pub fn resume(
     number(&mut output, "last_line", entry.last_line);
     number(&mut output, "event_count", entry.event_count);
     output.push('}');
-    field(
-        &mut output,
-        "next_recall",
-        if boundary_reached {
-            "sync_tail_after_observed_boundary"
-        } else {
-            "sync_source_boundary_then_resume"
-        },
-        false,
-    );
+    freshness_fields(&mut output, boundary_reached, freshness);
     boolean(&mut output, "checkpoint_valid", entry.checkpoint_valid);
     number(&mut output, "committed_byte_end", entry.committed_byte_end);
     number(&mut output, "source_size", entry.size);
@@ -362,6 +354,7 @@ fn brief_json(
 ) -> String {
     let source_path = &entry.path;
     let boundary_reached = corpus::source_is_complete(entry);
+    let freshness = corpus::freshness(entry);
     let mut output = String::from("{");
     field(&mut output, "disposition", resume_disposition(entry), true);
     field(&mut output, "mode", "resume_brief", false);
@@ -382,16 +375,7 @@ fn brief_json(
     number(&mut output, "byte_end", entry.committed_byte_end);
     number(&mut output, "source_size", entry.size);
     output.push('}');
-    field(
-        &mut output,
-        "next_recall",
-        if boundary_reached {
-            "sync_tail_after_observed_boundary"
-        } else {
-            "sync_source_boundary_then_resume"
-        },
-        false,
-    );
+    freshness_fields(&mut output, boundary_reached, freshness);
     output.push_str(",\"compactions\":");
     output.push_str(&compactions_json(scanned));
 
@@ -486,6 +470,28 @@ fn brief_json(
     number(&mut output, "after_byte", entry.committed_byte_end);
     output.push_str("}}\n");
     output
+}
+
+/// How the transcript stands against the result: `source_freshness` and the bytes the corpus
+/// has not read (`corpus::freshness`), and the next step. A transcript still being written is
+/// `behind` until the next sync.
+fn freshness_fields(output: &mut String, boundary_reached: bool, freshness: corpus::Freshness) {
+    field(output, "source_freshness", freshness.as_str(), false);
+    number(
+        output,
+        "unscanned_source_bytes",
+        freshness.unscanned_bytes(),
+    );
+    field(
+        output,
+        "next_recall",
+        match freshness {
+            corpus::Freshness::Unreachable => "source_unreachable",
+            corpus::Freshness::Current if boundary_reached => "none",
+            _ => "sync_then_resume",
+        },
+        false,
+    );
 }
 
 fn bounded(text: &str, limit: usize) -> (String, bool) {

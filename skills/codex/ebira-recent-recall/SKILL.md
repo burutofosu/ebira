@@ -42,7 +42,9 @@ PowerShell).
    `imported_skipped`);
    `latest_assistant_texts` and `latest_commands` hold the latest replies and tool
    calls; `compactions` counts the summaries. A value marked `*_truncated: true`
-   carries a `source_ref` for the rest.
+   carries a `source_ref` for the rest. `source_freshness: behind` with
+   `unscanned_source_bytes` counts what was written after the sync; it is
+   normal for the session you are in.
 
 3. Read everything the person said in this thread, newest first:
 

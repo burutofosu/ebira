@@ -303,6 +303,8 @@ fn command_output_matches_declared_schema() {
             "current_turn_state",
             "source_boundary_state",
             "observed_boundary",
+            "source_freshness",
+            "unscanned_source_bytes",
             "next_recall",
             "checkpoint_valid",
             "committed_byte_end",

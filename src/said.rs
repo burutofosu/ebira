@@ -11,7 +11,7 @@ use crate::format::{json_string, parse_event_header, EventHeader};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 const IO_BUFFER_SIZE: usize = 1024 * 1024;
@@ -60,8 +60,16 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
     }
     let started = Instant::now();
     let catalog = corpus::source_catalog(root)?;
-    let scope = scoped_sources(&catalog, request);
-    let files = scoped_files(root, &scope, request)?;
+    let mut scope = corpus::scope(
+        &catalog,
+        request.source_id.as_deref(),
+        request.session.as_deref(),
+    );
+    if let Some(app) = request.agent.as_deref() {
+        scope.sources.retain(|entry| entry.app == app);
+        scope.whole = false;
+    }
+    let files = scope.files(root)?;
     let query = request
         .query
         .as_deref()
@@ -125,7 +133,9 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
     }
     let next_offset = request.offset.saturating_add(page.len() as u64);
     let has_more = next_offset < total;
-    let (stale_sources, unscanned_bytes) = freshness(&scope);
+    let staleness = corpus::Staleness::of(scope.sources.iter().copied());
+    let (stale_sources, unscanned_bytes) =
+        (staleness.stale_sources, staleness.unscanned_source_bytes);
     let duration_ms = started.elapsed().as_millis() as u64;
 
     if request.text_format {
@@ -189,7 +199,7 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
     number(&mut output, "max_chars", request.max_chars as u64);
     number(&mut output, "scanned_files", files.len() as u64);
     number(&mut output, "scanned_bytes", scanned_bytes);
-    number(&mut output, "sources_in_scope", scope.len() as u64);
+    number(&mut output, "sources_in_scope", scope.sources.len() as u64);
     number(&mut output, "stale_sources", stale_sources);
     number(&mut output, "unscanned_source_bytes", unscanned_bytes);
     number(&mut output, "duration_ms", duration_ms);
@@ -203,48 +213,6 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
     output.push_str("]}\n");
     print!("{}", output);
     Ok(())
-}
-
-fn scoped_sources<'a>(
-    catalog: &'a BTreeMap<String, SourceEntry>,
-    request: &SaidRequest,
-) -> Vec<&'a SourceEntry> {
-    let sources = match request.session.as_deref() {
-        Some(session) => corpus::session_sources(catalog, session).sources,
-        None => catalog.values().collect(),
-    };
-    sources
-        .into_iter()
-        .filter(|entry| {
-            request
-                .source_id
-                .as_deref()
-                .map(|source_id| entry.source_id == source_id)
-                .unwrap_or(true)
-        })
-        .filter(|entry| {
-            request
-                .agent
-                .as_deref()
-                .map(|agent| entry.app == agent)
-                .unwrap_or(true)
-        })
-        .collect()
-}
-
-fn scoped_files(
-    root: &Path,
-    scope: &[&SourceEntry],
-    request: &SaidRequest,
-) -> io::Result<Vec<PathBuf>> {
-    if request.source_id.is_none() && request.session.is_none() && request.agent.is_none() {
-        return corpus::corpus_files(root);
-    }
-    let mut files = Vec::new();
-    for entry in scope {
-        files.extend(corpus::source_files(root, &entry.source_id)?);
-    }
-    Ok(files)
 }
 
 fn scan_file(
@@ -336,21 +304,6 @@ fn fold(value: &str, fold_ascii_case: bool) -> String {
     } else {
         value.to_string()
     }
-}
-
-/// Sources in scope whose file has grown past what the corpus has read.
-fn freshness(scope: &[&SourceEntry]) -> (u64, u64) {
-    let mut stale = 0u64;
-    let mut unscanned = 0u64;
-    for entry in scope {
-        if let Ok(metadata) = std::fs::metadata(&entry.path) {
-            if metadata.len() > entry.committed_byte_end {
-                stale += 1;
-                unscanned = unscanned.saturating_add(metadata.len() - entry.committed_byte_end);
-            }
-        }
-    }
-    (stale, unscanned)
 }
 
 fn local_time(timestamp: &str, offset_minutes: i64) -> String {

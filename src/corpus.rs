@@ -647,6 +647,162 @@ fn source_availability_json(snapshot: &SourceAvailabilitySnapshot) -> String {
     format!("[{}]", rows.join(","))
 }
 
+/// The sources a read covers: the one named by `--source-id`, the sources of a `--session`, or
+/// all of them. Every command scopes what it reads and what it reports as covered this way.
+pub struct Scope<'a> {
+    pub sources: Vec<&'a SourceEntry>,
+    /// Neither a source nor a session was named.
+    pub whole: bool,
+}
+
+pub fn scope<'a>(
+    catalog: &'a BTreeMap<String, SourceEntry>,
+    source_id: Option<&str>,
+    session: Option<&str>,
+) -> Scope<'a> {
+    let sources = match session {
+        Some(session) => session_sources(catalog, session).sources,
+        None => catalog.values().collect(),
+    };
+    Scope {
+        sources: sources
+            .into_iter()
+            .filter(|entry| source_id.is_none_or(|source_id| entry.source_id == source_id))
+            .collect(),
+        whole: source_id.is_none() && session.is_none(),
+    }
+}
+
+impl Scope<'_> {
+    pub fn contains(&self, source_id: &str) -> bool {
+        self.sources
+            .iter()
+            .any(|entry| entry.source_id == source_id)
+    }
+
+    /// The segment files to read: every segment for the whole corpus, else those of the
+    /// sources in scope.
+    pub fn files(&self, root: &Path) -> io::Result<Vec<PathBuf>> {
+        if self.whole {
+            return corpus_files(root);
+        }
+        let mut files = Vec::new();
+        for entry in &self.sources {
+            files.extend(source_files(root, &entry.source_id)?);
+        }
+        Ok(files)
+    }
+}
+
+/// How a source's log stands now against what the corpus read of it, by the test a sync
+/// makes before it reads the log again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// The log is as the corpus read it.
+    Current,
+    /// The log has grown; this many bytes after what the corpus read are not in it yet.
+    Behind(u64),
+    /// The log was replaced or rewritten; the next sync reads all of its bytes again.
+    Rewritten(u64),
+    /// The log cannot be read.
+    Unreachable,
+}
+
+impl Freshness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Behind(_) => "behind",
+            Self::Rewritten(_) => "rewritten",
+            Self::Unreachable => "unreachable",
+        }
+    }
+
+    /// Bytes of the log as it is now that the corpus does not hold.
+    pub fn unscanned_bytes(self) -> u64 {
+        match self {
+            Self::Behind(bytes) | Self::Rewritten(bytes) => bytes,
+            Self::Current | Self::Unreachable => 0,
+        }
+    }
+
+    pub fn is_stale(self) -> bool {
+        matches!(self, Self::Behind(_) | Self::Rewritten(_))
+    }
+}
+
+pub fn freshness(entry: &SourceEntry) -> Freshness {
+    let path = Path::new(&entry.path);
+    let Ok(metadata) = fs::metadata(path) else {
+        return Freshness::Unreachable;
+    };
+    let (volume_serial_number, file_id) = identity_of(path, &metadata);
+    let observed = SourceEntry {
+        path: entry.path.clone(),
+        size: metadata.len(),
+        modified_ms: modified_ms(&metadata),
+        volume_serial_number,
+        file_id,
+        ..SourceEntry::default()
+    };
+    if same_snapshot(entry, &observed) && entry.committed_byte_end >= observed.size {
+        Freshness::Current
+    } else if can_append(entry, &observed) {
+        Freshness::Behind(observed.size.saturating_sub(entry.committed_byte_end))
+    } else {
+        Freshness::Rewritten(observed.size)
+    }
+}
+
+/// What the logs of some sources hold now that the corpus does not.
+#[derive(Debug, Default)]
+pub struct Staleness {
+    pub stale_sources: u64,
+    pub unscanned_source_bytes: u64,
+    pub unreachable: BTreeSet<String>,
+}
+
+impl Staleness {
+    pub fn of<'a>(sources: impl IntoIterator<Item = &'a SourceEntry>) -> Self {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        // A file's metadata takes about a millisecond to read through WSL's view of a Windows
+        // drive, so a thousand sources are checked on several threads.
+        let workers = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let chunk = sources.len().div_ceil(workers).max(1);
+        let results = thread::scope(|scope| {
+            let handles = sources
+                .chunks(chunk)
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|entry| freshness(entry))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("freshness worker"))
+                .collect::<Vec<_>>()
+        });
+        let mut staleness = Staleness::default();
+        for (entry, freshness) in sources.iter().zip(results) {
+            if freshness == Freshness::Unreachable {
+                staleness.unreachable.insert(entry.source_id.clone());
+            } else if freshness.is_stale() {
+                staleness.stale_sources += 1;
+                staleness.unscanned_source_bytes = staleness
+                    .unscanned_source_bytes
+                    .saturating_add(freshness.unscanned_bytes());
+            }
+        }
+        staleness
+    }
+}
+
 pub fn source_is_complete(entry: &SourceEntry) -> bool {
     entry.checkpoint_valid
         && entry.committed_byte_end >= entry.size
@@ -2478,17 +2634,28 @@ fn file_identity(path: &Path) -> (u64, u64) {
 
 #[cfg(unix)]
 fn file_identity(path: &Path) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-
     let Ok(metadata) = fs::metadata(path) else {
         return (0, 0);
     };
-    (metadata.dev(), metadata.ino())
+    identity_of(path, &metadata)
 }
 
 #[cfg(not(any(windows, unix)))]
 fn file_identity(_path: &Path) -> (u64, u64) {
     (0, 0)
+}
+
+/// The identity of a file whose metadata is already read: on Unix it is in the metadata.
+#[cfg(unix)]
+fn identity_of(_path: &Path, metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn identity_of(path: &Path, _metadata: &fs::Metadata) -> (u64, u64) {
+    file_identity(path)
 }
 
 fn rebuild_output_name(segment_dir: &Path, entry: &SourceEntry) -> String {
@@ -2951,6 +3118,62 @@ mod tests {
     use std::fs::{self, File, OpenOptions};
     use std::io::{BufReader, Cursor, Write};
     use std::path::PathBuf;
+
+    #[test]
+    fn freshness_is_the_test_a_sync_makes() {
+        use super::{freshness, source_entry, Freshness};
+        let root = std::env::temp_dir().join(format!("ebira-freshness-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp directory");
+        let path = root.join("log.jsonl");
+        let record = "{\"type\":\"note\",\"text\":\"one\"}
+";
+        fs::write(&path, record).expect("write log");
+        let read = || {
+            let mut entry = source_entry(&path, 300)
+                .expect("entry")
+                .expect("a complete record");
+            entry.committed_byte_end = entry.size;
+            entry.checkpoint_valid = true;
+            entry
+        };
+        let entry = read();
+        assert_eq!(freshness(&entry), Freshness::Current);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(record.as_bytes()))
+            .expect("append");
+        assert_eq!(
+            freshness(&entry),
+            Freshness::Behind(record.len() as u64),
+            "an appended log is behind by what was appended"
+        );
+
+        let entry = read();
+        let earlier = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("modified time")
+            - std::time::Duration::from_secs(60);
+        let same_size = record.replace("one", "two").repeat(2);
+        fs::write(&path, &same_size).expect("rewrite in place");
+        File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(earlier))
+            .expect("set modified time");
+        assert_eq!(
+            freshness(&entry),
+            Freshness::Rewritten(same_size.len() as u64),
+            "a log rewritten at the same size is read again"
+        );
+        fs::write(&path, "").expect("truncate");
+        assert_eq!(freshness(&entry), Freshness::Rewritten(0));
+        fs::remove_file(&path).expect("remove log");
+        assert_eq!(freshness(&entry), Freshness::Unreachable);
+        fs::remove_dir_all(root).expect("remove temp directory");
+    }
 
     #[test]
     fn bounded_reader_preserves_incomplete_tail_without_committing_it() {

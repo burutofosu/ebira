@@ -173,6 +173,22 @@ record. Managed imports resolve to the copied JSONL.
 A context read verifies the source state recorded during indexing. Changed
 sources return `source_changed_since_projection`.
 
+## Scope and freshness
+
+A read covers one scope, resolved by `corpus::scope`: the source named by
+`--source-id`, the sources of a `--session`, or all of them. A command reads the
+segments of its scope and reports the coverage of the same sources.
+
+What the logs of a scope hold that the corpus has not read is judged by one test,
+`corpus::freshness`, the one a sync makes before it reads a log again. A log is
+`current` when it is the file the corpus read, unchanged; `behind` when it has
+grown, by the bytes after what was read; `rewritten` when it was replaced,
+shortened, or changed in place, in which case all of it is read again; and
+`unreachable` when it cannot be read. `search`, `history`, `timeline`, and `said`
+report the stale sources and unscanned bytes of their scope; `resume` reports its
+transcript's freshness and whether to sync first. A transcript still being
+written is `behind` until the next sync.
+
 ## Search
 
 Projection search compares a literal query with selected corpus fields. Tool
