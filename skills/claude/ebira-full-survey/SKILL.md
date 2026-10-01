@@ -17,8 +17,8 @@ prints it as `corpus`. Do not test that path from another shell: the WSL build
 reports a WSL path (`/home/...`), which PowerShell and Git Bash do not resolve to
 the same place.
 
-Run `ebira sync` first when the question includes recent events. After an Ebira
-update that sync rebuilds the corpus from the logs, which takes about a minute.
+Run `ebira sync` first when the question includes recent events. If the storage
+format or reading rules changed, sync rebuilds the corpus from the logs.
 
 ## Find
 

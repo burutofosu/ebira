@@ -28,8 +28,8 @@ PowerShell).
    ebira sync
    ```
 
-   After an Ebira update the first sync rebuilds the corpus from the logs and
-   names the `rebuild_cause`; on 12 GB of logs that takes about a minute.
+   If the storage format or reading rules changed, sync rebuilds the corpus
+   from the logs and reports `rebuild_cause`.
 
 2. Read the current state:
 

@@ -1,0 +1,138 @@
+name: package
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/package.yml"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to package (must match Cargo.toml)
+        required: true
+        default: "0.1.0"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.89.0"
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Install the build toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
+
+      - name: Check the requested version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          cargo +"$RUST_TOOLCHAIN" metadata --locked --no-deps --format-version 1 > metadata.json
+          python - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          package = next(p for p in json.loads(Path("metadata.json").read_text())["packages"] if p["name"] == "ebira")
+          version = package["version"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit("Unsupported package version: " + version)
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              if os.environ["GITHUB_REF_NAME"] != "v" + version:
+                  raise SystemExit("Tag must match Cargo.toml: v" + version)
+          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+              if os.environ["REQUESTED_VERSION"] != version:
+                  raise SystemExit("Requested version must match Cargo.toml: " + version)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("version=" + version + "\n")
+          PY
+
+      - name: Test
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --target "${{ matrix.target }}"
+
+      - name: Build
+        run: cargo +"$RUST_TOOLCHAIN" build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package and checksum
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          python - <<'PY'
+          import gzip, hashlib, io, os, subprocess, tarfile, zipfile
+          from pathlib import Path
+
+          version, target = os.environ["VERSION"], os.environ["TARGET"]
+          stem = f"ebira-v{version}-{target}"
+          binary = "ebira.exe" if "windows" in target else "ebira"
+          source = Path("target") / target / "release" / binary
+          subprocess.run([str(source.resolve()), "help"], check=True)
+          entries = {binary: (source.read_bytes(), 0o755)}
+          for name in ("LICENSE", "README.md", "ARCHITECTURE.md"):
+              entries[name] = (Path(name).read_bytes(), 0o644)
+          for directory in ("skills", "examples"):
+              for path in sorted(Path(directory).rglob("*")):
+                  if path.is_file():
+                      entries[path.as_posix()] = (path.read_bytes(), 0o644)
+          rustc = subprocess.check_output(["rustc", "+" + os.environ["RUST_TOOLCHAIN"], "--version"], text=True).strip()
+          info = f"version: {version}\ncommit: {os.environ['GITHUB_SHA']}\ntarget: {target}\ntoolchain: {rustc}\n"
+          entries["BUILD-INFO.txt"] = (info.encode(), 0o644)
+          dist = Path("dist")
+          dist.mkdir()
+          if "windows" in target:
+              archive = dist / (stem + ".zip")
+              with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+                  for name, (data, mode) in sorted(entries.items()):
+                      member = zipfile.ZipInfo(stem + "/" + name, (1980, 1, 1, 0, 0, 0))
+                      member.create_system = 3
+                      member.external_attr = (0o100000 | mode) << 16
+                      member.compress_type = zipfile.ZIP_DEFLATED
+                      output.writestr(member, data)
+          else:
+              archive = dist / (stem + ".tar.gz")
+              with archive.open("wb") as raw:
+                  with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                      with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as output:
+                          for name, (data, mode) in sorted(entries.items()):
+                              member = tarfile.TarInfo(stem + "/" + name)
+                              member.size, member.mode, member.mtime = len(data), mode, 0
+                              output.addfile(member, io.BytesIO(data))
+          checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (dist / (archive.name + ".sha256")).write_text(checksum + "  " + archive.name + "\n", encoding="utf-8")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ebira-v${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
