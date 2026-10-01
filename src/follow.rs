@@ -65,7 +65,7 @@ impl Origin {
         let settled = match value {
             SourceOrigin::ClaudeMain | SourceOrigin::ClaudeSubagent => true,
             SourceOrigin::Generic => false,
-            _ => first_line_complete(path),
+            _ => corpus::first_line_complete(path),
         };
         Origin { value, settled }
     }
@@ -78,18 +78,6 @@ impl Origin {
         }
     }
 }
-
-fn first_line_complete(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
-    let mut reader = io::BufReader::new(file.take(FIRST_LINE_LIMIT));
-    let mut line = Vec::new();
-    io::BufRead::read_until(&mut reader, b'\n', &mut line).is_ok() && line.last() == Some(&b'\n')
-}
-
-/// A Codex session_meta record carries the base instructions and can be large.
-const FIRST_LINE_LIMIT: u64 = 16 * 1024 * 1024;
 
 pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
     let target = resolve_target(root, request)?;

@@ -45,6 +45,8 @@ pub struct SaidRequest {
 struct Said {
     header: EventHeader,
     source_path: String,
+    /// `claude`, `codex`, or `other`, from the catalog.
+    app: String,
     text: String,
     images: usize,
 }
@@ -218,7 +220,7 @@ fn scoped_sources<'a>(
             request
                 .agent
                 .as_deref()
-                .map(|agent| entry.kind == agent)
+                .map(|agent| entry.app == agent)
                 .unwrap_or(true)
         })
         .filter(|entry| {
@@ -284,13 +286,14 @@ fn scan_file(
                 continue;
             }
         }
-        let source_path = catalog
+        let (source_path, app) = catalog
             .get(&header.source_id)
-            .map(|entry| entry.path.clone())
+            .map(|entry| (entry.path.clone(), entry.app.clone()))
             .unwrap_or_default();
         accept(Said {
             header,
             source_path,
+            app,
             text,
             images,
         });
@@ -381,10 +384,6 @@ fn local_time(timestamp: &str, offset_minutes: i64) -> String {
     )
 }
 
-fn agent_of(source_id: &str) -> &str {
-    source_id.split('-').next().unwrap_or("")
-}
-
 fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> String {
     let header = &said.header;
     let mut output = String::from("{");
@@ -395,7 +394,7 @@ fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> Stri
         &local_time(&header.timestamp, offset_minutes),
         false,
     );
-    field(&mut output, "agent", agent_of(&header.source_id), false);
+    field(&mut output, "agent", &said.app, false);
     field(&mut output, "via", &header.via, false);
     field(&mut output, "session", &header.session, false);
     field(&mut output, "cwd", &header.cwd, false);
@@ -441,7 +440,7 @@ fn text_output(
         output.push_str(&format!(
             "\n[{}] {} {} session={} source-id={} byte={}+{}{}\n{}{}\n",
             local_time(&header.timestamp, request.offset_minutes),
-            agent_of(&header.source_id),
+            said.app,
             header.via,
             header.session.chars().take(8).collect::<String>(),
             header.source_id,

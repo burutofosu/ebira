@@ -86,7 +86,8 @@ struct SourceCollection {
 #[derive(Clone, Debug, Default)]
 pub struct SourceEntry {
     pub source_id: String,
-    pub kind: String,
+    /// `claude`, `codex`, or `other`: the agent whose log this is.
+    pub app: String,
     pub path: String,
     pub fallback_session: String,
     pub size: u64,
@@ -207,7 +208,7 @@ pub fn build_with_preview(
 
     let snapshot = source_paths
         .iter()
-        .map(|path| source_entry_for_preview(path, requested_preview, &previous))
+        .filter_map(|path| source_entry_for_preview(path, requested_preview, &previous).transpose())
         .collect::<io::Result<Vec<_>>>()?;
     let segment_dir = segment_dir(corpus);
     fs::create_dir_all(corpus)?;
@@ -219,7 +220,11 @@ pub fn build_with_preview(
     }
     let forced_ids = force_paths
         .iter()
-        .map(|path| source_entry(Path::new(path), 300).map(|entry| entry.source_id))
+        .filter_map(|path| {
+            source_entry(Path::new(path), 300)
+                .map(|entry| entry.map(|entry| entry.source_id))
+                .transpose()
+        })
         .collect::<io::Result<Vec<_>>>()?;
     // The date offset is fixed when the corpus is built: an incremental sync keeps the one in
     // the catalog, so every segment of one corpus puts records on the same dates.
@@ -1222,7 +1227,7 @@ fn source_catalog_header(offset_minutes: i64) -> String {
 ///
 /// Increase it with every change to what a sync writes for the same logs, together with
 /// `RULES_FINGERPRINT` in the tests of `core.rs`, which fails until both are updated.
-pub const RULES_VERSION: u64 = 1;
+pub const RULES_VERSION: u64 = 2;
 
 /// How a corpus on disk relates to this build of Ebira.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1384,21 +1389,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn source_entry(path: &Path, output_preview: u64) -> io::Result<SourceEntry> {
+/// The catalog entry for a log, or `None` while it cannot yet be told which agent wrote it: a
+/// log outside `.claude` and `.codex` directories without one complete record. The agent is
+/// part of the source id, so it is decided once, from records that will not change.
+fn source_entry(path: &Path, output_preview: u64) -> io::Result<Option<SourceEntry>> {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let canonical_string = canonical.to_string_lossy().into_owned();
     let metadata = fs::metadata(&canonical)?;
     let (volume_serial_number, file_id) = file_identity(&canonical);
-    let kind = source_kind(&canonical);
+    let Some(app) = source_app(&canonical) else {
+        return Ok(None);
+    };
     let fallback_session = canonical
         .file_stem()
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.is_empty())
         .unwrap_or("source")
         .to_string();
-    Ok(SourceEntry {
-        source_id: format!("{}-{:016x}", kind, fnv64(canonical_string.as_bytes())),
-        kind,
+    Ok(Some(SourceEntry {
+        source_id: format!("{}-{:016x}", app, fnv64(canonical_string.as_bytes())),
+        app: app.to_string(),
         path: canonical_string,
         fallback_session,
         size: metadata.len(),
@@ -1407,21 +1417,23 @@ fn source_entry(path: &Path, output_preview: u64) -> io::Result<SourceEntry> {
         volume_serial_number,
         file_id,
         ..SourceEntry::default()
-    })
+    }))
 }
 
 fn source_entry_for_preview(
     path: &Path,
     requested_preview: Option<usize>,
     previous: &BTreeMap<String, SourceEntry>,
-) -> io::Result<SourceEntry> {
-    let mut entry = source_entry(path, requested_preview.unwrap_or(300) as u64)?;
+) -> io::Result<Option<SourceEntry>> {
+    let Some(mut entry) = source_entry(path, requested_preview.unwrap_or(300) as u64)? else {
+        return Ok(None);
+    };
     if requested_preview.is_none() {
         if let Some(previous) = previous.get(&entry.source_id) {
             entry.output_preview = previous.output_preview;
         }
     }
-    Ok(entry)
+    Ok(Some(entry))
 }
 
 fn write_source_entry(writer: &mut BufWriter<File>, entry: &SourceEntry) -> io::Result<()> {
@@ -1429,7 +1441,7 @@ fn write_source_entry(writer: &mut BufWriter<File>, entry: &SourceEntry) -> io::
         writer,
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         encode_token(&entry.source_id),
-        encode_token(&entry.kind),
+        encode_token(&entry.app),
         encode_token(&entry.path),
         encode_token(&entry.fallback_session),
         entry.size,
@@ -1702,8 +1714,9 @@ fn attach_source_ids(
 ) -> io::Result<()> {
     let mut current = BTreeMap::new();
     for path in paths {
-        let entry = source_entry(path, 300)?;
-        current.insert(entry.path, entry.source_id);
+        if let Some(entry) = source_entry(path, 300)? {
+            current.insert(entry.path, entry.source_id);
+        }
     }
     let old = previous
         .values()
@@ -2116,7 +2129,7 @@ fn load_source_catalog_paths(paths: &[PathBuf]) -> io::Result<BTreeMap<String, S
                 ));
             }
             let source_id = catalog_token(&parts, 0, None, path, line_number, "source_id")?;
-            let kind = catalog_token(&parts, 1, None, path, line_number, "kind")?;
+            let app = catalog_token(&parts, 1, None, path, line_number, "app")?;
             let source_path = catalog_token(&parts, 2, None, path, line_number, "path")?;
             let fallback_session =
                 catalog_token(&parts, 3, None, path, line_number, "fallback_session")?;
@@ -2160,7 +2173,7 @@ fn load_source_catalog_paths(paths: &[PathBuf]) -> io::Result<BTreeMap<String, S
                 source_id.clone(),
                 SourceEntry {
                     source_id,
-                    kind,
+                    app,
                     path: source_path,
                     fallback_session,
                     size,
@@ -2558,16 +2571,16 @@ fn source_input_covers_entry(inputs: &[String], entry: &SourceEntry) -> bool {
 /// transcripts live under `subagents/`, and a Codex rollout opens with a session_meta record
 /// that names its parent thread or the `codex exec` originator.
 fn source_origin(entry: &SourceEntry) -> SourceOrigin {
-    origin_of(&entry.kind, Path::new(&entry.path))
+    origin_of(&entry.app, Path::new(&entry.path))
 }
 
 /// The origin of a transcript that is read directly, without the catalog.
 pub fn origin_for_path(path: &Path) -> SourceOrigin {
-    origin_of(&source_kind(path), path)
+    origin_of(source_app(path).unwrap_or("other"), path)
 }
 
-fn origin_of(kind: &str, path: &Path) -> SourceOrigin {
-    match kind {
+fn origin_of(app: &str, path: &Path) -> SourceOrigin {
+    match app {
         "claude" => {
             if path
                 .to_string_lossy()
@@ -2623,19 +2636,42 @@ fn codex_origin(path: &Path) -> SourceOrigin {
     SourceOrigin::CodexThread
 }
 
-/// Which agent wrote a log: decided from its `.codex` or `.claude` directory, else from its
-/// first records, so copies kept elsewhere (managed imports, logs from another computer) are
-/// still read as Claude Code or Codex transcripts.
-fn source_kind(path: &Path) -> String {
-    let lower = path.to_string_lossy().to_ascii_lowercase();
-    let kind = if lower.contains(".codex") {
-        "codex"
-    } else if lower.contains(".claude") {
-        "claude"
-    } else {
-        sniff_kind(path).unwrap_or("source")
+/// Which agent wrote a log: decided by the nearest `.codex` or `.claude` directory above it,
+/// else by its first records, so copies kept elsewhere (managed imports, logs from another
+/// computer) are still read as Claude Code or Codex transcripts. `None` while a log outside
+/// those directories has no complete record to tell by.
+fn source_app(path: &Path) -> Option<&'static str> {
+    let by_directory = path.ancestors().skip(1).find_map(|ancestor| {
+        match ancestor
+            .file_name()?
+            .to_str()?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            ".codex" => Some("codex"),
+            ".claude" => Some("claude"),
+            _ => None,
+        }
+    });
+    if by_directory.is_some() {
+        return by_directory;
+    }
+    if !first_line_complete(path) {
+        return None;
+    }
+    Some(sniff_kind(path).unwrap_or("other"))
+}
+
+/// Whether a log holds at least one complete record. A first line longer than any record can
+/// be is complete too: it is projected as an invalid record.
+pub fn first_line_complete(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
     };
-    kind.to_string()
+    let mut reader = BufReader::new(file.take(MAX_RECORD_BYTES as u64 + 1));
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).is_ok()
+        && (line.last() == Some(&b'\n') || line.len() > MAX_RECORD_BYTES)
 }
 
 const SNIFF_LINES: usize = 16;
@@ -3629,6 +3665,7 @@ truncated-header",
         fs::rename(&replacement, &source).expect("replace source path");
         let replaced_identity = super::source_entry(&source, 300)
             .expect("replaced entry")
+            .expect("a log with a complete record has an entry")
             .file_id;
         assert_ne!(original_identity, replaced_identity);
 

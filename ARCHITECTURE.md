@@ -119,7 +119,18 @@ own markers:
   `<in-app-browser-context>` removed, is the person's. Messages in turns named
   `external-import-turn-*` are copies of another agent's conversation.
 - A message that opens with Claude Code's compaction sentence is a summary in
-  either format.
+  either format. Codex's `compacted` record is a summary when its `message`
+  holds text, and otherwise the boundary, like Claude Code's `compact_boundary`.
+  These two record types are the compactions `resume` counts (`core::is_compaction`).
+- A prompt typed while the agent was working (`queued_command`) is a user-role
+  record whoever wrote it, as a typed one is; the sender tells them apart.
+- A record's type comes from fixed paths (`/payload/type`, an envelope's
+  `type`, then the top-level `/type`), never from a `type` nested deeper.
+- Which agent wrote a log (`claude`, `codex`, `other`) is decided by the nearest
+  `.claude` or `.codex` directory above it, else by its first records, and only
+  once it holds a complete record: the agent is part of the source id, which
+  must not change. Model reasoning (thinking blocks, Codex reasoning records)
+  is not projected.
 
 A person's message is projected as its text only, length-delimited so that
 multi-line text reads back exactly, with images counted rather than stored. The

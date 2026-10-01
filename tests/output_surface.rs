@@ -1088,3 +1088,45 @@ fn a_shortened_tool_output_is_marked_in_the_event_header() {
     assert!(headers[1].contains("\tcut=0\t"), "{}", headers[1]);
     std::fs::remove_dir_all(root).expect("remove temp directory");
 }
+
+#[test]
+fn a_log_gets_its_source_id_once_it_holds_a_record() {
+    let root =
+        std::env::temp_dir().join(format!("ebira-surface-registration-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let copies = root.join("copies");
+    std::fs::create_dir_all(&copies).expect("create copy directory");
+    let log = copies.join("session.jsonl");
+    std::fs::write(&log, "").expect("write empty log");
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    run(&[
+        "sync",
+        "--source",
+        copies.to_str().expect("utf-8 path"),
+        "--corpus",
+        corpus,
+    ]);
+    let empty = run(&["status", "--corpus", corpus]);
+    assert!(
+        empty.contains("\"sources\":0"),
+        "an empty log outside .claude and .codex is not registered yet: {empty}"
+    );
+    std::fs::write(
+        &log,
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"first words"},"sessionId":"s1","uuid":"u1","timestamp":"2026-08-16T00:00:00Z"}"#,
+            "\n"
+        ),
+    )
+    .expect("write the first record");
+    run(&["sync", "--corpus", corpus]);
+    let said = run(&["said", "--corpus", corpus]);
+    assert!(
+        said.contains("first words")
+            && said.contains("\"source_id\":\"claude-")
+            && said.contains("\"agent\":\"claude\""),
+        "{said}"
+    );
+    std::fs::remove_dir_all(root).expect("remove temp directory");
+}

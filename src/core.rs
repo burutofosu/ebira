@@ -67,7 +67,7 @@ pub enum Sender {
 impl Sender {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Unknown => "",
+            Self::Unknown => "unknown",
             Self::Human => "human",
             Self::Agent => "agent",
             Self::System => "system",
@@ -384,7 +384,7 @@ pub fn select_body<F: FieldView>(
     meta: &RecordMeta,
     tool_output_chars: usize,
 ) -> Projection {
-    if meta.sender == Sender::Human && !is_compaction_event(meta.event_type.as_deref()) {
+    if meta.sender == Sender::Human {
         return Projection {
             body: select_human_body(fields),
             cut: false,
@@ -526,12 +526,12 @@ fn claude_sender<F: FieldView>(
                 return (Sender::Agent, "subagent_prompt");
             }
             let (sender, via) = claude_text_sender(&human_text(fields), false, "queued");
-            if sender == Sender::Human {
-                meta.event_kind = EventKind::User;
-                meta.role = Some("user".to_string());
+            meta.event_kind = if sender == Sender::Summary {
+                EventKind::Summary
             } else {
-                meta.event_kind = EventKind::Unknown;
-            }
+                EventKind::User
+            };
+            meta.role = Some("user".to_string());
             (sender, via)
         }
         "system" => {
@@ -644,6 +644,13 @@ fn codex_record_sender<F: FieldView>(
             (Sender::System, "tool_result")
         }
         ("response_item", _) => (Sender::Assistant, ""),
+        ("compacted", _) => {
+            if field_at(fields, "/payload/message").is_some_and(|text| !text.trim().is_empty()) {
+                (Sender::Summary, "compact_summary")
+            } else {
+                (Sender::System, "compact_boundary")
+            }
+        }
         _ => (Sender::System, ""),
     }
 }
@@ -976,24 +983,30 @@ fn key_matches(value: &str, normalized: &str) -> bool {
     wanted.next().is_none()
 }
 
+/// The record's type, from the first of these paths that holds one: Codex's `/payload/type`,
+/// the envelopes of other formats, then the top-level `/type` (Claude Code) and generic
+/// top-level names. A `type` nested deeper in the record never names the record.
 fn event_type_value<F: FieldView>(fields: &[F]) -> Option<String> {
-    let preferred = fields.iter().find(|field| {
-        let path = field.path().to_ascii_lowercase();
-        let value = field.value().to_ascii_lowercase();
-        (path.ends_with("/payload/type")
-            || path.ends_with("/response_item/type")
-            || path.ends_with("/event_msg/type"))
-            && value != "event_msg"
-            && value != "response_item"
-    });
-    preferred
-        .or_else(|| {
-            fields.iter().find(|field| {
-                let key = normalize_key(leaf(field.path()));
-                key == "type" || key == "eventtype" || key == "kind"
+    const PATHS: [&str; 7] = [
+        "/payload/type",
+        "/response_item/type",
+        "/event_msg/type",
+        "/type",
+        "/event_type",
+        "/eventtype",
+        "/kind",
+    ];
+    PATHS.iter().find_map(|wanted| {
+        fields
+            .iter()
+            .find(|field| field.path().eq_ignore_ascii_case(wanted))
+            .map(|field| field.value())
+            .filter(|value| {
+                !value.eq_ignore_ascii_case("event_msg")
+                    && !value.eq_ignore_ascii_case("response_item")
             })
-        })
-        .map(|field| field.value().to_string())
+            .map(str::to_string)
+    })
 }
 
 fn should_render_field<F: FieldView>(field: &F, meta: &RecordMeta) -> bool {
@@ -1002,9 +1015,15 @@ fn should_render_field<F: FieldView>(field: &F, meta: &RecordMeta) -> bool {
     if is_noise_field(&path) && meta.event_kind != EventKind::Unknown {
         return false;
     }
-    if is_compaction_event(meta.event_type.as_deref()) {
-        return path.contains("/replacement_history/")
-            && matches!(key.as_str(), "role" | "text" | "message" | "turnid");
+    if carries_replacement_history(meta.event_type.as_deref()) {
+        return path == "/payload/message"
+            || (path.contains("/replacement_history/")
+                && matches!(key.as_str(), "role" | "text" | "message" | "turnid"));
+    }
+    // Model reasoning is not projected: Claude Code thinking blocks (text and signature) as
+    // Codex reasoning records are not. It stays in the original record.
+    if matches!(key.as_str(), "thinking" | "signature") && path.contains("/content/") {
+        return false;
     }
     if is_noise_event(meta.event_type.as_deref()) {
         return is_identity_field(&key);
@@ -1112,13 +1131,15 @@ fn is_noise_event(event_type: Option<&str>) -> bool {
     )
 }
 
-fn is_compaction_event(event_type: Option<&str>) -> bool {
-    event_type
-        .map(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("compaction") || value.contains("compacted")
-        })
-        .unwrap_or(false)
+/// A record that marks a compaction: Claude Code's `compact_boundary`, Codex's `compacted`.
+/// Each compaction has exactly one.
+pub fn is_compaction(event_type: &str) -> bool {
+    matches!(event_type, "compact_boundary" | "compacted")
+}
+
+/// Codex's compaction record, which carries the history kept after the compaction.
+pub fn carries_replacement_history(event_type: Option<&str>) -> bool {
+    event_type == Some("compacted")
 }
 
 fn has_content_item_type<F: FieldView>(fields: &[F], wanted: &str) -> bool {
@@ -1134,7 +1155,10 @@ fn classify_event<F: FieldView>(
 ) -> EventKind {
     let event_type = event_type.unwrap_or("").to_ascii_lowercase();
     let role = role.unwrap_or("").to_ascii_lowercase();
-    if is_compaction_event(Some(event_type.as_str())) {
+    if matches!(
+        event_type.as_str(),
+        "compacted" | "context_compacted" | "compaction"
+    ) {
         return EventKind::Unknown;
     }
     if event_type.contains("output")
@@ -2379,7 +2403,7 @@ mod tests {
             classified(ClaudeMain, &queued("<task-notification><status>completed"));
         assert_eq!(
             (sender, via.as_str(), kind),
-            (Sender::System, "notification", EventKind::Unknown)
+            (Sender::System, "notification", EventKind::User)
         );
 
         let fields = [("/type", "system"), ("/subtype", "compact_boundary")]
@@ -2568,7 +2592,7 @@ mod tests {
     /// how representative records are classified and projected changes with any change to
     /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
     /// here: the next sync then rebuilds every corpus made under the old rules.
-    const RULES_FINGERPRINT: (&str, u64, &str) = ("7", 1, "5b8a7e002824d976");
+    const RULES_FINGERPRINT: (&str, u64, &str) = ("7", 2, "40eb632a4a07b829");
 
     #[test]
     fn reading_rules_are_versioned() {
@@ -2767,6 +2791,58 @@ mod tests {
                     ("/payload/content/0/text", "Answer in one line"),
                 ],
             ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "assistant"),
+                    ("/message/role", "assistant"),
+                    ("/message/content/0/type", "thinking"),
+                    ("/message/content/0/thinking", "weighing two options"),
+                    ("/message/content/0/signature", "c2lnbmF0dXJl"),
+                    ("/message/content/1/type", "text"),
+                    ("/message/content/1/text", "chose the first"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "attachment"),
+                    ("/attachment/type", "queued_command"),
+                    (
+                        "/attachment/prompt",
+                        "<task-notification>done</task-notification>",
+                    ),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/message/content/0/type", "text"),
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content/0/text", "a nested type comes first"),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![
+                    ("/type", "compacted"),
+                    ("/payload/message", "Summary of the work so far"),
+                    ("/payload/replacement_history/0/role", "user"),
+                    (
+                        "/payload/replacement_history/0/content/0/text",
+                        "kept request",
+                    ),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![("/type", "compacted"), ("/payload/message", "")],
+            ),
+            (
+                Generic,
+                vec![("/type", "note"), ("/text", "a format without senders")],
+            ),
         ];
         let mut digest = 0xcbf29ce484222325u64;
         for (origin, pairs) in &records {
@@ -2872,5 +2948,92 @@ mod tests {
             ],
         );
         assert_eq!(super::human_text_from_body(&body).0, "## shrink it\n");
+    }
+
+    #[test]
+    fn a_records_type_comes_from_fixed_paths_not_from_key_order() {
+        let fields = [
+            TestField {
+                path: "/message/content/0/type",
+                value: "text",
+            },
+            TestField {
+                path: "/type",
+                value: "user",
+            },
+        ];
+        assert_eq!(record_meta(&fields).event_type.as_deref(), Some("user"));
+        let codex = [
+            TestField {
+                path: "/type",
+                value: "response_item",
+            },
+            TestField {
+                path: "/payload/type",
+                value: "message",
+            },
+        ];
+        assert_eq!(record_meta(&codex).event_type.as_deref(), Some("message"));
+    }
+
+    #[test]
+    fn a_codex_compaction_is_a_summary_when_it_carries_one() {
+        use super::{Sender, SourceOrigin::CodexThread};
+        let (sender, via, kind, body) = classified(
+            CodexThread,
+            &[
+                ("/type", "compacted"),
+                ("/payload/message", "Summary of the work so far"),
+                ("/payload/replacement_history/0/role", "user"),
+            ],
+        );
+        assert_eq!(
+            (sender, via.as_str(), kind),
+            (Sender::Summary, "compact_summary", EventKind::Summary)
+        );
+        assert!(crate::format::body_fields(&body).contains(&(
+            "/payload/message".to_string(),
+            "Summary of the work so far".to_string()
+        )));
+        let (sender, via, kind, _) = classified(
+            CodexThread,
+            &[("/type", "compacted"), ("/payload/message", "")],
+        );
+        assert_eq!(
+            (sender, via.as_str(), kind),
+            (Sender::System, "compact_boundary", EventKind::Unknown)
+        );
+        assert!(super::is_compaction("compacted") && super::is_compaction("compact_boundary"));
+        assert!(!super::is_compaction("context_compacted"));
+    }
+
+    #[test]
+    fn model_reasoning_is_not_projected() {
+        use super::SourceOrigin::ClaudeMain;
+        let (_, _, _, body) = classified(
+            ClaudeMain,
+            &[
+                ("/type", "assistant"),
+                ("/message/role", "assistant"),
+                ("/message/content/0/type", "thinking"),
+                ("/message/content/0/thinking", "weighing two options"),
+                ("/message/content/0/signature", "c2lnbmF0dXJl"),
+                ("/message/content/1/type", "text"),
+                ("/message/content/1/text", "chose the first"),
+            ],
+        );
+        assert!(body.contains("chose the first"), "{body}");
+        assert!(
+            !body.contains("weighing") && !body.contains("c2lnbmF0dXJl"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_format_without_markers_has_an_unknown_sender() {
+        use super::{Sender, SourceOrigin::Generic};
+        let (sender, ..) = classified(Generic, &[("/type", "note"), ("/text", "plain")]);
+        assert_eq!(sender, Sender::Unknown);
+        assert_eq!(Sender::Unknown.as_str(), "unknown");
     }
 }

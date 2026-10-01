@@ -142,9 +142,16 @@ out unless `--include-imported` is given.
 The sender comes from markers the logs already carry: the `subagents/`
 directory, `isSidechain`, `isMeta`, `isCompactSummary`, and `queued_command`
 attachments in Claude Code transcripts; `parent_thread_id`, the `codex_exec`
-originator, and tagged context blocks in Codex rollouts. In other formats only
-assistant replies get a sender. A transcript kept outside `.claude` and `.codex`
-directories is recognised by its first records.
+originator, and tagged context blocks in Codex rollouts. A compaction counts the
+same way in both: Claude Code's `compact_boundary` and Codex's `compacted`
+record, and the summary text each carries is `sender: summary`. In other formats
+records are `sender: unknown`, except an assistant's replies. A transcript kept
+outside `.claude` and `.codex` directories is recognised by its first records,
+and indexed once it holds a complete one.
+
+Model reasoning (Claude Code thinking blocks, Codex reasoning) is not projected:
+the corpus holds what was said and done. It stays in the original records, which
+`context` and `search --raw` read.
 
 ## Recovering a session
 

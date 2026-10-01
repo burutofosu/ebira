@@ -301,7 +301,7 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
             if is_call {
                 keep_last(&mut recent_commands, &event, BRIEF_COMMANDS);
             }
-            if event.event_type == "compact_boundary" || is_codex_compaction(&event.event_type) {
+            if crate::core::is_compaction(&event.event_type) {
                 compactions += 1;
                 last_compaction_at = event.timestamp.clone();
             }
@@ -326,10 +326,6 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
         recent_assistants,
         recent_commands,
     })
-}
-
-fn is_codex_compaction(event_type: &str) -> bool {
-    matches!(event_type, "compacted" | "context_compacted")
 }
 
 /// A session id names the main transcript and the transcripts of the agents it started:
@@ -636,7 +632,7 @@ fn tool_calls(fields: &[Field]) -> Vec<(String, String)> {
 }
 
 fn embedded_messages(event: &RecoveryEvent) -> Vec<RecoveryEvent> {
-    if !event.event_type.to_ascii_lowercase().contains("compact") {
+    if !crate::core::carries_replacement_history(Some(&event.event_type)) {
         return Vec::new();
     }
     let fields = body_fields(&event.body);
@@ -1094,7 +1090,7 @@ mod tests {
             turn: "turn".to_string(),
             role: String::new(),
             kind: EventKind::Unknown,
-            event_type: "context_compaction".to_string(),
+            event_type: "compacted".to_string(),
             timestamp: String::new(),
             cwd: String::new(),
             repository: String::new(),
