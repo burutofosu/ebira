@@ -1420,6 +1420,9 @@ fn commits_are_the_names_that_start_one_commit() {
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
             .env("GIT_COMMITTER_NAME", "test")
             .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            // Keep the tested abbreviation stable and containing a hexadecimal letter.
+            .env("GIT_AUTHOR_DATE", "2026-08-16T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-08-16T00:00:00Z")
             .output()
             .expect("git runs");
         assert!(output.status.success(), "git {args:?} failed");
