@@ -217,7 +217,13 @@ pub fn build_with_preview(
         .iter()
         .map(|path| source_entry(Path::new(path), 300).map(|entry| entry.source_id))
         .collect::<io::Result<Vec<_>>>()?;
-    let offset_minutes = configured_offset_minutes();
+    // The date offset is fixed when the corpus is built: an incremental sync keeps the one in
+    // the catalog, so every segment of one corpus puts records on the same dates.
+    let offset_minutes = if incremental && !previous.is_empty() {
+        corpus_offset_minutes(output)?
+    } else {
+        configured_offset_minutes()
+    };
     let catalog_path = output.join("sources.tsv");
     let catalog_partial_path = output.join("sources.tsv.partial");
     let mut timeline_by_source = if incremental {
@@ -232,9 +238,20 @@ pub fn build_with_preview(
         .iter()
         .map(|entry| entry.source_id.as_str())
         .collect::<BTreeSet<_>>();
+    // A source that could not be listed or read this time keeps its projection: it is reported
+    // as unreadable, not taken for removed. A source that is gone is dropped.
+    let unreadable = availability
+        .entries
+        .iter()
+        .filter(|entry| entry.disposition == "unreadable")
+        .map(|entry| PathBuf::from(&entry.observed_path))
+        .collect::<Vec<_>>();
     for entry in previous.values() {
+        let unreadable_now = unreadable
+            .iter()
+            .any(|root| Path::new(&entry.path).starts_with(root));
         if !snapshot_ids.contains(entry.source_id.as_str())
-            && !source_input_covers_entry(sources, entry)
+            && (unreadable_now || !source_input_covers_entry(sources, entry))
         {
             write_source_entry(&mut catalog, entry)?;
         }
@@ -505,6 +522,7 @@ fn collect_changed_sources(
 
 pub fn status(path: &Path) -> io::Result<()> {
     let output = resolve_output(path);
+    let rules_version = corpus_rules_version(&output)?;
     let managed = crate::imports::inventory(&output)?;
     let corpus_root = output.join("corpus");
     let sources = load_source_catalog(&output)?;
@@ -552,7 +570,7 @@ pub fn status(path: &Path) -> io::Result<()> {
         availability.observed_at_ms.to_string()
     };
     println!(
-        "{{\"disposition\":{},\"mode\":\"compact_literal_corpus\",\"corpus\":{},\"sources\":{},\"complete_sources\":{},\"incomplete_sources\":{},\"corpus_files\":{},\"partial_files\":{},\"corpus_bytes\":{},\"catalog_bytes\":{},\"timeline_present\":{},\"timeline_sources\":{},\"timeline_runs\":{},\"timeline_bytes\":{},\"registered_source_inputs\":{},\"managed_imports\":{},\"unavailable_managed_imports\":{},\"imports\":{},\"unavailable_source_paths\":{},\"source_availability_observed_at_ms\":{},\"source_availability_total\":{},\"source_availability_truncated\":{},\"source_availability\":{},\"source_availability_bytes\":{}}}",
+        "{{\"disposition\":{},\"mode\":\"compact_literal_corpus\",\"corpus\":{},\"rules_version\":{},\"rules_current\":{},\"sources\":{},\"complete_sources\":{},\"incomplete_sources\":{},\"corpus_files\":{},\"partial_files\":{},\"corpus_bytes\":{},\"catalog_bytes\":{},\"timeline_present\":{},\"timeline_sources\":{},\"timeline_runs\":{},\"timeline_bytes\":{},\"registered_source_inputs\":{},\"managed_imports\":{},\"unavailable_managed_imports\":{},\"imports\":{},\"unavailable_source_paths\":{},\"source_availability_observed_at_ms\":{},\"source_availability_total\":{},\"source_availability_truncated\":{},\"source_availability\":{},\"source_availability_bytes\":{}}}",
         json_string(if managed.unavailable_imports != 0 {
             "managed_imports_unavailable"
         } else if unavailable_source_paths != 0 {
@@ -561,6 +579,8 @@ pub fn status(path: &Path) -> io::Result<()> {
             "observed"
         }),
         json_string(&output.to_string_lossy()),
+        rules_version,
+        rules_version == RULES_VERSION,
         sources.len(),
         complete_sources,
         incomplete_sources,
@@ -672,8 +692,32 @@ pub fn no_corpus_here(path: &Path) -> io::Error {
     )
 }
 
-pub fn corpus_exists(path: &Path) -> bool {
-    resolve_output(path).join("sources.tsv").is_file()
+const LOCK_FILE: &str = "ebira.lock";
+
+/// Commands that write (`sync`, `import`, `timeline --rebuild`) hold the corpus lock alone, and
+/// commands that read share it: a reader never sees a sync half done, and two writers never
+/// interleave their updates of one catalog or registry. The lock is released when the returned
+/// file is dropped, also when the process ends abnormally.
+pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+    let root = resolve_output(path);
+    fs::create_dir_all(&root)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(LOCK_FILE))?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// A corpus that no writer has locked yet has no lock file; reading it needs none.
+pub fn lock_shared(path: &Path) -> io::Result<Option<File>> {
+    let Ok(file) = File::open(resolve_output(path).join(LOCK_FILE)) else {
+        return Ok(None);
+    };
+    file.lock_shared()?;
+    Ok(Some(file))
 }
 
 /// The directories Claude Code and Codex write their transcripts to, where they exist:
@@ -1136,12 +1180,65 @@ fn source_catalog_header(offset_minutes: i64) -> String {
     let sign = if offset_minutes < 0 { '-' } else { '+' };
     let magnitude = offset_minutes.abs();
     format!(
-        "{}\ttz={}{:02}:{:02}",
+        "{}\ttz={}{:02}:{:02}\trules={}",
         source_catalog_version(),
         sign,
         magnitude / 60,
-        magnitude % 60
+        magnitude % 60,
+        RULES_VERSION
     )
+}
+
+/// The version of how records are read: which fields are kept, who sent each record, how
+/// turns are told apart. The logs are the source of truth and the corpus is a projection of
+/// them, so a corpus made under other rules is rebuilt by the next `ebira sync`.
+///
+/// Increase it with every change to what a sync writes for the same logs, together with
+/// `RULES_FINGERPRINT` in the tests of `core.rs`, which fails until both are updated.
+pub const RULES_VERSION: u64 = 1;
+
+/// How a corpus on disk relates to this build of Ebira.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorpusState {
+    Missing,
+    Current,
+    /// Written in another storage format; this build cannot read it.
+    FormatChanged,
+    /// Readable, but made under other reading rules.
+    RulesChanged,
+}
+
+pub fn corpus_state(path: &Path) -> CorpusState {
+    let catalog_path = resolve_output(path).join("sources.tsv");
+    let Ok(file) = File::open(&catalog_path) else {
+        return CorpusState::Missing;
+    };
+    let Some(Ok(header)) = BufReader::new(file).lines().next() else {
+        return CorpusState::FormatChanged;
+    };
+    if parse_catalog_header(&header, &catalog_path).is_err() {
+        return CorpusState::FormatChanged;
+    }
+    if catalog_rules_version(&header) == RULES_VERSION {
+        CorpusState::Current
+    } else {
+        CorpusState::RulesChanged
+    }
+}
+
+/// A catalog written before the rules were versioned declares none and counts as 0.
+fn catalog_rules_version(header: &str) -> u64 {
+    header
+        .split('\t')
+        .find_map(|part| part.strip_prefix("rules="))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+pub fn corpus_rules_version(root: &Path) -> io::Result<u64> {
+    let file = File::open(resolve_output(root).join("sources.tsv"))?;
+    let header = BufReader::new(file).lines().next().transpose()?;
+    Ok(header.as_deref().map(catalog_rules_version).unwrap_or(0))
 }
 
 pub fn corpus_offset_minutes(root: &Path) -> io::Result<i64> {
@@ -1172,10 +1269,9 @@ fn parse_catalog_header(line: &str, path: &Path) -> io::Result<i64> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{}: catalog is not {}; {}",
+                "{}: catalog is not {}; run `ebira sync`, which rebuilds it",
                 path.display(),
                 source_catalog_version(),
-                REBUILD_ADVICE
             ),
         ));
     }

@@ -17,11 +17,14 @@ apart and points every result back to its original bytes.
   latest messages, the latest replies and tool calls, and the compactions.
 - **Source references.** Each result carries a `source_ref` (source id, byte
   offset, length), and `ebira context` reads the original record around it.
+- **The logs stay the source of truth.** The corpus is a projection of them. When
+  Ebira's reading rules change, for example because an agent changed how its logs
+  mark the person, the next sync rebuilds it from the logs in about a minute.
 - **Offline, no dependencies.** Standard-library Rust; nothing leaves the machine.
 
 ## Install
 
-With Rust 1.87 or later:
+With Rust 1.89 or later:
 
 ```text
 cargo install --git https://github.com/burutofosu/ebira
@@ -225,12 +228,22 @@ The corpus is the directory in `EBIRA_CORPUS`, or by default:
 
 `--corpus <dir>` selects another one. `EBIRA_TZ_OFFSET` (for example `+09:00`)
 sets the offset of the date buckets when the corpus is built; the default is UTC.
+A corpus keeps its offset until it is rebuilt.
 
-The corpus is generated from the logs and can always be rebuilt with
-`ebira sync --rebuild`: `sources.tsv` (source catalog and checkpoints),
-`source-inputs.tsv` (the registered sources), `source-availability.tsv`,
-`timeline.tsv`, and `corpus/*.corpus` (the projected events). Its files carry a
-format version; a build of another version asks for a rebuild.
+The logs are the source of truth and the corpus is a projection of them:
+`sources.tsv` (source catalog and checkpoints), `source-inputs.tsv` (the
+registered sources), `source-availability.tsv`, `timeline.tsv`, and
+`corpus/*.corpus` (the projected events). The catalog records the storage format
+and the reading rules the corpus was made under. When an Ebira update changes
+either, the next `ebira sync` rebuilds the corpus from the logs in full and
+reports `rebuild_cause`; otherwise a sync reads only what the logs gained, and
+re-reads a log that was rewritten. `ebira sync --rebuild` rebuilds on request. A
+log that is gone loses its projection; one that cannot be read for the moment
+keeps it and is reported as unreadable.
+
+Several agents can use one corpus at once. A sync or an import waits while
+another one runs, and the commands that read the corpus wait for a sync in
+progress, so none of them sees a half-written corpus.
 
 `ebira import --source <path> --provenance <text> --label <text>` copies JSONL
 logs into `managed-imports/` beside the corpus, with their original paths, sizes,
@@ -287,10 +300,12 @@ Copy a skill directory into `~/.claude/skills` or `~/.codex/skills`.
 Ebira reads the transcript formats that Claude Code and Codex wrote in 2026.
 Neither format is documented, so a change can need an Ebira update.
 
-On one machine with 1,002 transcripts (about 12 GB of JSONL), the corpus took 2.9 GB;
-`resume --brief` answered in 0.13 s and a literal search over everything in 2 to
-4 s (under WSL). On the same logs, `said` listed the person's 3,161 messages with
-none missing and none extra, checked against an independent reading.
+On one machine with 1,002 transcripts (about 12 GB of JSONL, 1,052,720 records),
+a full rebuild took 54 s and the corpus 3.0 GB; a sync that found one grown log
+took 16 s, most of it spent listing the Windows logs from WSL. `resume --brief`
+answered in 0.13 s, and a literal search over everything in 2 to 4 s. On the
+same logs, `said` listed the person's 3,161 messages with none missing and none
+extra, checked against an independent reading.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the modules and the storage format.
 

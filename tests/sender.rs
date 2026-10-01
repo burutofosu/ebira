@@ -451,3 +451,85 @@ fn follow_finds_a_session_registered_as_a_file_or_in_a_directory() {
         "a session found inside a registered directory: {by_directory}"
     );
 }
+
+#[test]
+fn resume_reads_the_whole_session_however_it_is_named() {
+    let root = std::env::temp_dir().join(format!("ebira-sender-segments-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join(".claude").join("projects").join("C--work");
+    std::fs::create_dir_all(&project).expect("create project directory");
+    let transcript = project.join("s-seg.jsonl");
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    let turns = [
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"first request"},"sessionId":"s-seg","timestamp":"2026-09-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"compact_boundary","sessionId":"s-seg","timestamp":"2026-09-01T00:00:01Z"}"#,
+            "\n",
+            r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation"},"sessionId":"s-seg","timestamp":"2026-09-01T00:00:02Z"}"#,
+            "\n",
+        ),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"second request"},"sessionId":"s-seg","timestamp":"2026-09-01T00:01:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"second answer"}]},"sessionId":"s-seg","timestamp":"2026-09-01T00:01:01Z"}"#,
+            "\n",
+        ),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"third request"},"sessionId":"s-seg","timestamp":"2026-09-01T00:02:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"third answer"}]},"sessionId":"s-seg","timestamp":"2026-09-01T00:02:01Z"}"#,
+            "\n",
+        ),
+    ];
+    let mut written = String::new();
+    for (index, turn) in turns.iter().enumerate() {
+        written.push_str(turn);
+        std::fs::write(&transcript, &written).expect("append a turn");
+        if index == 0 {
+            run(&[
+                "sync",
+                "--source",
+                project.to_str().expect("utf-8 path"),
+                "--corpus",
+                corpus,
+            ]);
+        } else {
+            run(&["sync", "--corpus", corpus]);
+        }
+    }
+
+    let by_session = run(&[
+        "resume",
+        "--corpus",
+        corpus,
+        "--session",
+        "s-seg",
+        "--brief",
+    ]);
+    let source_id = by_session
+        .split("\"source_id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the result names its source")
+        .to_string();
+    let by_source = run(&[
+        "resume",
+        "--corpus",
+        corpus,
+        "--source-id",
+        &source_id,
+        "--brief",
+    ]);
+    for result in [&by_session, &by_source] {
+        assert!(
+            result.contains("\"compactions\":{\"count\":1")
+                && result.contains("first request")
+                && result.contains("second request")
+                && result.contains("third request"),
+            "resume misses part of the session: {result}"
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove test root");
+}

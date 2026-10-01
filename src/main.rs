@@ -459,6 +459,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 .into_iter()
                 .next()
                 .unwrap_or_default();
+            let _lock = corpus::lock_exclusive(&corpus)?;
             let report = imports::import(&corpus, &source, &provenance, &label, &source_computer)?;
             println!("{}", report.json());
             Ok(())
@@ -466,6 +467,7 @@ fn run(args: &[String]) -> io::Result<()> {
         "search" | "history" => {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
+            let _lock = corpus::lock_shared(&root)?;
             let request = search_request(
                 args,
                 if command == "history" { "history" } else { "" },
@@ -477,14 +479,17 @@ fn run(args: &[String]) -> io::Result<()> {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
             if has_flag(args, "--rebuild") {
+                let _lock = corpus::lock_exclusive(&root)?;
                 return corpus::rebuild_timeline(&root);
             }
+            let _lock = corpus::lock_shared(&root)?;
             let request = timeline_request(args, corpus::corpus_offset_minutes(&root)?)?;
             search::timeline(&root, request)
         }
         "commits" => {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
+            let _lock = corpus::lock_shared(&root)?;
             let request = commits::CommitRequest {
                 repo: one_option(args, "--repo")?,
                 from: option_values(args, "--from").into_iter().next(),
@@ -497,6 +502,7 @@ fn run(args: &[String]) -> io::Result<()> {
         "resume" => {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
+            let _lock = corpus::lock_shared(&root)?;
             let source_id = option_values(args, "--source-id").into_iter().next();
             let session = option_values(args, "--session").into_iter().next();
             resume::resume(
@@ -509,6 +515,7 @@ fn run(args: &[String]) -> io::Result<()> {
         "said" => {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
+            let _lock = corpus::lock_shared(&root)?;
             let request = said::SaidRequest {
                 session: option_values(args, "--session").into_iter().next(),
                 source_id: option_values(args, "--source-id").into_iter().next(),
@@ -553,6 +560,7 @@ fn run(args: &[String]) -> io::Result<()> {
         "context" => {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
+            let _lock = corpus::lock_shared(&root)?;
             let source_id = one_option(args, "--source-id")?;
             let byte_start = number_option_u64(args, "--byte-start")?;
             let byte_len = number_option_u64(args, "--byte-len")?;
@@ -599,6 +607,7 @@ fn run(args: &[String]) -> io::Result<()> {
         "status" => {
             let root = corpus_path(args)?;
             corpus::require_corpus(&root)?;
+            let _lock = corpus::lock_shared(&root)?;
             corpus::status(&root)
         }
         _ => Err(unknown_command(command)),
@@ -608,12 +617,23 @@ fn run(args: &[String]) -> io::Result<()> {
 /// `sync` creates the corpus or brings it up to date. The sources are the registered ones plus
 /// any `--source`; a first sync without sources reads the Claude Code and Codex transcript
 /// directories. `--rebuild` with `--source` builds from exactly the given sources.
+///
+/// The logs are the source of truth. A corpus written in another storage format or under other
+/// reading rules is rebuilt from them in full; otherwise only what the logs gained is read.
 fn sync(args: &[String]) -> io::Result<()> {
     let corpus = corpus_path(args)?;
+    let _lock = corpus::lock_exclusive(&corpus)?;
     let given = option_values(args, "--source");
-    let rebuild = has_flag(args, "--rebuild");
-    let exists = corpus::corpus_exists(&corpus);
-    let mut sources = if rebuild && !given.is_empty() {
+    let requested = has_flag(args, "--rebuild");
+    let state = corpus::corpus_state(&corpus);
+    let exists = state != corpus::CorpusState::Missing;
+    let rebuild_cause = match state {
+        _ if requested => Some("requested"),
+        corpus::CorpusState::FormatChanged => Some("format_changed"),
+        corpus::CorpusState::RulesChanged => Some("rules_changed"),
+        _ => None,
+    };
+    let mut sources = if requested && !given.is_empty() {
         given.clone()
     } else {
         let mut sources = if exists {
@@ -649,12 +669,12 @@ fn sync(args: &[String]) -> io::Result<()> {
     let report = corpus::build_with_preview(
         &sources,
         &corpus,
-        !rebuild,
+        rebuild_cause.is_none(),
         optional_number_option(args, "--tool-output-chars")?,
         &option_values(args, "--rebuild-source"),
     )?;
     println!(
-        "{{\"disposition\":\"{}\",\"mode\":\"compact_literal_corpus\",\"counter_scope\":\"this_command\",\"sources_seen\":{},\"sources_processed\":{},\"sources_appended\":{},\"sources_reused\":{},\"records\":{},\"invalid_records\":{},\"partial_records\":{},\"timeline_runs\":{},\"corpus_bytes\":{},\"corpus_bytes_scope\":\"current_projection\",\"unreadable_source_paths\":{},\"changed_sources_total\":{},\"changed_sources_truncated\":{},\"changed_sources\":{},\"managed_imports\":{},\"unavailable_managed_imports\":{},\"detected_sources\":{},\"corpus\":{}}}",
+        "{{\"disposition\":\"{}\",\"mode\":\"compact_literal_corpus\",\"counter_scope\":\"this_command\",\"sources_seen\":{},\"sources_processed\":{},\"sources_appended\":{},\"sources_reused\":{},\"records\":{},\"invalid_records\":{},\"partial_records\":{},\"timeline_runs\":{},\"corpus_bytes\":{},\"corpus_bytes_scope\":\"current_projection\",\"unreadable_source_paths\":{},\"changed_sources_total\":{},\"changed_sources_truncated\":{},\"changed_sources\":{},\"managed_imports\":{},\"unavailable_managed_imports\":{},\"detected_sources\":{},\"rebuild_cause\":{},\"corpus\":{}}}",
         report.disposition,
         report.sources_seen,
         report.sources_processed,
@@ -672,6 +692,9 @@ fn sync(args: &[String]) -> io::Result<()> {
         managed.entries.len(),
         managed.unavailable_imports,
         string_array_json(&detected),
+        rebuild_cause
+            .map(format::json_string)
+            .unwrap_or_else(|| "null".to_string()),
         format::json_string(&report.output),
     );
     Ok(())

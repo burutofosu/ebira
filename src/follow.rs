@@ -46,8 +46,50 @@ struct Message {
 struct Target {
     source_id: String,
     path: PathBuf,
-    origin: SourceOrigin,
+    origin: Origin,
 }
+
+/// Who wrote a transcript. A Claude Code transcript is known from its path; a Codex thread
+/// from its first record, which says whether another thread or `codex exec` started it; a
+/// transcript outside `.claude` and `.codex` from its first records. Until that is known, the
+/// origin is decided again whenever new lines arrive, before any of them is classified.
+#[derive(Clone, Copy)]
+struct Origin {
+    value: SourceOrigin,
+    settled: bool,
+}
+
+impl Origin {
+    fn of(path: &Path) -> Self {
+        let value = corpus::origin_for_path(path);
+        let settled = match value {
+            SourceOrigin::ClaudeMain | SourceOrigin::ClaudeSubagent => true,
+            SourceOrigin::Generic => false,
+            _ => first_line_complete(path),
+        };
+        Origin { value, settled }
+    }
+
+    /// Called when the file holds at least one complete line.
+    fn settle(&mut self, path: &Path) {
+        if !self.settled {
+            self.value = corpus::origin_for_path(path);
+            self.settled = self.value != SourceOrigin::Generic;
+        }
+    }
+}
+
+fn first_line_complete(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = io::BufReader::new(file.take(FIRST_LINE_LIMIT));
+    let mut line = Vec::new();
+    io::BufRead::read_until(&mut reader, b'\n', &mut line).is_ok() && line.last() == Some(&b'\n')
+}
+
+/// A Codex session_meta record carries the base instructions and can be large.
+const FIRST_LINE_LIMIT: u64 = 16 * 1024 * 1024;
 
 pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
     let target = resolve_target(root, request)?;
@@ -122,7 +164,7 @@ fn resolve_target(root: &Path, request: &FollowRequest) -> io::Result<Target> {
 }
 
 fn target(source_id: String, path: PathBuf) -> Target {
-    let origin = corpus::origin_for_path(&path);
+    let origin = Origin::of(&path);
     Target {
         source_id,
         path,
@@ -215,15 +257,11 @@ fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
 }
 
 /// Read every complete line after `cursor`; return the messages found and the
-/// boundary after the last line consumed.
-///
-/// A transcript outside `.claude` and `.codex` directories is recognised by its first
-/// records. One that was still empty or unrecognised when following began is looked at
-/// again once new lines arrive, before any of them is classified, so its first messages
-/// are not read as a format without senders.
+/// boundary after the last line consumed. The origin is settled first, so the first
+/// messages of a transcript that began empty are classified like the rest.
 fn scan(
     path: &Path,
-    origin: &mut SourceOrigin,
+    origin: &mut Origin,
     cursor: u64,
     request: &FollowRequest,
 ) -> io::Result<(Vec<Message>, u64)> {
@@ -239,10 +277,8 @@ fn scan(
         Some(index) => index + 1,
         None => return Ok((Vec::new(), cursor)),
     };
-    if *origin == SourceOrigin::Generic {
-        *origin = corpus::origin_for_path(path);
-    }
-    let origin = *origin;
+    origin.settle(path);
+    let origin = origin.value;
     let mut messages = Vec::new();
     let mut offset = 0usize;
     while offset < complete {
@@ -438,8 +474,9 @@ mod tests {
     #[test]
     fn a_transcript_written_before_following_is_read_by_sender() {
         let path = transcript("before", CODEX_THREAD);
-        let mut origin = corpus::origin_for_path(&path);
-        assert_eq!(origin, SourceOrigin::CodexThread);
+        let mut origin = Origin::of(&path);
+        assert_eq!(origin.value, SourceOrigin::CodexThread);
+        assert!(origin.settled);
         let (messages, _) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "the person's words");
@@ -449,8 +486,8 @@ mod tests {
     #[test]
     fn a_transcript_first_written_while_following_is_read_by_sender() {
         let path = transcript("after", "");
-        let mut origin = corpus::origin_for_path(&path);
-        assert_eq!(origin, SourceOrigin::Generic);
+        let mut origin = Origin::of(&path);
+        assert_eq!(origin.value, SourceOrigin::Generic);
         let (messages, cursor) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
         assert!(messages.is_empty());
         assert_eq!(cursor, 0);
@@ -461,7 +498,7 @@ mod tests {
             .and_then(|mut file| file.write_all(CODEX_THREAD.as_bytes()))
             .expect("append records");
         let (messages, _) = scan(&path, &mut origin, cursor, &request("human")).expect("scan");
-        assert_eq!(origin, SourceOrigin::CodexThread);
+        assert_eq!(origin.value, SourceOrigin::CodexThread);
         assert_eq!(
             messages.len(),
             1,
@@ -469,5 +506,52 @@ mod tests {
         );
         assert_eq!(messages[0].sender, "human");
         fs::remove_file(path).expect("remove transcript");
+    }
+
+    #[test]
+    fn a_codex_child_thread_written_while_following_is_known_from_its_first_record() {
+        let directory = std::env::temp_dir()
+            .join(format!("ebira-follow-child-{}", std::process::id()))
+            .join(".codex")
+            .join("sessions");
+        fs::create_dir_all(&directory).expect("create session directory");
+        let path = directory.join("rollout-child.jsonl");
+        fs::write(&path, "").expect("write empty rollout");
+        let mut origin = Origin::of(&path);
+        assert!(
+            !origin.settled,
+            "an empty rollout does not say who started it"
+        );
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                file.write_all(
+                    concat!(
+                        r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}"#,
+                        "\n",
+                        r#"{"timestamp":"2026-09-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"audit the parser"}]}}"#,
+                        "\n",
+                    )
+                    .as_bytes(),
+                )
+            })
+            .expect("append records");
+        let (messages, _) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
+        assert_eq!(origin.value, SourceOrigin::CodexChild);
+        assert!(
+            messages.is_empty(),
+            "the parent thread's prompt is another agent's, not the person's"
+        );
+        let (messages, _) = scan(&path, &mut origin, 0, &request("agent")).expect("scan");
+        assert_eq!(messages.len(), 1);
+        fs::remove_dir_all(
+            directory
+                .parent()
+                .and_then(Path::parent)
+                .expect("test root"),
+        )
+        .expect("remove test root");
     }
 }

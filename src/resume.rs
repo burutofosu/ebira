@@ -222,20 +222,14 @@ pub fn resume(
     Ok(())
 }
 
+/// Every segment of the source is read, however the source was named: the person's messages
+/// and the compactions of the whole session belong to the result, not only the latest turns.
 fn scan_source(
     root: &Path,
     source_id: &str,
     session_filter: Option<&str>,
 ) -> io::Result<ScanResult> {
     let files = corpus::source_files(root, source_id)?;
-    if session_filter.is_none() {
-        let recent_start = files.len().saturating_sub(2);
-        let recent_files = &files[recent_start..];
-        let recent = scan_paths(recent_files, None)?;
-        if recent.previous.is_some() && recent_window_is_complete(&files, recent_start)? {
-            return Ok(recent);
-        }
-    }
     scan_paths(&files, session_filter)
 }
 
@@ -639,63 +633,6 @@ fn tool_calls(fields: &[Field]) -> Vec<(String, String)> {
         calls.push((name, input));
     }
     calls
-}
-
-fn recent_window_is_complete(files: &[PathBuf], recent_start: usize) -> io::Result<bool> {
-    if recent_start == 0 {
-        return Ok(true);
-    }
-    let Some(first) = first_event_header(&files[recent_start])? else {
-        return Ok(false);
-    };
-    let Some(previous) = last_event_header(&files[recent_start - 1])? else {
-        return Ok(false);
-    };
-    Ok(first.session != previous.session || first.turn != previous.turn)
-}
-
-fn first_event_header(path: &Path) -> io::Result<Option<crate::format::EventHeader>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
-    let mut line = Vec::new();
-    if reader.read_until(b'\n', &mut line)? == 0 {
-        return Ok(None);
-    }
-    parse_event_header(&line)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-const RESUME_HEADER_TAIL_BYTES: u64 = 4 * 1024 * 1024;
-
-fn last_event_header(path: &Path) -> io::Result<Option<crate::format::EventHeader>> {
-    let metadata = std::fs::metadata(path)?;
-    let start = metadata.len().saturating_sub(RESUME_HEADER_TAIL_BYTES);
-    let mut file = File::open(path)?;
-    file.seek(std::io::SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let marker = b"@ebira\t";
-    let end = bytes.len().saturating_add(1).saturating_sub(marker.len());
-    for position in (0..end).rev() {
-        if &bytes[position..position + marker.len()] != marker
-            || (position > 0 && bytes[position - 1] != b'\n')
-        {
-            continue;
-        }
-        let Some(relative_end) = bytes[position..].iter().position(|byte| *byte == b'\n') else {
-            continue;
-        };
-        let line_end = position + relative_end + 1;
-        let Ok(header) = parse_event_header(&bytes[position..line_end]) else {
-            continue;
-        };
-        if !crate::format::record_closes_buffer(&bytes, line_end, header.body_len) {
-            continue;
-        }
-        return Ok(Some(header));
-    }
-    Ok(None)
 }
 
 fn embedded_messages(event: &RecoveryEvent) -> Vec<RecoveryEvent> {

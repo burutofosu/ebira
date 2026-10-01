@@ -75,7 +75,9 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
         scan_file(path, &catalog, request, query.as_deref(), &mut |said| {
             if said.header.via == "imported" && !request.include_imported {
                 imported += 1;
-            } else if seen.insert((said.header.timestamp.clone(), said.text.clone())) {
+            // One message stored twice can differ in surrounding whitespace only (Codex writes
+            // the text as an event and as a response item); the text shown stays as sent.
+            } else if seen.insert((said.header.timestamp.clone(), said.text.trim().to_string())) {
                 found.push(said);
             } else {
                 copies += 1;

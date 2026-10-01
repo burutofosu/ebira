@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const EBIRA: &str = env!("CARGO_BIN_EXE_ebira");
 
@@ -332,5 +332,65 @@ fn invalid_registry_returns_an_error() {
         "invalid registry was reported as empty: {observed}"
     );
 
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn concurrent_imports_all_stay_registered() {
+    let root = root("concurrent");
+    let corpus = root.join("home").join("corpus");
+    let archives = (0..8)
+        .map(|index| {
+            let archive = root.join(format!("archive-{index}"));
+            std::fs::create_dir_all(&archive).expect("create archive");
+            std::fs::write(
+                archive.join("archive.jsonl"),
+                format!(
+                    "{{\"event_msg\":{{\"type\":\"user_message\",\"message\":\"archive marker {index}\"}},\"role\":\"user\",\"session_id\":\"a{index}\",\"turn_id\":\"t\"}}\n"
+                ),
+            )
+            .expect("write archive");
+            archive
+        })
+        .collect::<Vec<_>>();
+    let children = archives
+        .iter()
+        .enumerate()
+        .map(|(index, archive)| {
+            ebira()
+                .args([
+                    "import",
+                    "--source",
+                    text(archive),
+                    "--provenance",
+                    "concurrent-test",
+                    "--label",
+                    &format!("archive-{index}"),
+                    "--corpus",
+                    text(&corpus),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start ebira")
+        })
+        .collect::<Vec<_>>();
+    for child in children {
+        let output = child.wait_with_output().expect("ebira finishes");
+        assert!(
+            output.status.success(),
+            "an import beside others failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    run(&["sync", "--corpus", text(&corpus)]);
+    let status = run(&["status", "--corpus", text(&corpus)]);
+    assert!(status.contains("\"managed_imports\":8"), "{status}");
+    for index in 0..8 {
+        assert!(
+            status.contains(&format!("\"label\":\"archive-{index}\"")),
+            "import {index} lost its registration: {status}"
+        );
+    }
     std::fs::remove_dir_all(root).expect("remove test root");
 }

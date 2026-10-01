@@ -2,7 +2,7 @@
 name = "ebira"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.89"
 description = "Search and recover Claude Code and Codex conversations from their JSONL transcripts."
 readme = "README.md"
 license = "Apache-2.0"

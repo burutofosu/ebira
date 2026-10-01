@@ -52,16 +52,6 @@ pub fn event_header_line(header: &EventHeader) -> String {
     line
 }
 
-pub fn record_closes_buffer(bytes: &[u8], header_line_end: usize, body_len: u64) -> bool {
-    let Ok(body_len) = usize::try_from(body_len) else {
-        return false;
-    };
-    let Some(body_end) = header_line_end.checked_add(body_len) else {
-        return false;
-    };
-    bytes.get(body_end) == Some(&b'\n') && body_end.saturating_add(1) == bytes.len()
-}
-
 pub fn parse_event_header(line: &[u8]) -> Result<EventHeader, String> {
     let text = std::str::from_utf8(line)
         .map_err(|_| "corpus header is not UTF-8".to_string())?

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const EBIRA: &str = env!("CARGO_BIN_EXE_ebira");
 
@@ -253,6 +253,7 @@ fn command_output_matches_declared_schema() {
             "managed_imports",
             "unavailable_managed_imports",
             "detected_sources",
+            "rebuild_cause",
             "corpus",
         ],
     );
@@ -261,6 +262,8 @@ fn command_output_matches_declared_schema() {
         "disposition",
         "mode",
         "corpus",
+        "rules_version",
+        "rules_current",
         "sources",
         "complete_sources",
         "incomplete_sources",
@@ -822,4 +825,209 @@ fn copied_transcripts_are_recognised_by_their_records() {
         "a transcript outside .claude is still read as Claude Code: {said}"
     );
     std::fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+fn rewrite_catalog_header(corpus: &str, edit: impl Fn(&str) -> String) {
+    let catalog = Path::new(corpus).join("sources.tsv");
+    let text = std::fs::read_to_string(&catalog).expect("read catalog");
+    let (header, rest) = text.split_once('\n').expect("catalog header");
+    std::fs::write(&catalog, format!("{}\n{}", edit(header), rest)).expect("write catalog");
+}
+
+#[test]
+fn sync_rebuilds_a_corpus_made_under_other_reading_rules() {
+    let fixture = Fixture::new("rules-version");
+    let corpus = fixture.corpus();
+    let current = run(&["status", "--corpus", &corpus]);
+    assert!(current.contains("\"rules_current\":true"), "{current}");
+
+    // A catalog written before the reading rules were versioned declares none.
+    rewrite_catalog_header(&corpus, |header| {
+        header
+            .split('\t')
+            .filter(|part| !part.starts_with("rules="))
+            .collect::<Vec<_>>()
+            .join("\t")
+    });
+    let stale = run(&["status", "--corpus", &corpus]);
+    assert!(
+        stale.contains("\"rules_version\":0,\"rules_current\":false"),
+        "{stale}"
+    );
+    let rebuilt = run(&["sync", "--corpus", &corpus]);
+    assert!(
+        rebuilt.contains("\"rebuild_cause\":\"rules_changed\"")
+            && rebuilt.contains("\"sources_processed\":1")
+            && rebuilt.contains("\"sources_reused\":0"),
+        "a corpus made under other rules is rebuilt from the logs: {rebuilt}"
+    );
+    let again = run(&["sync", "--corpus", &corpus]);
+    assert!(
+        again.contains("\"rebuild_cause\":null") && again.contains("\"sources_reused\":1"),
+        "a current corpus is synced incrementally: {again}"
+    );
+    let requested = run(&["sync", "--corpus", &corpus, "--rebuild"]);
+    assert!(
+        requested.contains("\"rebuild_cause\":\"requested\"")
+            && requested.contains("\"sources_processed\":1"),
+        "{requested}"
+    );
+}
+
+#[test]
+fn sync_rebuilds_a_corpus_written_in_another_format() {
+    let fixture = Fixture::new("format-version");
+    let corpus = fixture.corpus();
+    rewrite_catalog_header(&corpus, |header| {
+        header
+            .split('\t')
+            .map(|part| {
+                if part.starts_with("v=") {
+                    "v=0".to_string()
+                } else {
+                    part.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\t")
+    });
+    let refused = run_failure(&["search", "--corpus", &corpus, "--query", "probe"]);
+    assert!(
+        refused.contains("run `ebira sync`, which rebuilds it"),
+        "{refused}"
+    );
+    let rebuilt = run(&["sync", "--corpus", &corpus]);
+    assert!(
+        rebuilt.contains("\"rebuild_cause\":\"format_changed\""),
+        "{rebuilt}"
+    );
+    let found = run(&["search", "--corpus", &corpus, "--query", "surface probe"]);
+    assert!(found.contains("\"total_candidates\":1"), "{found}");
+}
+
+#[test]
+fn concurrent_syncs_and_reads_leave_one_consistent_corpus() {
+    let fixture = Fixture::new("concurrent");
+    let corpus = fixture.corpus();
+    let logs = fixture.path().join("more");
+    std::fs::create_dir_all(&logs).expect("create log directory");
+    let record = |index: usize, turn: &str| {
+        format!(
+            "{{\"event_msg\":{{\"type\":\"user_message\",\"message\":\"concurrent marker {index} {turn}\"}},\"role\":\"user\",\"session_id\":\"s{index}\",\"turn_id\":\"{turn}\"}}\n"
+        )
+    };
+    for index in 0..40 {
+        std::fs::write(logs.join(format!("log-{index}.jsonl")), record(index, "t1"))
+            .expect("write source");
+    }
+    run(&[
+        "sync",
+        "--corpus",
+        &corpus,
+        "--source",
+        logs.to_str().expect("utf-8 path"),
+    ]);
+    for index in 0..40 {
+        let path = logs.join(format!("log-{index}.jsonl"));
+        let mut text = std::fs::read_to_string(&path).expect("read source");
+        text.push_str(&record(index, "t2"));
+        std::fs::write(&path, text).expect("append to source");
+    }
+
+    let children = (0..8)
+        .map(|index| {
+            let args: Vec<&str> = if index % 2 == 0 {
+                vec!["sync", "--corpus", &corpus]
+            } else {
+                vec![
+                    "search",
+                    "--corpus",
+                    &corpus,
+                    "--query",
+                    "concurrent marker",
+                ]
+            };
+            ebira()
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start ebira")
+        })
+        .collect::<Vec<_>>();
+    for child in children {
+        let output = child.wait_with_output().expect("ebira finishes");
+        assert!(
+            output.status.success(),
+            "a command run beside others failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let status = run(&["status", "--corpus", &corpus]);
+    assert!(
+        status.contains("\"incomplete_sources\":0") && status.contains("\"partial_files\":0"),
+        "{status}"
+    );
+    let found = run(&[
+        "search",
+        "--corpus",
+        &corpus,
+        "--query",
+        "concurrent marker",
+        "--limit",
+        "200",
+    ]);
+    assert!(found.contains("\"total_candidates\":80"), "{found}");
+}
+
+/// A directory that cannot be listed this time is reported, and what was read from it before
+/// stays searchable; only a source that is gone loses its projection.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_keeps_its_projection() {
+    use std::os::unix::fs::PermissionsExt;
+    let root =
+        std::env::temp_dir().join(format!("ebira-surface-unreadable-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let logs = root.join("logs");
+    for name in ["open", "closed"] {
+        std::fs::create_dir_all(logs.join(name)).expect("create log directory");
+        std::fs::write(
+            logs.join(name).join(format!("{name}.jsonl")),
+            format!(
+                "{{\"event_msg\":{{\"type\":\"user_message\",\"message\":\"{name} marker\"}},\"role\":\"user\",\"session_id\":\"{name}\",\"turn_id\":\"t\"}}\n"
+            ),
+        )
+        .expect("write source");
+    }
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    run(&[
+        "sync",
+        "--source",
+        logs.to_str().expect("utf-8 path"),
+        "--corpus",
+        corpus,
+    ]);
+    let closed = logs.join("closed");
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
+        .expect("close the directory");
+    if std::fs::read_dir(&closed).is_ok() {
+        // Running with privileges that ignore permissions; nothing to observe.
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755))
+            .expect("open the directory");
+        std::fs::remove_dir_all(&root).expect("remove temp directory");
+        return;
+    }
+    let sync = run(&["sync", "--corpus", corpus]);
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755))
+        .expect("open the directory");
+    assert!(sync.contains("\"unreadable_source_paths\":1"), "{sync}");
+    let found = run(&["search", "--corpus", corpus, "--query", "closed marker"]);
+    assert!(
+        found.contains("\"total_candidates\":1"),
+        "the projection of an unreadable directory is kept: {found}"
+    );
+    std::fs::remove_dir_all(&root).expect("remove temp directory");
 }

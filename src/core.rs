@@ -419,10 +419,8 @@ fn select_human_body<F: FieldView>(fields: &[F]) -> String {
     for field in fields {
         let path = field.path();
         if is_human_text_path(path) {
-            let value = strip_injected_blocks(field.value());
-            let value = value.trim();
-            if !value.is_empty() {
-                push_delimited(&mut body, path, value);
+            if let Some(value) = person_text(field.value()) {
+                push_delimited(&mut body, path, &value);
             }
         } else if normalize_key(leaf(path)) == "type"
             && matches!(field.value(), "image" | "input_image")
@@ -692,14 +690,18 @@ fn codex_record_sender<F: FieldView>(
         ("response_item", "message") => match field_at(fields, "/payload/role").unwrap_or("") {
             "user" => match delivered_by {
                 Some(via) => (Sender::Agent, via),
-                None => codex_text_sender(&human_text(fields)),
+                None => codex_text_sender(
+                    &human_text(fields),
+                    has_content_item_type(fields, "input_image"),
+                ),
             },
             "assistant" => (Sender::Assistant, ""),
             _ => (Sender::System, "instructions"),
         },
+        // The response item carries the images of the same message; this event repeats its text.
         ("event_msg", "user_message") => match delivered_by {
             Some(via) => (Sender::Agent, via),
-            None => codex_text_sender(&human_text(fields)),
+            None => codex_text_sender(&human_text(fields), false),
         },
         ("response_item", "agent_message") => (Sender::Agent, "agent_message"),
         ("event_msg", "agent_message") => (Sender::Assistant, ""),
@@ -711,10 +713,15 @@ fn codex_record_sender<F: FieldView>(
     }
 }
 
-fn codex_text_sender(text: &str) -> (Sender, &'static str) {
+fn codex_text_sender(text: &str, has_image: bool) -> (Sender, &'static str) {
     let text = text.trim_start();
     if text.is_empty() {
-        return (Sender::System, "injected");
+        // A screenshot sent without words is still the person's message.
+        return if has_image {
+            (Sender::Human, "typed")
+        } else {
+            (Sender::System, "injected")
+        };
     }
     if is_compaction_summary_text(text) {
         return (Sender::Summary, "compact_summary");
@@ -824,6 +831,35 @@ const INJECTED_BLOCKS: [(&str, &str); 2] = [
     ("<system-reminder>", "</system-reminder>"),
     ("<in-app-browser-context", "</in-app-browser-context>"),
 ];
+
+/// A person's text as they sent it. Text without a tool-injected block is kept byte for byte;
+/// where a block opened or closed the value, the whitespace that set it apart from the
+/// person's words goes with it. `None` when nothing of the person's is left.
+fn person_text(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let stripped = strip_injected_blocks(value);
+    if stripped.trim().is_empty() {
+        return None;
+    }
+    match stripped {
+        std::borrow::Cow::Borrowed(text) => Some(std::borrow::Cow::Borrowed(text)),
+        std::borrow::Cow::Owned(text) => {
+            let opened = INJECTED_BLOCKS
+                .iter()
+                .any(|(open, _)| value.trim_start().starts_with(open));
+            let closed = INJECTED_BLOCKS
+                .iter()
+                .any(|(_, close)| value.trim_end().ends_with(close));
+            let mut kept = text.as_str();
+            if opened {
+                kept = kept.trim_start_matches(['\r', '\n']);
+            }
+            if closed {
+                kept = kept.trim_end();
+            }
+            Some(std::borrow::Cow::Owned(kept.to_string()))
+        }
+    }
+}
 
 fn strip_injected_blocks(value: &str) -> std::borrow::Cow<'_, str> {
     if !INJECTED_BLOCKS.iter().any(|(open, _)| value.contains(open)) {
@@ -2558,5 +2594,311 @@ mod tests {
             sender: super::Sender::Unknown,
             via: String::new(),
         }
+    }
+
+    /// What a sync writes for the same logs is fixed by `corpus::RULES_VERSION`. This digest of
+    /// how representative records are classified and projected changes with any change to
+    /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
+    /// here: the next sync then rebuilds every corpus made under the old rules.
+    const RULES_FINGERPRINT: (u64, &str) = (1, "644c98ff872d783a");
+
+    #[test]
+    fn reading_rules_are_versioned() {
+        use super::SourceOrigin::{self, *};
+        let long_output: &'static str = Box::leak("x".repeat(400).into_boxed_str());
+        let records: Vec<(SourceOrigin, Vec<(&'static str, &'static str)>)> = vec![
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content", "please fix it"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content/0/type", "text"),
+                    (
+                        "/message/content/0/text",
+                        "<system-reminder>context</system-reminder>\n    keep this indent\n",
+                    ),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content/0/type", "image"),
+                    ("/message/content/0/source/type", "base64"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content/0/type", "tool_result"),
+                    ("/message/content/0/content", "a.txt"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/isCompactSummary", "true"),
+                    ("/message/role", "user"),
+                    (
+                        "/message/content",
+                        "This session is being continued from a previous conversation",
+                    ),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    (
+                        "/message/content",
+                        "<task-notification>done</task-notification>",
+                    ),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "attachment"),
+                    ("/attachment/type", "queued_command"),
+                    ("/attachment/prompt", "also check the docs"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content", "<command-name>/review</command-name>"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/isMeta", "true"),
+                    ("/message/role", "user"),
+                    ("/message/content", "Caveat"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "assistant"),
+                    ("/message/role", "assistant"),
+                    ("/message/content/0/type", "text"),
+                    ("/message/content/0/text", "on it"),
+                    ("/message/content/1/type", "tool_use"),
+                    ("/message/content/1/name", "Bash"),
+                    ("/message/content/1/input/command", "ls"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![("/type", "system"), ("/subtype", "compact_boundary")],
+            ),
+            (
+                ClaudeSubagent,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content", "Survey the parser"),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![
+                    ("/type", "response_item"),
+                    ("/payload/type", "message"),
+                    ("/payload/role", "user"),
+                    ("/payload/content/0/type", "input_text"),
+                    (
+                        "/payload/content/0/text",
+                        "<in-app-browser-context>tabs</in-app-browser-context>\n## shrink it",
+                    ),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![
+                    ("/type", "response_item"),
+                    ("/payload/type", "message"),
+                    ("/payload/role", "user"),
+                    ("/payload/content/0/type", "input_text"),
+                    (
+                        "/payload/content/0/text",
+                        "<environment_context>cwd</environment_context>",
+                    ),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![
+                    ("/type", "response_item"),
+                    ("/payload/type", "message"),
+                    ("/payload/role", "user"),
+                    ("/payload/content/0/type", "input_image"),
+                    ("/payload/content/0/image_url", "data:image/png;base64,AAAA"),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![
+                    ("/type", "event_msg"),
+                    ("/payload/type", "user_message"),
+                    ("/payload/message", "shrink it"),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![
+                    ("/type", "response_item"),
+                    ("/payload/type", "message"),
+                    ("/payload/role", "assistant"),
+                    ("/payload/content/0/type", "output_text"),
+                    ("/payload/content/0/text", "done"),
+                ],
+            ),
+            (
+                CodexThread,
+                vec![
+                    ("/type", "response_item"),
+                    ("/payload/type", "function_call_output"),
+                    ("/payload/output", long_output),
+                ],
+            ),
+            (
+                CodexChild,
+                vec![
+                    ("/type", "response_item"),
+                    ("/payload/type", "message"),
+                    ("/payload/role", "user"),
+                    ("/payload/content/0/type", "input_text"),
+                    ("/payload/content/0/text", "audit the parser"),
+                ],
+            ),
+            (
+                CodexExec,
+                vec![
+                    ("/type", "response_item"),
+                    ("/payload/type", "message"),
+                    ("/payload/role", "user"),
+                    ("/payload/content/0/type", "input_text"),
+                    ("/payload/content/0/text", "Answer in one line"),
+                ],
+            ),
+        ];
+        let mut digest = 0xcbf29ce484222325u64;
+        for (origin, pairs) in &records {
+            let (sender, via, kind, body) = classified(*origin, pairs);
+            let line = format!("{}|{}|{}|{}\n", sender.as_str(), via, kind.as_str(), body);
+            for byte in line.bytes() {
+                digest ^= u64::from(byte);
+                digest = digest.wrapping_mul(0x100000001b3);
+            }
+        }
+        let fingerprint = format!("{:016x}", digest);
+        assert_eq!(
+            (crate::corpus::RULES_VERSION, fingerprint.as_str()),
+            RULES_FINGERPRINT,
+            "the reading rules changed: increase corpus::RULES_VERSION, then record \
+             RULES_FINGERPRINT = (<that version>, \"{}\")",
+            fingerprint
+        );
+    }
+
+    #[test]
+    fn a_codex_screenshot_without_words_is_the_persons_message() {
+        use super::{Sender, SourceOrigin::CodexThread};
+        let (sender, via, kind, body) = classified(
+            CodexThread,
+            &[
+                ("/type", "response_item"),
+                ("/payload/type", "message"),
+                ("/payload/role", "user"),
+                ("/payload/content/0/type", "input_image"),
+                ("/payload/content/0/image_url", "data:image/png;base64,AAAA"),
+            ],
+        );
+        assert_eq!(
+            (sender, via.as_str(), kind),
+            (Sender::Human, "typed", EventKind::User)
+        );
+        assert_eq!(super::human_text_from_body(&body), (String::new(), 1));
+        let (sender, ..) = classified(
+            CodexThread,
+            &[
+                ("/type", "response_item"),
+                ("/payload/type", "message"),
+                ("/payload/role", "user"),
+                ("/payload/content/0/type", "input_text"),
+                ("/payload/content/0/text", ""),
+            ],
+        );
+        assert_eq!(
+            sender,
+            Sender::System,
+            "an empty message without images is not the person's"
+        );
+    }
+
+    #[test]
+    fn the_persons_text_is_kept_as_sent() {
+        use super::SourceOrigin::{ClaudeMain, CodexThread};
+        let claude = |text: &'static str| {
+            let (_, _, _, body) = classified(
+                ClaudeMain,
+                &[
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content", text),
+                ],
+            );
+            super::human_text_from_body(&body).0
+        };
+        assert_eq!(claude("    let x = 1;\n"), "    let x = 1;\n");
+        assert_eq!(
+            claude("\n\nfirst line\n  second\n"),
+            "\n\nfirst line\n  second\n"
+        );
+        assert_eq!(
+            claude("<system-reminder>context</system-reminder>\n  indented request"),
+            "  indented request",
+            "a leading block takes the line break after it, not the person's indentation"
+        );
+        assert_eq!(
+            claude("keep the colors\n\n<system-reminder>context</system-reminder>"),
+            "keep the colors"
+        );
+        assert_eq!(
+            claude("before\n<system-reminder>context</system-reminder>\nafter"),
+            "before\n\nafter"
+        );
+        let (_, _, _, body) = classified(
+            CodexThread,
+            &[
+                ("/type", "response_item"),
+                ("/payload/type", "message"),
+                ("/payload/role", "user"),
+                ("/payload/content/0/type", "input_text"),
+                (
+                    "/payload/content/0/text",
+                    "<in-app-browser-context>tabs</in-app-browser-context>\n## shrink it\n",
+                ),
+            ],
+        );
+        assert_eq!(super::human_text_from_body(&body).0, "## shrink it\n");
     }
 }

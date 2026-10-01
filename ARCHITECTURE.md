@@ -56,6 +56,14 @@ directories that exist (`$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`,
 `--rebuild` discards the projection and builds it again; with `--source` the
 given sources replace the registered ones.
 
+The logs are the source of truth. The catalog header records the storage format
+(`v=`), the date offset (`tz=`), and the reading rules (`rules=`) the corpus was
+made under. A sync that finds another format or other rules rebuilds the corpus
+in full and names the `rebuild_cause`; the rules version changes with any change
+to what a sync writes for the same logs, and a test of `core.rs` fingerprints the
+classification of representative records so that such a change cannot go
+unversioned. An incremental sync keeps the corpus's date offset.
+
 Each source file goes through these operations:
 
 ```text
@@ -73,7 +81,19 @@ The source catalog stores a checkpoint for each JSONL file. Append-only updates
 resume at the last complete record. An incomplete final line remains pending for
 the next sync. The checkpoint includes the working directory in effect, so an
 appended record without its own `cwd` inherits the thread's, as Codex records
-after `session_meta` and `turn_context` do.
+after `session_meta` and `turn_context` do. A file that changed other than by
+appending is projected again. A file that is gone is dropped; one under a
+directory that could not be listed keeps its projection and is reported as
+unreadable.
+
+## Concurrency
+
+`sync`, `import`, and `timeline --rebuild` hold the lock file `ebira.lock` in the
+corpus directory exclusively; the commands that read the corpus hold it shared.
+Two writers never interleave their catalog, registry, or segment updates, and a
+reader never sees a sync half done. The lock is released when the process ends,
+also abnormally. `follow` reads the transcript itself and takes no lock while it
+waits.
 
 ## Senders
 
@@ -100,7 +120,10 @@ own markers:
   either format.
 
 A person's message is projected as its text only, length-delimited so that
-multi-line text reads back exactly, with images counted rather than stored.
+multi-line text reads back exactly, with images counted rather than stored. The
+text is kept as sent; where an injected block opened or closed it, the whitespace
+around the cut goes with the block. A message of images alone is the person's in
+either format.
 Only a person's message (or a record in a format without sender markers) opens
 a turn, so notifications, injected context, and summaries stay inside the
 person's turn.
@@ -155,8 +178,9 @@ imported copies are counted but not listed unless requested.
 ## Timeline and dates
 
 `timeline.tsv` stores date runs, event counts, session counts, kind counts, and
-record locations. The corpus header records a fixed timezone offset. Builds use
-`EBIRA_TZ_OFFSET`; reads use the offset stored in the corpus.
+record locations. The corpus header records a fixed timezone offset. A build from
+scratch uses `EBIRA_TZ_OFFSET`; incremental syncs and reads use the offset stored
+in the corpus.
 
 Timestamps with an explicit zone are converted to the corpus offset. Timestamps
 without a zone keep their written calendar date.
@@ -170,9 +194,11 @@ opened the turn, which keeps them stable across rebuilds.
 Resume output reports the observed source boundary, current turn state,
 retention counts, truncation flags, and the next read position. When a session
 id matches a main transcript and its subagent transcripts, the main transcript
-is used. The scan also keeps the person's latest messages, the latest replies
-and tool calls across turns, and the compaction count; `--brief` prints only
-those, reading reply text and tool inputs from the original records.
+is used. Every segment of the source is read, whether it was named by session or
+by source id, so both give the same result. The scan also keeps the person's
+latest messages, the latest replies and tool calls across turns, and the
+compaction count; `--brief` prints only those, reading reply text and tool
+inputs from the original records.
 
 ## Commit lookup
 
