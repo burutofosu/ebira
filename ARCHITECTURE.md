@@ -15,6 +15,7 @@ source retrieval. All commands run locally.
 | `json.rs` | The JSON writer every command's result goes through |
 | `corpus.rs` | Source discovery, indexing, checkpoints, and generated files |
 | `imports.rs` | Managed JSONL imports and provenance records |
+| `private_fs.rs` | Private creation modes for corpus directories, files, and managed copies |
 | `search.rs` | Literal search, timeline reads, raw scans, and context reads |
 | `resume.rs` | Current-turn recovery and the brief recovery view |
 | `said.rs` | The person's own messages, by session, project, agent, or topic |
@@ -41,6 +42,14 @@ are gone. Everything else is generated from the logs and the imports, carries
 the storage format version, and is rebuilt by `ebira sync` when the format or
 the reading rules change. Paths to managed files are relative to the corpus
 directory, so the directory can be moved as a whole.
+
+On Unix, new corpus directories are created with mode `0700` and new files
+with mode `0600`, including temporary files, catalogs, the lock, and managed
+JSONL copies. These modes apply at creation, before data is written; the
+process umask can restrict them further. Managed copies do not inherit the
+original log's permissions. Existing entries keep their permissions, so an
+older corpus needs its permissions tightened separately. Windows retains its
+existing filesystem behavior.
 
 ### Events
 

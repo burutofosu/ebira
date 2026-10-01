@@ -1,5 +1,6 @@
 use crate::format::{decode_token, encode_token};
 use crate::json;
+use crate::private_fs;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -177,15 +178,15 @@ pub fn import(
     }
 
     let store = store_root(corpus);
-    fs::create_dir_all(&store)?;
+    private_fs::create_dir_all(&store)?;
     let imports_root = store.join(IMPORTS_DIRECTORY);
-    fs::create_dir_all(&imports_root)?;
+    private_fs::create_dir_all(&imports_root)?;
     let imported_at_ms = now_ms();
     let import_id = unused_import_id(&imports_root, imported_at_ms);
     let partial_root = imports_root.join(format!("{}.partial", import_id));
     let final_root = imports_root.join(&import_id);
     let partial_jsonl = partial_root.join("jsonl");
-    fs::create_dir_all(&partial_jsonl)?;
+    private_fs::create_dir_all(&partial_jsonl)?;
 
     let mut copied_files = Vec::with_capacity(plans.len());
     let mut bytes_copied = 0u64;
@@ -197,9 +198,9 @@ pub fn import(
         let before_modified_ms = modified_ms(&before);
         let destination = partial_jsonl.join(&plan.relative);
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+            private_fs::create_dir_all(parent)?;
         }
-        let copied = fs::copy(&plan.source, &destination)?;
+        let copied = private_fs::copy(&plan.source, &destination)?;
         let after = fs::metadata(&plan.source)?;
         let destination_size = fs::metadata(&destination)?.len();
         if copied != before.len()
@@ -458,7 +459,7 @@ fn load_registry(path: &Path) -> io::Result<Vec<ManagedImport>> {
 
 fn write_registry(path: &Path, imports: &[ManagedImport]) -> io::Result<()> {
     let partial = path.with_file_name(format!("{}.partial", REGISTRY_FILE));
-    let mut writer = BufWriter::new(File::create(&partial)?);
+    let mut writer = BufWriter::new(private_fs::create(&partial)?);
     writeln!(writer, "{}", REGISTRY_HEADER)?;
     let mut imports = imports.to_vec();
     imports.sort_by(|left, right| {
@@ -488,7 +489,7 @@ fn write_registry(path: &Path, imports: &[ManagedImport]) -> io::Result<()> {
 }
 
 fn write_file_manifest(path: &Path, files: &[ImportFile]) -> io::Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
+    let mut writer = BufWriter::new(private_fs::create(path)?);
     writeln!(writer, "{}", FILES_HEADER)?;
     for file in files {
         writeln!(

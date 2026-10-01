@@ -6,6 +6,7 @@ mod format;
 mod imports;
 mod json;
 mod jsonl;
+mod private_fs;
 mod resume;
 mod said;
 mod search;

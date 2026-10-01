@@ -8,6 +8,7 @@ use crate::format::{
 };
 use crate::json;
 use crate::jsonl::{parse_record, Field};
+use crate::private_fs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -216,7 +217,7 @@ pub fn build_with_preview(
         &registered_inputs,
     );
     if !collection.paths.is_empty() || (incremental && corpus.is_dir()) {
-        fs::create_dir_all(corpus)?;
+        private_fs::create_dir_all(corpus)?;
         write_source_availability(corpus, &availability)?;
     }
     let unreadable_source_paths = availability_entries_for_inputs(&availability, sources)
@@ -241,8 +242,8 @@ pub fn build_with_preview(
         .filter_map(|path| source_entry_for_preview(path, requested_preview, &previous).transpose())
         .collect::<io::Result<Vec<_>>>()?;
     let segment_dir = segment_dir(corpus);
-    fs::create_dir_all(corpus)?;
-    fs::create_dir_all(&segment_dir)?;
+    private_fs::create_dir_all(corpus)?;
+    private_fs::create_dir_all(&segment_dir)?;
     write_source_inputs_partial(corpus, &registered_inputs)?;
     let mut existing_files = corpus_file_map(&segment_dir)?;
     for files in existing_files.values_mut() {
@@ -264,7 +265,7 @@ pub fn build_with_preview(
         BTreeMap::<String, Vec<TimelineRun>>::new()
     };
     let mut catalog =
-        BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&catalog_partial_path)?);
+        BufWriter::with_capacity(IO_BUFFER_SIZE, private_fs::create(&catalog_partial_path)?);
     writeln!(catalog, "{}", source_catalog_header(offset_minutes))?;
     let snapshot_ids = snapshot
         .iter()
@@ -477,8 +478,10 @@ pub fn build_with_preview(
     let final_entries = load_source_catalog_paths(std::slice::from_ref(&catalog_partial_path))?;
     collect_changed_sources(&mut report, &snapshot, &previous, &final_entries);
     let normalized_catalog_path = corpus.join("sources.tsv.normalized");
-    let mut normalized_catalog =
-        BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&normalized_catalog_path)?);
+    let mut normalized_catalog = BufWriter::with_capacity(
+        IO_BUFFER_SIZE,
+        private_fs::create(&normalized_catalog_path)?,
+    );
     writeln!(
         normalized_catalog,
         "{}",
@@ -912,12 +915,10 @@ const LOCK_FILE: &str = "ebira.lock";
 /// file is dropped, also when the process ends abnormally.
 pub fn lock_exclusive(path: &Path) -> io::Result<File> {
     let root = path.to_path_buf();
-    fs::create_dir_all(&root)?;
-    let file = fs::OpenOptions::new()
-        .create(true)
+    private_fs::create_dir_all(&root)?;
+    let file = private_fs::write_options()
         .truncate(false)
         .read(true)
-        .write(true)
         .open(root.join(LOCK_FILE))?;
     file.lock()?;
     Ok(file)
@@ -1373,7 +1374,7 @@ fn process_source(
     let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, input);
     reader.seek(SeekFrom::Start(start_offset))?;
     let mut bounded = reader.take(entry.size.saturating_sub(start_offset));
-    let segment = File::create(&partial_path)?;
+    let segment = private_fs::create(&partial_path)?;
     let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, segment);
     let mut line = Vec::new();
     let mut committed_byte_end = start_offset;
@@ -1879,7 +1880,7 @@ fn write_source_inputs(corpus: &Path, inputs: &[String]) -> io::Result<()> {
 
 fn write_source_inputs_partial(corpus: &Path, inputs: &[String]) -> io::Result<()> {
     let partial_path = corpus.join(format!("{}.partial", SOURCE_INPUTS_FILE));
-    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&partial_path)?);
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, private_fs::create(&partial_path)?);
     let mut sorted = inputs.to_vec();
     sorted.sort();
     sorted.dedup();
@@ -1972,7 +1973,7 @@ fn write_source_availability(
 ) -> io::Result<()> {
     let partial_path = corpus.join(format!("{}.partial", SOURCE_AVAILABILITY_FILE));
     let complete_path = corpus.join(SOURCE_AVAILABILITY_FILE);
-    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&partial_path)?);
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, private_fs::create(&partial_path)?);
     writeln!(
         writer,
         "#ebira-source-availability\tv={}\tobserved_at_ms={}",
@@ -2253,7 +2254,7 @@ fn write_timeline_catalog(
 ) -> io::Result<()> {
     let path = corpus.join("timeline.tsv");
     let partial_path = corpus.join("timeline.tsv.partial");
-    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, File::create(&partial_path)?);
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, private_fs::create(&partial_path)?);
     writeln!(writer, "{}", timeline_header())?;
     for source_id in sources.keys() {
         if let Some(runs) = runs_by_source.get(source_id) {
