@@ -2,20 +2,19 @@
 //!
 //! Claude Code and Codex logs mark who put each record into the conversation. Records whose
 //! sender is the person (typed, pasted, typed while the agent was working, slash commands,
-//! answers to an agent's question) are listed with their text and source reference. Copies of
-//! the same message (same text and timestamp, e.g. a session file stored twice) appear once.
+//! answers to an agent's question) are listed with their text and source reference, as
+//! `core::persons_message` and `core::SeenMessages` define them.
 
-use crate::core::{human_text_from_body, Sender};
+use crate::core::{human_text_from_body, persons_message, PersonsMessage, SeenMessages, Sender};
 use crate::corpus::{self, SourceEntry};
 use crate::format::{json_string, parse_event_header, EventHeader};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const IO_BUFFER_SIZE: usize = 1024 * 1024;
-const MAX_HUMAN_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct SaidRequest {
@@ -69,18 +68,17 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
         .map(|query| fold(query, request.fold_ascii_case));
 
     let mut found = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = SeenMessages::default();
     let mut copies = 0u64;
     let mut imported = 0u64;
     let mut scanned_bytes = 0u64;
     for path in &files {
         scanned_bytes = scanned_bytes.saturating_add(path.metadata().map(|m| m.len()).unwrap_or(0));
         scan_file(path, &catalog, request, query.as_deref(), &mut |said| {
-            if said.header.via == "imported" && !request.include_imported {
+            let message = persons_message(&said.header.sender, &said.header.via);
+            if message == Some(PersonsMessage::Imported) && !request.include_imported {
                 imported += 1;
-            // One message stored twice can differ in surrounding whitespace only (Codex writes
-            // the text as an event and as a response item); the text shown stays as sent.
-            } else if seen.insert((said.header.timestamp.clone(), said.text.trim().to_string())) {
+            } else if seen.first(&said.header.timestamp, &said.text) {
                 found.push(said);
             } else {
                 copies += 1;
@@ -274,9 +272,7 @@ fn scan_file(
                 format!("{}: {}", path.display(), error),
             )
         })?;
-        let wanted = header.sender == human
-            && header.body_len <= MAX_HUMAN_BODY_BYTES
-            && header_matches(&header, request);
+        let wanted = header.sender == human && header_matches(&header, request);
         if !wanted {
             skip(&mut reader, header.body_len.saturating_add(1))?;
             continue;

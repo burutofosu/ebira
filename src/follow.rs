@@ -3,24 +3,25 @@
 //! An agent whose conversation is recorded by Claude Code or Codex can watch
 //! the other agent's transcript directly: no shared folder, no transcription.
 //! The command reads only the raw JSONL of one source, from a byte boundary,
-//! and returns complete records that carry a message from the requested sender,
-//! classified the same way the corpus classifies it.
+//! and returns complete records that carry a message from the requested sender.
+//! It reads them with the corpus's own `LogReader`, from the state the corpus
+//! holds at that boundary, so a message has the sender, `via`, timestamp, and
+//! byte range the corpus gives the same record.
 //!
 //! The transcript is named by a registered source id, by a session id whose
 //! file lives under one of the registered source roots, or by a path.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::core::{
-    classify_sender, human_text_from_body, record_meta, select_body, Sender, SourceOrigin,
-};
-use crate::corpus;
+use crate::core::{human_text_from_body, persons_message, PersonsMessage};
+use crate::corpus::{self, LogReader, ReadRecord, SourceEntry};
 use crate::format::json_string;
-use crate::jsonl::{parse_record, Field, ScalarKind};
+use crate::jsonl::{Field, ScalarKind};
 
 pub struct FollowRequest {
     pub source_id: Option<String>,
@@ -39,56 +40,36 @@ struct Message {
     via: String,
     timestamp: String,
     byte_start: u64,
+    /// The whole line, its newline included, as in a corpus `source_ref`.
     byte_len: u64,
     text: String,
+    images: usize,
 }
 
 struct Target {
     source_id: String,
     path: PathBuf,
-    origin: Origin,
-}
-
-/// Who wrote a transcript. A Claude Code transcript is known from its path; a Codex thread
-/// from its first record, which says whether another thread or `codex exec` started it; a
-/// transcript outside `.claude` and `.codex` from its first records. Until that is known, the
-/// origin is decided again whenever new lines arrive, before any of them is classified.
-#[derive(Clone, Copy)]
-struct Origin {
-    value: SourceOrigin,
-    settled: bool,
-}
-
-impl Origin {
-    fn of(path: &Path) -> Self {
-        let value = corpus::origin_for_path(path);
-        let settled = match value {
-            SourceOrigin::ClaudeMain | SourceOrigin::ClaudeSubagent => true,
-            SourceOrigin::Generic => false,
-            _ => corpus::first_line_complete(path),
-        };
-        Origin { value, settled }
-    }
-
-    /// Called when the file holds at least one complete line.
-    fn settle(&mut self, path: &Path) {
-        if !self.settled {
-            self.value = corpus::origin_for_path(path);
-            self.settled = self.value != SourceOrigin::Generic;
-        }
-    }
 }
 
 pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
-    let target = resolve_target(root, request)?;
+    let catalog = corpus::source_catalog(root)?;
+    let target = resolve_target(root, &catalog, request)?;
     let path = target.path.as_path();
-    let mut origin = target.origin;
     let size = fs::metadata(path)?.len();
     let start = request.after_byte.unwrap_or(size).min(size);
     let mut cursor = align_to_line_start(path, start)?;
+    // Made once the transcript holds a complete record, so the agent that writes it is known
+    // before any message is classified.
+    let mut reader = None;
     let deadline = Instant::now() + Duration::from_secs(request.seconds);
     loop {
-        let (messages, next) = scan(path, &mut origin, cursor, request)?;
+        if reader.is_none() {
+            reader = corpus::log_reader_at(&catalog, path, cursor)?;
+        }
+        let (messages, next) = match reader.as_mut() {
+            Some(reader) => scan(path, reader, cursor, request)?,
+            None => (Vec::new(), cursor),
+        };
         if !messages.is_empty() {
             print_result("received", &target, next, &messages);
             return Ok(());
@@ -104,7 +85,11 @@ pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
 
 /// `--source` wins, then `--source-id` through the catalog, then `--session`
 /// by file name under the registered source roots (newest file wins).
-fn resolve_target(root: &Path, request: &FollowRequest) -> io::Result<Target> {
+fn resolve_target(
+    root: &Path,
+    catalog: &BTreeMap<String, SourceEntry>,
+    request: &FollowRequest,
+) -> io::Result<Target> {
     if let Some(path) = &request.path {
         let path = PathBuf::from(path);
         if !path.is_file() {
@@ -113,17 +98,22 @@ fn resolve_target(root: &Path, request: &FollowRequest) -> io::Result<Target> {
                 format!("transcript not found: {}", path.display()),
             ));
         }
-        return Ok(target(String::new(), path));
+        return Ok(Target {
+            source_id: String::new(),
+            path,
+        });
     }
     if let Some(source_id) = &request.source_id {
-        let catalog = corpus::source_catalog(root)?;
         let entry = catalog.get(source_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("unknown source id: {}", source_id),
             )
         })?;
-        return Ok(target(entry.source_id.clone(), PathBuf::from(&entry.path)));
+        return Ok(Target {
+            source_id: entry.source_id.clone(),
+            path: PathBuf::from(&entry.path),
+        });
     }
     if let Some(session) = &request.session {
         if session.is_empty() {
@@ -143,21 +133,15 @@ fn resolve_target(root: &Path, request: &FollowRequest) -> io::Result<Target> {
                 format!("no transcript file named by session {}", session),
             ));
         };
-        return Ok(target(String::new(), path));
+        return Ok(Target {
+            source_id: String::new(),
+            path,
+        });
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "follow needs --session, --source-id or --source",
     ))
-}
-
-fn target(source_id: String, path: PathBuf) -> Target {
-    let origin = Origin::of(&path);
-    Target {
-        source_id,
-        path,
-        origin,
-    }
 }
 
 /// A registered source is a JSONL file or a directory of them: a file is matched by its own
@@ -245,11 +229,10 @@ fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
 }
 
 /// Read every complete line after `cursor`; return the messages found and the
-/// boundary after the last line consumed. The origin is settled first, so the first
-/// messages of a transcript that began empty are classified like the rest.
+/// boundary after the last line read.
 fn scan(
     path: &Path,
-    origin: &mut Origin,
+    reader: &mut LogReader,
     cursor: u64,
     request: &FollowRequest,
 ) -> io::Result<(Vec<Message>, u64)> {
@@ -257,48 +240,27 @@ fn scan(
     if size <= cursor {
         return Ok((Vec::new(), cursor));
     }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(cursor))?;
-    let mut bytes = Vec::with_capacity((size - cursor) as usize);
-    file.read_to_end(&mut bytes)?;
-    let complete = match bytes.iter().rposition(|byte| *byte == b'\n') {
-        Some(index) => index + 1,
-        None => return Ok((Vec::new(), cursor)),
-    };
-    origin.settle(path);
-    let origin = origin.value;
+    let mut input = BufReader::new(File::open(path)?);
+    input.seek(SeekFrom::Start(cursor))?;
+    let mut bounded = input.take(size - cursor);
+    let mut line = Vec::new();
     let mut messages = Vec::new();
-    let mut offset = 0usize;
-    while offset < complete {
-        let end = bytes[offset..complete]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| offset + index)
-            .unwrap_or(complete);
-        let line = trim_cr(&bytes[offset..end]);
-        if !line.is_empty() {
-            let base = cursor + offset as u64;
-            if let Ok(fields) = parse_record(line, base) {
-                if let Some(message) =
-                    message_from_fields(&fields, origin, request, base, line.len() as u64)
-                {
-                    messages.push(message);
-                    if messages.len() >= request.limit {
-                        return Ok((messages, cursor + end as u64 + 1));
-                    }
-                }
+    let mut position = cursor;
+    while let Some(read) = corpus::read_bounded_line(&mut bounded, &mut line)? {
+        if !read.complete {
+            break;
+        }
+        let record = reader.read(&line, position, read.oversized);
+        let byte_start = position;
+        position += read.total_len;
+        if let Some(message) = message(&record, request, byte_start, read.total_len) {
+            messages.push(message);
+            if messages.len() >= request.limit {
+                break;
             }
         }
-        offset = end + 1;
     }
-    Ok((messages, cursor + complete as u64))
-}
-
-fn trim_cr(line: &[u8]) -> &[u8] {
-    match line.last() {
-        Some(b'\r') => &line[..line.len() - 1],
-        _ => line,
-    }
+    Ok((messages, position))
 }
 
 fn value<'a>(fields: &'a [Field], path: &str) -> Option<&'a str> {
@@ -308,21 +270,23 @@ fn value<'a>(fields: &'a [Field], path: &str) -> Option<&'a str> {
         .map(|field| field.value.as_str())
 }
 
-/// Recognise a message in either transcript format and decide who sent it.
+/// A message in either transcript format, from the sender the corpus gives it.
 ///
 /// Codex: `/type = response_item`, `/payload/type = message`, text parts under
 /// `/payload/content/<n>/text`. Claude Code: `/type = assistant|user`, text
 /// parts under `/message/content/<n>/text` whose type is `text`, or a plain
 /// string content; a prompt typed while the agent was working is a
-/// `queued_command` attachment with the text in `/attachment/prompt`. A person's
-/// message loses the blocks the tools inject into it.
-fn message_from_fields(
-    fields: &[Field],
-    origin: SourceOrigin,
+/// `queued_command` attachment with the text in `/attachment/prompt`. The
+/// person's messages are those `said` lists (`core::persons_message`), with the
+/// text `said` shows: without the blocks the tools inject, and imported copies
+/// only for `--sender any`.
+fn message(
+    record: &ReadRecord,
     request: &FollowRequest,
     byte_start: u64,
     byte_len: u64,
 ) -> Option<Message> {
+    let fields = record.fields.as_slice();
     let text = match value(fields, "/type")? {
         "response_item" if value(fields, "/payload/type") == Some("message") => {
             collect_text(fields, "/payload/content/", &["input_text", "output_text"])
@@ -333,17 +297,21 @@ fn message_from_fields(
         }
         _ => return None,
     };
-    let mut meta = record_meta(fields);
-    classify_sender(origin, fields, &mut meta);
-    if request.sender != "any" && meta.sender.as_str() != request.sender {
+    let meta = &record.event.meta;
+    let persons = persons_message(meta.sender.as_str(), &meta.via);
+    let wanted = match request.sender.as_str() {
+        "any" => true,
+        "human" => persons == Some(PersonsMessage::Own),
+        sender => meta.sender.as_str() == sender,
+    };
+    if !wanted {
         return None;
     }
-    let text = if meta.sender == Sender::Human {
-        human_text_from_body(&select_body(fields, &meta, 0).body).0
-    } else {
-        text
+    let (text, images) = match persons {
+        Some(_) => human_text_from_body(&record.event.body),
+        None => (text, 0),
     };
-    if text.trim().is_empty() {
+    if text.trim().is_empty() && images == 0 {
         return None;
     }
     if let Some(prefix) = &request.prefix {
@@ -353,11 +321,12 @@ fn message_from_fields(
     }
     Some(Message {
         sender: meta.sender.as_str(),
-        via: meta.via,
-        timestamp: value(fields, "/timestamp").unwrap_or("").to_string(),
+        via: meta.via.clone(),
+        timestamp: meta.timestamp.clone().unwrap_or_default(),
         byte_start,
         byte_len,
         text,
+        images,
     })
 }
 
@@ -410,13 +379,14 @@ fn print_result(disposition: &str, target: &Target, after_byte: u64, messages: &
             output.push(',');
         }
         output.push_str(&format!(
-            "{{\"sender\":{},\"via\":{},\"timestamp\":{},\"byte_start\":{},\"byte_len\":{},\"text\":{}}}",
+            "{{\"sender\":{},\"via\":{},\"timestamp\":{},\"byte_start\":{},\"byte_len\":{},\"text\":{},\"images\":{}}}",
             json_string(message.sender),
             json_string(&message.via),
             json_string(&message.timestamp),
             message.byte_start,
             message.byte_len,
-            json_string(&message.text)
+            json_string(&message.text),
+            message.images
         ));
     }
     output.push_str("]}");
@@ -459,34 +429,45 @@ mod tests {
         path
     }
 
+    /// The messages after `cursor` from `sender`, read as `run` reads them without a corpus.
+    fn follow(path: &Path, cursor: u64, sender: &str) -> Option<(Vec<Message>, u64)> {
+        let mut reader = corpus::log_reader_at(&BTreeMap::new(), path, cursor).expect("reader")?;
+        Some(scan(path, &mut reader, cursor, &request(sender)).expect("scan"))
+    }
+
+    fn append(path: &Path, contents: &str) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(contents.as_bytes()))
+            .expect("append records");
+    }
+
     #[test]
     fn a_transcript_written_before_following_is_read_by_sender() {
         let path = transcript("before", CODEX_THREAD);
-        let mut origin = Origin::of(&path);
-        assert_eq!(origin.value, SourceOrigin::CodexThread);
-        assert!(origin.settled);
-        let (messages, _) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
+        let (messages, cursor) = follow(&path, 0, "human").expect("a complete record");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "the person's words");
+        assert_eq!(cursor, CODEX_THREAD.len() as u64);
+        let line = CODEX_THREAD.lines().nth(1).expect("message line");
+        assert_eq!(
+            messages[0].byte_len,
+            line.len() as u64 + 1,
+            "the range covers the newline, as corpus references do"
+        );
         fs::remove_file(path).expect("remove transcript");
     }
 
     #[test]
     fn a_transcript_first_written_while_following_is_read_by_sender() {
         let path = transcript("after", "");
-        let mut origin = Origin::of(&path);
-        assert_eq!(origin.value, SourceOrigin::Generic);
-        let (messages, cursor) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
-        assert!(messages.is_empty());
-        assert_eq!(cursor, 0);
-
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| file.write_all(CODEX_THREAD.as_bytes()))
-            .expect("append records");
-        let (messages, _) = scan(&path, &mut origin, cursor, &request("human")).expect("scan");
-        assert_eq!(origin.value, SourceOrigin::CodexThread);
+        assert!(
+            follow(&path, 0, "human").is_none(),
+            "nothing is read before the transcript says which agent writes it"
+        );
+        append(&path, CODEX_THREAD);
+        let (messages, _) = follow(&path, 0, "human").expect("a complete record");
         assert_eq!(
             messages.len(),
             1,
@@ -505,34 +486,25 @@ mod tests {
         fs::create_dir_all(&directory).expect("create session directory");
         let path = directory.join("rollout-child.jsonl");
         fs::write(&path, "").expect("write empty rollout");
-        let mut origin = Origin::of(&path);
         assert!(
-            !origin.settled,
+            follow(&path, 0, "human").is_none(),
             "an empty rollout does not say who started it"
         );
-
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| {
-                file.write_all(
-                    concat!(
-                        r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}"#,
-                        "\n",
-                        r#"{"timestamp":"2026-09-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"audit the parser"}]}}"#,
-                        "\n",
-                    )
-                    .as_bytes(),
-                )
-            })
-            .expect("append records");
-        let (messages, _) = scan(&path, &mut origin, 0, &request("human")).expect("scan");
-        assert_eq!(origin.value, SourceOrigin::CodexChild);
+        append(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-09-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"audit the parser"}]}}"#,
+                "\n",
+            ),
+        );
+        let (messages, _) = follow(&path, 0, "human").expect("a complete record");
         assert!(
             messages.is_empty(),
             "the parent thread's prompt is another agent's, not the person's"
         );
-        let (messages, _) = scan(&path, &mut origin, 0, &request("agent")).expect("scan");
+        let (messages, _) = follow(&path, 0, "agent").expect("a complete record");
         assert_eq!(messages.len(), 1);
         fs::remove_dir_all(
             directory
@@ -541,5 +513,40 @@ mod tests {
                 .expect("test root"),
         )
         .expect("remove test root");
+    }
+
+    #[test]
+    fn an_imported_conversation_is_not_the_persons_next_message() {
+        let imported = concat!(
+            r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"t2"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1"}}"#,
+            "\n",
+        );
+        let copy = concat!(
+            r#"{"timestamp":"2026-09-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"words from the other agent's session"}]}}"#,
+            "\n",
+        );
+        let own = concat!(
+            r#"{"timestamp":"2026-09-01T00:05:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T00:05:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new words"}]}}"#,
+            "\n",
+        );
+        let path = transcript("imported", &format!("{imported}{copy}{own}"));
+        let (messages, _) = follow(&path, 0, "human").expect("a complete record");
+        let texts = messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(texts, ["new words"]);
+        // Started after the record that opened the import turn, the reader still knows it.
+        let (messages, _) = follow(&path, imported.len() as u64, "any").expect("a complete record");
+        let copy_message = messages
+            .iter()
+            .find(|m| m.text == "words from the other agent's session")
+            .expect("the copy is a message");
+        assert_eq!(
+            (copy_message.sender, copy_message.via.as_str()),
+            ("human", "imported")
+        );
+        fs::remove_file(path).expect("remove transcript");
     }
 }

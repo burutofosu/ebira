@@ -1,12 +1,13 @@
 use crate::core::{
-    classify_sender, record_meta, select_body, EventKind, IngestCheckpoint, IngestStateMachine,
-    RecordMeta, SessionTurn, SourceOrigin, TimelineBucket, TimelineRef, TurnReducerState,
+    classify_sender, record_meta, select_body, CanonicalEvent, EventKind, IngestCheckpoint,
+    IngestStateMachine, RecordMeta, SessionTurn, SourceOrigin, TimelineBucket, TimelineRef,
+    TurnReducerState,
 };
 use crate::format::{
     decode_token, encode_token, event_header_line, json_string, parse_event_header, push_field,
     EventHeader,
 };
-use crate::jsonl::parse_record;
+use crate::jsonl::{parse_record, Field};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -20,10 +21,14 @@ const IO_BUFFER_SIZE: usize = 1024 * 1024;
 const FLUSH_RECORD_INTERVAL: u64 = 4096;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
-struct LineRead {
-    total_len: u64,
-    complete: bool,
-    oversized: bool,
+/// One line of a log, as `read_bounded_line` read it.
+pub struct LineRead {
+    /// The length of the whole line, its newline included.
+    pub total_len: u64,
+    /// The line ends with a newline; the last line of a log being written may not yet.
+    pub complete: bool,
+    /// The line is longer than a record can be; only its first `MAX_RECORD_BYTES` were kept.
+    pub oversized: bool,
 }
 
 struct SourceRead<'a> {
@@ -947,7 +952,7 @@ impl TimelineAccumulator {
     }
 }
 
-fn read_bounded_line<R: BufRead>(
+pub fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
 ) -> io::Result<Option<LineRead>> {
@@ -991,6 +996,130 @@ fn read_bounded_line<R: BufRead>(
     }
 }
 
+/// Reads the records of one log in order, the way a sync projects them: who sent each one, its
+/// session and turn, and its body. `follow` reads with it too, so a message it returns carries
+/// what the corpus records for the same line.
+pub struct LogReader {
+    origin: SourceOrigin,
+    machine: IngestStateMachine,
+    fallback_session: String,
+    output_preview: usize,
+}
+
+/// One line of a log, read.
+pub struct ReadRecord {
+    pub event: CanonicalEvent,
+    /// The record's fields; none when the line is not a record that can be read.
+    pub fields: Vec<Field>,
+    /// The body was shortened.
+    pub cut: bool,
+    /// The line is not a record that can be read.
+    pub invalid: bool,
+}
+
+impl LogReader {
+    fn new(entry: &SourceEntry, checkpoint: IngestCheckpoint) -> Self {
+        Self {
+            origin: source_origin(entry),
+            machine: IngestStateMachine::from_checkpoint(checkpoint),
+            fallback_session: entry.fallback_session.clone(),
+            output_preview: entry.output_preview as usize,
+        }
+    }
+
+    /// Reads one complete line, newline included, that starts at `record_start`. An
+    /// `oversized` line holds only its first `MAX_RECORD_BYTES`.
+    pub fn read(&mut self, line: &[u8], record_start: u64, oversized: bool) -> ReadRecord {
+        let fields = if oversized {
+            None
+        } else {
+            parse_record(line, record_start).ok()
+        };
+        let Some(fields) = fields else {
+            let mut text = String::from_utf8_lossy(line).into_owned();
+            if oversized {
+                text.push_str(crate::core::PROJECTION_BOUND_MARKER);
+            }
+            let mut body = String::new();
+            push_field(&mut body, "/raw", &text);
+            let meta = RecordMeta {
+                event_kind: EventKind::Invalid,
+                ..RecordMeta::default()
+            };
+            return ReadRecord {
+                event: self
+                    .machine
+                    .apply(&self.fallback_session, meta, body, record_start),
+                fields: Vec::new(),
+                cut: oversized,
+                invalid: true,
+            };
+        };
+        let mut meta = record_meta(&fields);
+        classify_sender(self.origin, &fields, &mut meta);
+        let projection = select_body(&fields, &meta, self.output_preview);
+        ReadRecord {
+            event: self
+                .machine
+                .apply(&self.fallback_session, meta, projection.body, record_start),
+            fields,
+            cut: projection.cut,
+            invalid: false,
+        }
+    }
+
+    pub fn checkpoint(&self) -> IngestCheckpoint {
+        self.machine.checkpoint()
+    }
+}
+
+/// The reading state a sync left where it stopped reading a source.
+fn checkpoint_of(entry: &SourceEntry) -> IngestCheckpoint {
+    IngestCheckpoint {
+        reducer: decode_turn_state(entry),
+        active_session: non_empty(&entry.last_session),
+        active_cwd: non_empty(&entry.last_cwd),
+        next_event_index: entry.event_count,
+    }
+}
+
+/// A reader for the log at `path` that has read it up to `cursor`, a line start: it starts from
+/// the catalog's checkpoint when the corpus has read the log no further than `cursor`, else
+/// from the start of the log. `None` while the log has no complete record, before which the
+/// agent that writes it cannot be told.
+pub fn log_reader_at(
+    catalog: &BTreeMap<String, SourceEntry>,
+    path: &Path,
+    cursor: u64,
+) -> io::Result<Option<LogReader>> {
+    if !first_line_complete(path) {
+        return Ok(None);
+    }
+    let Some(entry) = source_entry(path, 300)? else {
+        return Ok(None);
+    };
+    let (mut log, from) = match catalog.get(&entry.source_id) {
+        Some(known) if known.checkpoint_valid && known.committed_byte_end <= cursor => (
+            LogReader::new(known, checkpoint_of(known)),
+            known.committed_byte_end,
+        ),
+        _ => (LogReader::new(&entry, IngestCheckpoint::default()), 0),
+    };
+    let mut input = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(path)?);
+    input.seek(SeekFrom::Start(from))?;
+    let mut bounded = input.take(cursor.saturating_sub(from));
+    let mut line = Vec::new();
+    let mut position = from;
+    while let Some(read) = read_bounded_line(&mut bounded, &mut line)? {
+        if !read.complete {
+            break;
+        }
+        log.read(&line, position, read.oversized);
+        position += read.total_len;
+    }
+    Ok(Some(log))
+}
+
 fn process_source(
     entry: &SourceEntry,
     old: Option<&SourceEntry>,
@@ -1027,16 +1156,8 @@ fn process_source(
     let mut partial_records = 0u64;
     let mut corpus_offset = 0u64;
     let mut timeline = TimelineAccumulator::new(&entry.source_id, &output_name, offset_minutes);
-    let checkpoint = old
-        .map(|old| IngestCheckpoint {
-            reducer: decode_turn_state(old),
-            active_session: non_empty(&old.last_session),
-            active_cwd: non_empty(&old.last_cwd),
-            next_event_index: old.event_count,
-        })
-        .unwrap_or_default();
-    let mut machine = IngestStateMachine::from_checkpoint(checkpoint);
-    let origin = source_origin(entry);
+    let checkpoint = old.map(checkpoint_of).unwrap_or_default();
+    let mut log = LogReader::new(entry, checkpoint);
 
     while let Some(line_read) = read_bounded_line(&mut bounded, &mut line)? {
         let record_start = committed_byte_end;
@@ -1046,40 +1167,12 @@ fn process_source(
             break;
         }
         line_number += 1;
-        let mut body_cut = false;
-        let event = if line_read.oversized {
+        let record = log.read(&line, record_start, line_read.oversized);
+        if record.invalid {
             invalid_records += 1;
-            let meta = RecordMeta {
-                event_kind: EventKind::Invalid,
-                ..RecordMeta::default()
-            };
-            let mut text = String::from_utf8_lossy(&line).into_owned();
-            text.push_str(crate::core::PROJECTION_BOUND_MARKER);
-            let mut body = String::new();
-            push_field(&mut body, "/raw", &text);
-            body_cut = true;
-            machine.apply(&entry.fallback_session, meta, body, record_start)
-        } else {
-            match parse_record(&line, record_start) {
-                Ok(fields) => {
-                    let mut meta = record_meta(&fields);
-                    classify_sender(origin, &fields, &mut meta);
-                    let projection = select_body(&fields, &meta, entry.output_preview as usize);
-                    body_cut = projection.cut;
-                    machine.apply(&entry.fallback_session, meta, projection.body, record_start)
-                }
-                Err(_) => {
-                    invalid_records += 1;
-                    let meta = RecordMeta {
-                        event_kind: EventKind::Invalid,
-                        ..RecordMeta::default()
-                    };
-                    let mut body = String::new();
-                    push_field(&mut body, "/raw", &String::from_utf8_lossy(&line));
-                    machine.apply(&entry.fallback_session, meta, body, record_start)
-                }
-            }
-        };
+        }
+        let body_cut = record.cut;
+        let event = record.event;
         let body_bytes = event.body.as_bytes();
         let header = EventHeader {
             event_index: event.event_index,
@@ -1157,7 +1250,7 @@ fn process_source(
     } else {
         operation_disposition
     };
-    let checkpoint = machine.checkpoint();
+    let checkpoint = log.checkpoint();
     let mut updated = entry.clone();
     updated.committed_byte_end = committed_byte_end;
     updated.event_count = checkpoint.next_event_index;
@@ -2560,11 +2653,6 @@ fn source_input_covers_entry(inputs: &[String], entry: &SourceEntry) -> bool {
 /// that names its parent thread or the `codex exec` originator.
 fn source_origin(entry: &SourceEntry) -> SourceOrigin {
     origin_of(&entry.app, Path::new(&entry.path))
-}
-
-/// The origin of a transcript that is read directly, without the catalog.
-pub fn origin_for_path(path: &Path) -> SourceOrigin {
-    origin_of(source_app(path).unwrap_or("other"), path)
 }
 
 fn origin_of(app: &str, path: &Path) -> SourceOrigin {

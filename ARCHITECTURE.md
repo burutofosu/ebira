@@ -96,7 +96,9 @@ corpus directory exclusively; the commands that read the corpus hold it shared.
 Two writers never interleave their catalog, registry, or segment updates, and a
 reader never sees a sync half done. The lock is released when the process ends,
 also abnormally. `follow` reads the transcript itself and takes no lock while it
-waits.
+waits. It reads with the reader a sync uses (`corpus::LogReader`), starting from
+the checkpoint the catalog holds for that transcript, so its messages carry the
+sender, channel, timestamp, and byte range the corpus gives the same records.
 
 ## Senders
 
@@ -184,10 +186,13 @@ Matches are chronological, or newest first with `--order desc`. Filters are
 applied to source, session, role, event kind, sender, and time range. ASCII case
 folding is optional.
 
-`said` reads only events whose sender is the person. A session scope reads the
-segments of the sources that declare the session; the other filters apply to
-event headers. Messages with the same text and timestamp are listed once, and
-imported copies are counted but not listed unless requested.
+The person's messages have one definition, in `core.rs`, which `said`,
+`resume`, and `follow` share: records whose sender is the person, listed once
+when the same text was stored twice with the same timestamp
+(`core::SeenMessages`). Imported copies (`via: imported`) are counted but listed
+only when requested. A message is read whole, however long. `said` reads only
+such events; a session scope reads the segments of the sources that declare the
+session, and the other filters apply to event headers.
 
 ## Timeline and dates
 

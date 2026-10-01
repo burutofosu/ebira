@@ -311,7 +311,6 @@ fn command_output_matches_declared_schema() {
             "latest_turn_id",
             "matched_events",
             "current",
-            "latest_user_message",
             "latest_human_message",
             "compactions",
             "latest_event",

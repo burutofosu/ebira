@@ -88,6 +88,44 @@ impl Sender {
     }
 }
 
+/// The `via` of the person's messages that Codex copied from another conversation into this
+/// one, stamped with the time of the import.
+pub const IMPORTED_VIA: &str = "imported";
+
+/// One of the person's messages. `said`, `resume`, and `follow` share this definition: a
+/// record whose sender is the person, either sent in this conversation or imported with
+/// another one. Imported copies are listed only on request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonsMessage {
+    Own,
+    Imported,
+}
+
+pub fn persons_message(sender: &str, via: &str) -> Option<PersonsMessage> {
+    if sender != Sender::Human.as_str() {
+        return None;
+    }
+    Some(if via == IMPORTED_VIA {
+        PersonsMessage::Imported
+    } else {
+        PersonsMessage::Own
+    })
+}
+
+/// The person's messages already listed. One message stored twice (a session file kept in two
+/// places, or Codex writing it as an event and as a response item) has the same timestamp and
+/// the same text apart from the whitespace around it, and is listed once.
+#[derive(Default)]
+pub struct SeenMessages(BTreeSet<(String, String)>);
+
+impl SeenMessages {
+    /// Whether this is the first message with this timestamp and text.
+    pub fn first(&mut self, timestamp: &str, text: &str) -> bool {
+        self.0
+            .insert((timestamp.to_string(), text.trim().to_string()))
+    }
+}
+
 /// Where a whole source file came from. It is decided from the path and, for Codex, from the
 /// session_meta record that opens the file, before any other record is classified.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,7 +302,7 @@ impl IngestStateMachine {
         let turn = self.reducer.choose(&session, &meta, record_start);
         if meta.sender == Sender::Human && turn.starts_with(IMPORTED_TURN_PREFIX) {
             // A copy of another agent's conversation: the person's words, stamped at import.
-            meta.via = "imported".to_string();
+            meta.via = IMPORTED_VIA.to_string();
         }
         meta.session = Some(session);
         meta.turn = Some(turn);

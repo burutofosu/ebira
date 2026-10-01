@@ -37,7 +37,9 @@ Claude Code sets `CLAUDE_CODE_SESSION_ID` for the running session
    ebira resume --session "$CLAUDE_CODE_SESSION_ID" --brief
    ```
 
-   `human_messages` holds the person's latest messages verbatim;
+   `human_messages` holds the person's latest messages verbatim (copies of
+   another conversation imported into this one are only counted, in
+   `imported_skipped`);
    `latest_assistant_texts` and `latest_commands` hold the latest replies and tool
    calls; `compactions` counts the summaries. A value marked `*_truncated: true`
    carries a `source_ref` for the rest.

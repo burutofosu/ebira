@@ -533,3 +533,97 @@ fn resume_reads_the_whole_session_however_it_is_named() {
     }
     std::fs::remove_dir_all(root).expect("remove test root");
 }
+
+/// The `byte_start` and `byte_len` of the message whose text is `text`: in its `source_ref`
+/// after the text, or before the text in `follow`'s flat messages.
+fn range_of(output: &str, text: &str) -> (u64, u64) {
+    let marker = format!("\"text\":\"{text}\"");
+    let at = output
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{text:?} is not in {output}"));
+    let after = &output[at + marker.len()..];
+    let after = &after[..after.find("\"text\":").unwrap_or(after.len())];
+    let number = |key: &str| {
+        let key = format!("\"{key}\":");
+        let start = match after.find(&key) {
+            Some(index) => at + marker.len() + index,
+            None => output[..at]
+                .rfind(&key)
+                .expect("the message has a byte range"),
+        } + key.len();
+        output[start..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse().ok())
+            .expect("a number")
+    };
+    (number("byte_start"), number("byte_len"))
+}
+
+#[test]
+fn said_resume_and_follow_mean_the_same_by_the_persons_messages() {
+    let logs = Logs::new("person");
+    let thread = logs.path(".codex/sessions/2026/09/01/rollout-2026-09-01T02-00-00-c-import.jsonl");
+    let mut contents = std::fs::read_to_string(&thread).expect("read the imported thread");
+    contents.push_str(concat!(
+        r#"{"timestamp":"2026-09-01T02:05:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#, "\n",
+        r#"{"timestamp":"2026-09-01T02:05:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"and add a legend"}]}}"#, "\n",
+    ));
+    std::fs::write(&thread, contents).expect("append the person's own message");
+    run(&["sync", "--corpus", &logs.corpus()]);
+
+    let said = run(&["said", "--corpus", &logs.corpus(), "--session", "c-import"]);
+    let brief = run(&[
+        "resume",
+        "--corpus",
+        &logs.corpus(),
+        "--session",
+        "c-import",
+        "--brief",
+    ]);
+    let followed = run(&[
+        "follow",
+        "--corpus",
+        &logs.corpus(),
+        "--source",
+        &thread,
+        "--after-byte",
+        "0",
+        "--seconds",
+        "0",
+        "--sender",
+        "human",
+    ]);
+    for (command, output) in [("said", &said), ("resume", &brief), ("follow", &followed)] {
+        assert!(
+            output.contains("and add a legend") && !output.contains("please build the map"),
+            "{command} lists the person's own message and not the imported copy: {output}"
+        );
+    }
+    assert!(said.contains("\"imported_skipped\":1"), "{said}");
+    assert!(
+        brief.contains("\"human_messages_seen\":1") && brief.contains("\"imported_skipped\":1"),
+        "{brief}"
+    );
+    let range = range_of(&said, "and add a legend");
+    assert_eq!(range_of(&brief, "and add a legend"), range, "{brief}");
+    assert_eq!(range_of(&followed, "and add a legend"), range, "{followed}");
+
+    let everything = run(&[
+        "follow",
+        "--corpus",
+        &logs.corpus(),
+        "--source",
+        &thread,
+        "--after-byte",
+        "0",
+        "--seconds",
+        "0",
+        "--sender",
+        "any",
+    ]);
+    assert!(
+        everything.contains("please build the map") && everything.contains("\"via\":\"imported\""),
+        "with --sender any the copy is listed and marked: {everything}"
+    );
+}

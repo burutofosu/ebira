@@ -1,6 +1,6 @@
 use crate::core::{
-    human_text_from_body, is_tool_call, EventKind, RecoveryEvent, RecoverySnapshot, RecoveryState,
-    Sender, SourceRef,
+    human_text_from_body, is_tool_call, persons_message, EventKind, PersonsMessage, RecoveryEvent,
+    RecoverySnapshot, RecoveryState, SeenMessages, Sender, SourceRef,
 };
 use crate::corpus::{self, SourceEntry};
 use crate::format::{body_fields, json_string, parse_event_header, push_field};
@@ -31,8 +31,11 @@ struct ScanResult {
     previous: Option<RecoverySnapshot>,
     matched_events: u64,
     latest_event_index: Option<u64>,
+    /// The person's messages (`core::persons_message`), newest last.
     humans: Vec<Arc<RecoveryEvent>>,
     humans_seen: u64,
+    copies_skipped: u64,
+    imported_skipped: u64,
     compactions: u64,
     last_compaction_at: String,
     summaries: u64,
@@ -125,12 +128,6 @@ pub fn resume(
     let boundary_reached = corpus::source_is_complete(entry);
     let disposition = resume_disposition(entry);
     let source_path = &entry.path;
-    let latest_user = current
-        .users
-        .iter()
-        .rev()
-        .find(|event| event.sender == Sender::Human)
-        .or_else(|| current.users.last());
     let latest_event = current.events.last();
     let completion = completion_state(&current, entry);
     let current_turn_state = current_turn_state(&current);
@@ -174,13 +171,6 @@ pub fn resume(
     number(&mut output, "matched_events", scanned.matched_events);
     output.push_str(",\"current\":");
     output.push_str(&snapshot_json(&current, source_path));
-    output.push_str(",\"latest_user_message\":");
-    output.push_str(
-        latest_user
-            .map(|event| event_json(event, source_path))
-            .unwrap_or_else(|| "null".to_string())
-            .as_str(),
-    );
     output.push_str(",\"latest_human_message\":");
     output.push_str(
         scanned
@@ -238,6 +228,9 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
     let mut state = RecoveryState::default();
     let mut humans: Vec<Arc<RecoveryEvent>> = Vec::new();
     let mut humans_seen = 0u64;
+    let mut seen = SeenMessages::default();
+    let mut copies_skipped = 0u64;
+    let mut imported_skipped = 0u64;
     let mut compactions = 0u64;
     let mut last_compaction_at = String::new();
     let mut summaries = 0u64;
@@ -265,7 +258,14 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
                 skip_body_and_separator(&mut reader, header.body_len)?;
                 continue;
             }
-            let (body, read_truncated) = read_body(&mut reader, header.body_len)?;
+            // The person's messages are read whole, as `said` reads them; the others up to a
+            // bound, and marked when it cuts them.
+            let limit = if header.sender == Sender::Human.as_str() {
+                usize::MAX
+            } else {
+                MAX_RESUME_BODY_BYTES
+            };
+            let (body, read_truncated) = read_body(&mut reader, header.body_len, limit)?;
             let body_truncated = read_truncated || header.body_cut;
             let event = RecoveryEvent {
                 event_index: header.event_index,
@@ -290,9 +290,17 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
                 sender: Sender::from_str(&header.sender),
                 via: header.via,
             };
-            if event.sender == Sender::Human {
-                humans_seen += 1;
-                keep_last(&mut humans, &event, KEPT_HUMAN_MESSAGES);
+            match persons_message(event.sender.as_str(), &event.via) {
+                Some(PersonsMessage::Own) => {
+                    if seen.first(&event.timestamp, &human_text_from_body(&event.body).0) {
+                        humans_seen += 1;
+                        keep_last(&mut humans, &event, KEPT_HUMAN_MESSAGES);
+                    } else {
+                        copies_skipped += 1;
+                    }
+                }
+                Some(PersonsMessage::Imported) => imported_skipped += 1,
+                None => {}
             }
             if event.kind == EventKind::Assistant {
                 keep_last(&mut recent_assistants, &event, KEPT_RECENT_ASSISTANTS);
@@ -321,6 +329,8 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
         latest_event_index: state.latest_event_index(),
         humans,
         humans_seen,
+        copies_skipped,
+        imported_skipped,
         compactions,
         last_compaction_at,
         summaries,
@@ -415,9 +425,6 @@ fn brief_json(
     for event in scanned.humans.iter().rev().take(BRIEF_HUMAN_MESSAGES) {
         let (text, images) = human_text_from_body(&event.body);
         let (text, cut) = bounded(&text, BRIEF_HUMAN_TEXT_LIMIT.min(budget));
-        if text.is_empty() && images == 0 {
-            break;
-        }
         budget = budget.saturating_sub(text.chars().count());
         humans.push((Arc::clone(event), text, cut, images));
         if budget == 0 {
@@ -427,6 +434,8 @@ fn brief_json(
     humans.reverse();
     number(&mut output, "human_messages_seen", scanned.humans_seen);
     number(&mut output, "human_messages_returned", humans.len() as u64);
+    number(&mut output, "copies_skipped", scanned.copies_skipped);
+    number(&mut output, "imported_skipped", scanned.imported_skipped);
     output.push_str(",\"human_messages\":[");
     for (index, (event, text, cut, images)) in humans.iter().enumerate() {
         if index != 0 {
@@ -673,10 +682,9 @@ fn embedded_messages(event: &RecoveryEvent) -> Vec<RecoveryEvent> {
     result
 }
 
-fn read_body<R: Read>(reader: &mut R, body_len: u64) -> io::Result<(String, bool)> {
-    let stored_len = usize::try_from(body_len)
-        .unwrap_or(MAX_RESUME_BODY_BYTES)
-        .min(MAX_RESUME_BODY_BYTES);
+/// Reads a body of `body_len` bytes, keeping at most `limit` of them; true when it kept fewer.
+fn read_body<R: Read>(reader: &mut R, body_len: u64, limit: usize) -> io::Result<(String, bool)> {
+    let stored_len = usize::try_from(body_len).unwrap_or(limit).min(limit);
     let mut bytes = vec![0; stored_len];
     reader.read_exact(&mut bytes)?;
     let mut read_truncated = stored_len as u64 != body_len;
@@ -1057,7 +1065,9 @@ mod tests {
             &format!("abc{}", crate::core::PROJECTION_BOUND_MARKER),
         );
         let mut reader = std::io::Cursor::new(format!("{}\n", body).into_bytes());
-        let (read, truncated) = read_body(&mut reader, body.len() as u64).expect("read body");
+        let (read, truncated) =
+            read_body(&mut reader, body.len() as u64, super::MAX_RESUME_BODY_BYTES)
+                .expect("read body");
         assert_eq!(read, body);
         assert!(!truncated);
     }
