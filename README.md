@@ -88,10 +88,14 @@ that its compaction summary left out.
 ## Use with an agent
 
 Copy the individual skill directories from [skills/claude](skills/claude) into
-`~/.claude/skills`, or from [skills/codex](skills/codex) into `~/.codex/skills`:
+`~/.claude/skills`, or from [skills/codex](skills/codex) into `~/.agents/skills`:
 
 - `ebira-recent-recall`: recover the current task after compaction
 - `ebira-full-survey`: research earlier sessions using original records
+
+These user-level install locations are documented in the
+[Claude Code skills guide](https://code.claude.com/docs/en/skills) and the
+[Codex skills guide](https://learn.chatgpt.com/docs/build-skills).
 
 The `ebira` executable must be on `PATH`.
 
