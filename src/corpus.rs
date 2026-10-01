@@ -203,13 +203,21 @@ pub fn build_with_preview(
     } else {
         BTreeMap::new()
     };
+    let previous_paths = previous
+        .values()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
     let previous_availability = if incremental {
         load_source_availability(corpus)?
     } else {
         SourceAvailabilitySnapshot::default()
     };
     let mut collection = collect_sources(sources);
-    attach_source_ids(&mut collection.availability, &collection.paths, &previous)?;
+    attach_source_ids(
+        &mut collection.availability,
+        &collection.paths,
+        &previous_paths,
+    )?;
     let availability = merge_source_availability(
         previous_availability,
         collection.availability,
@@ -239,7 +247,9 @@ pub fn build_with_preview(
 
     let snapshot = source_paths
         .iter()
-        .filter_map(|path| source_entry_for_preview(path, requested_preview, &previous).transpose())
+        .filter_map(|path| {
+            source_entry_for_preview(path, requested_preview, &previous_paths).transpose()
+        })
         .collect::<io::Result<Vec<_>>>()?;
     let segment_dir = segment_dir(corpus);
     private_fs::create_dir_all(corpus)?;
@@ -1313,7 +1323,11 @@ pub fn log_reader_at(
     if !first_line_complete(path) {
         return Ok(None);
     }
-    let Some(entry) = source_entry(path, 300)? else {
+    let known_paths = catalog
+        .values()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let Some(entry) = source_entry_for_preview(path, None, &known_paths)? else {
         return Ok(None);
     };
     let (mut log, from, mut lines) = match catalog.get(&entry.source_id) {
@@ -1767,13 +1781,18 @@ fn source_entry(path: &Path, output_preview: u64) -> io::Result<Option<SourceEnt
 fn source_entry_for_preview(
     path: &Path,
     requested_preview: Option<usize>,
-    previous: &BTreeMap<String, SourceEntry>,
+    previous_paths: &BTreeMap<&str, &SourceEntry>,
 ) -> io::Result<Option<SourceEntry>> {
     let Some(mut entry) = source_entry(path, requested_preview.unwrap_or(300) as u64)? else {
         return Ok(None);
     };
-    if requested_preview.is_none() {
-        if let Some(previous) = previous.get(&entry.source_id) {
+    if let Some(previous) = previous_paths
+        .get(entry.path.as_str())
+        .filter(|old| old.app == entry.app)
+    {
+        // A managed log keeps its identity when its containing corpus moves.
+        entry.source_id = previous.source_id.clone();
+        if requested_preview.is_none() {
             entry.output_preview = previous.output_preview;
         }
     }
@@ -1846,7 +1865,46 @@ fn normalize_source_input(input: &str) -> String {
     input.to_string()
 }
 
+/// The registry owns managed paths relative to the corpus, including paths in older
+/// absolute-path catalogs. External source paths do not match these import roots.
+fn managed_path_roots(corpus: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    Ok(crate::imports::inventory(corpus)?
+        .entries
+        .into_iter()
+        .map(|entry| {
+            (
+                PathBuf::from(entry.import.managed_relative),
+                PathBuf::from(normalize_source_input(&entry.managed_source)),
+            )
+        })
+        .collect())
+}
+
+fn resolve_managed_path(recorded: &str, roots: &[(PathBuf, PathBuf)]) -> String {
+    let path = Path::new(recorded);
+    for (relative, current) in roots {
+        if path.starts_with(current) {
+            return recorded.to_string();
+        }
+        if let Some(old_root) = path
+            .ancestors()
+            .find(|ancestor| ancestor.ends_with(relative))
+        {
+            if let Ok(suffix) = path.strip_prefix(old_root) {
+                let resolved = if suffix.as_os_str().is_empty() {
+                    current.clone()
+                } else {
+                    current.join(suffix)
+                };
+                return resolved.to_string_lossy().into_owned();
+            }
+        }
+    }
+    recorded.to_string()
+}
+
 fn load_source_inputs(corpus: &Path) -> io::Result<Vec<String>> {
+    let managed_roots = managed_path_roots(corpus)?;
     let mut inputs = Vec::new();
     for path in [
         corpus.join(SOURCE_INPUTS_FILE),
@@ -1859,6 +1917,7 @@ fn load_source_inputs(corpus: &Path) -> io::Result<Vec<String>> {
         for line in BufReader::with_capacity(IO_BUFFER_SIZE, file).lines() {
             let line = line?;
             if let Ok(input) = decode_token(&line) {
+                let input = resolve_managed_path(&input, &managed_roots);
                 if !inputs.contains(&input) {
                     inputs.push(input);
                 }
@@ -1898,6 +1957,7 @@ fn load_source_availability(corpus: &Path) -> io::Result<SourceAvailabilitySnaps
     if !path.is_file() {
         return Ok(SourceAvailabilitySnapshot::default());
     }
+    let managed_roots = managed_path_roots(corpus)?;
     let file = File::open(&path)?;
     let mut lines = BufReader::with_capacity(IO_BUFFER_SIZE, file).lines();
     let header = lines
@@ -1936,12 +1996,18 @@ fn load_source_availability(corpus: &Path) -> io::Result<SourceAvailabilitySnaps
             ));
         }
         entries.push(SourceAvailability {
-            input_path: decode_token(columns[0]).map_err(|error| {
-                invalid_availability(&path, &format!("line {} input: {}", index + 2, error))
-            })?,
-            observed_path: decode_token(columns[1]).map_err(|error| {
-                invalid_availability(&path, &format!("line {} path: {}", index + 2, error))
-            })?,
+            input_path: resolve_managed_path(
+                &decode_token(columns[0]).map_err(|error| {
+                    invalid_availability(&path, &format!("line {} input: {}", index + 2, error))
+                })?,
+                &managed_roots,
+            ),
+            observed_path: resolve_managed_path(
+                &decode_token(columns[1]).map_err(|error| {
+                    invalid_availability(&path, &format!("line {} path: {}", index + 2, error))
+                })?,
+                &managed_roots,
+            ),
             disposition,
             source_id: decode_token(columns[3]).map_err(|error| {
                 invalid_availability(&path, &format!("line {} source_id: {}", index + 2, error))
@@ -2048,22 +2114,22 @@ fn merge_source_availability(
 fn attach_source_ids(
     availability: &mut [SourceAvailability],
     paths: &[PathBuf],
-    previous: &BTreeMap<String, SourceEntry>,
+    previous_paths: &BTreeMap<&str, &SourceEntry>,
 ) -> io::Result<()> {
     let mut current = BTreeMap::new();
     for path in paths {
-        if let Some(entry) = source_entry(path, 300)? {
+        if let Some(entry) = source_entry_for_preview(path, None, previous_paths)? {
             current.insert(entry.path, entry.source_id);
         }
     }
-    let old = previous
-        .values()
-        .map(|entry| (entry.path.clone(), entry.source_id.clone()))
-        .collect::<BTreeMap<_, _>>();
     for entry in availability {
         entry.source_id = current
             .get(&entry.observed_path)
-            .or_else(|| old.get(&entry.observed_path))
+            .or_else(|| {
+                previous_paths
+                    .get(entry.observed_path.as_str())
+                    .map(|known| &known.source_id)
+            })
             .cloned()
             .unwrap_or_default();
     }
@@ -2441,6 +2507,7 @@ fn load_source_catalog_paths(paths: &[PathBuf]) -> io::Result<BTreeMap<String, S
         if !path.is_file() {
             continue;
         }
+        let managed_roots = managed_path_roots(path.parent().unwrap_or(Path::new(".")))?;
         let file = File::open(path)?;
         let mut header_seen = false;
         for (line_index, line) in BufReader::with_capacity(IO_BUFFER_SIZE, file)
@@ -2467,7 +2534,10 @@ fn load_source_catalog_paths(paths: &[PathBuf]) -> io::Result<BTreeMap<String, S
             }
             let source_id = catalog_token(&parts, 0, None, path, line_number, "source_id")?;
             let app = catalog_token(&parts, 1, None, path, line_number, "app")?;
-            let source_path = catalog_token(&parts, 2, None, path, line_number, "path")?;
+            let source_path = resolve_managed_path(
+                &catalog_token(&parts, 2, None, path, line_number, "path")?,
+                &managed_roots,
+            );
             let fallback_session =
                 catalog_token(&parts, 3, None, path, line_number, "fallback_session")?;
             let size = catalog_u64(&parts, 4, None, path, line_number, "size")?;

@@ -122,15 +122,64 @@ fn import_preserves_records_provenance_and_portability() {
         "the per-file route back to the imported layout is retained: {files}"
     );
 
+    // Move an already indexed corpus, with an external source that must keep its path.
+    let live = root.join("live.jsonl");
+    std::fs::write(&live, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"external live marker\"},\"sessionId\":\"live\"}\n").expect("write live source");
+    run(&["sync", "--corpus", text(&corpus), "--source", text(&live)]);
+    let before = run(&[
+        "search",
+        "--corpus",
+        text(&corpus),
+        "--query",
+        "managed portable marker",
+    ]);
+    let source_id = before
+        .split("\"source_id\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+
     std::fs::remove_dir_all(root.join("old-machine")).expect("remove original placement");
     let moved_home = root.join("moved-ebira-home");
     std::fs::rename(&home, &moved_home).expect("move complete Ebira home");
     let moved_corpus = moved_home.join("corpus");
+    let raw = run(&[
+        "search",
+        "--corpus",
+        text(&moved_corpus),
+        "--query",
+        "managed portable marker",
+        "--raw",
+    ]);
+    assert!(
+        raw.contains("\"total_candidates\":1"),
+        "a managed source resolves relative to the moved corpus before syncing: {raw}"
+    );
+    let original = run(&[
+        "context",
+        "--corpus",
+        text(&moved_corpus),
+        "--source-id",
+        source_id,
+        "--byte-start",
+        "0",
+        "--byte-len",
+        &record.len().to_string(),
+    ]);
+    assert!(
+        original.contains("\"disposition\":\"ready\"")
+            && original.contains("managed portable marker"),
+        "the old reference still reads the moved managed log: {original}"
+    );
     let build = run(&["sync", "--corpus", text(&moved_corpus)]);
     assert!(
         build.contains("\"managed_imports\":1")
-            && build.contains("\"unavailable_managed_imports\":0"),
-        "a fresh corpus discovers the moved managed import: {build}"
+            && build.contains("\"unavailable_managed_imports\":0")
+            && build.contains("\"unreadable_source_paths\":0")
+            && build.contains("\"sources_reused\":2"),
+        "sync reuses both indexed sources at their resolved paths: {build}"
     );
     let found = run(&[
         "search",
@@ -142,17 +191,38 @@ fn import_preserves_records_provenance_and_portability() {
         "10",
     ]);
     assert!(
-        found.contains("managed portable marker"),
+        found.contains("managed portable marker")
+            && found.contains("\"total_candidates\":1")
+            && found.contains(&format!("\"source_id\":\"{source_id}\"")),
         "the copied JSONL remains searchable without its old path: {found}"
     );
     let status = run(&["status", "--corpus", text(&moved_corpus)]);
     assert!(
         status.contains("\"disposition\":\"observed\"")
+            && status.contains("\"sources\":2")
+            && status.contains("\"registered_source_inputs\":2")
             && status.contains("\"imports\":[{\"import_id\"")
             && status.contains("\"original_path\"")
             && status.contains("backup-2026")
             && status.contains("\"disposition\":\"present\""),
         "moved import lost its provenance: {status}"
+    );
+    let external = run(&[
+        "search",
+        "--corpus",
+        text(&moved_corpus),
+        "--query",
+        "external live marker",
+        "--raw",
+    ]);
+    assert!(
+        external.contains("\"total_candidates\":1"),
+        "an external source is not relocated: {external}"
+    );
+    let again = run(&["sync", "--corpus", text(&moved_corpus)]);
+    assert!(
+        again.contains("\"sources_reused\":2") && again.contains("\"unreadable_source_paths\":0"),
+        "relocation is persistent: {again}"
     );
 
     std::fs::remove_dir_all(root).expect("remove test root");
