@@ -489,10 +489,7 @@ pub fn build_with_preview(
     }
     normalized_catalog.flush()?;
     drop(normalized_catalog);
-    if catalog_path.exists() {
-        fs::remove_file(&catalog_path)?;
-    }
-    fs::rename(&normalized_catalog_path, &catalog_path)?;
+    replace_file(&normalized_catalog_path, &catalog_path)?;
     if catalog_partial_path.exists() {
         fs::remove_file(&catalog_partial_path)?;
     }
@@ -762,14 +759,35 @@ impl Freshness {
 
 pub fn freshness(entry: &SourceEntry) -> Freshness {
     let path = Path::new(&entry.path);
-    let Ok(metadata) = fs::metadata(path) else {
-        return Freshness::Unreachable;
+    match fs::metadata(path) {
+        Ok(metadata) => freshness_of(entry, &metadata),
+        Err(_) => Freshness::Unreachable,
+    }
+}
+
+/// Opens a source's log for reading its records, with its freshness. A log that was replaced
+/// or rewritten is not returned: the bytes at the corpus's references are another record now.
+pub fn open_log(entry: &SourceEntry) -> (Option<File>, Freshness) {
+    let Ok(file) = File::open(&entry.path) else {
+        return (None, Freshness::Unreachable);
     };
-    let (volume_serial_number, file_id) = identity_of(path, &metadata);
+    let freshness = match file.metadata() {
+        Ok(metadata) => freshness_of(entry, &metadata),
+        Err(_) => Freshness::Unreachable,
+    };
+    match freshness {
+        Freshness::Current | Freshness::Behind(_) => (Some(file), freshness),
+        Freshness::Rewritten(_) | Freshness::Unreachable => (None, freshness),
+    }
+}
+
+fn freshness_of(entry: &SourceEntry, metadata: &fs::Metadata) -> Freshness {
+    let path = Path::new(&entry.path);
+    let (volume_serial_number, file_id) = identity_of(path, metadata);
     let observed = SourceEntry {
         path: entry.path.clone(),
         size: metadata.len(),
-        modified_ms: modified_ms(&metadata),
+        modified_ms: modified_ms(metadata),
         volume_serial_number,
         file_id,
         ..SourceEntry::default()
@@ -903,6 +921,21 @@ pub fn lock_exclusive(path: &Path) -> io::Result<File> {
         .open(root.join(LOCK_FILE))?;
     file.lock()?;
     Ok(file)
+}
+
+/// Puts a finished file in place of the one it replaces, in one step: a reader opens the old
+/// file or the new one, never a name with no file behind it.
+pub fn replace_file(partial: &Path, complete: &Path) -> io::Result<()> {
+    fs::rename(partial, complete)
+}
+
+/// Holds the corpus for reading. A reader waits while a sync or an import writes the corpus,
+/// and checks that it is a current corpus only once it holds it; checked before, a corpus in
+/// the middle of a rebuild looks missing or outdated.
+pub fn read_lock(path: &Path) -> io::Result<Option<File>> {
+    let lock = lock_shared(path)?;
+    require_corpus(path)?;
+    Ok(lock)
 }
 
 /// A corpus that no writer has locked yet has no lock file; reading it needs none.
@@ -1270,8 +1303,9 @@ fn checkpoint_of(entry: &SourceEntry) -> IngestCheckpoint {
 
 /// A reader for the log at `path` that has read it up to `cursor`, a line start, and the number
 /// of lines before `cursor`: it starts from the catalog's checkpoint when the corpus has read
-/// the log no further than `cursor`, else from the start of the log. `None` while the log has
-/// no complete record, before which the agent that writes it cannot be told.
+/// this very log no further than `cursor`, else from the start of the log. A log replaced since
+/// the sync starts over, as the sync will. `None` while the log has no complete record, before
+/// which the agent that writes it cannot be told.
 pub fn log_reader_at(
     catalog: &BTreeMap<String, SourceEntry>,
     path: &Path,
@@ -1284,11 +1318,17 @@ pub fn log_reader_at(
         return Ok(None);
     };
     let (mut log, from, mut lines) = match catalog.get(&entry.source_id) {
-        Some(known) if known.checkpoint_valid && known.committed_byte_end <= cursor => (
-            LogReader::new(known, checkpoint_of(known)),
-            known.committed_byte_end,
-            known.last_line,
-        ),
+        Some(known)
+            if known.checkpoint_valid
+                && known.committed_byte_end <= cursor
+                && matches!(freshness(known), Freshness::Current | Freshness::Behind(_)) =>
+        {
+            (
+                LogReader::new(known, checkpoint_of(known)),
+                known.committed_byte_end,
+                known.last_line,
+            )
+        }
         _ => (LogReader::new(&entry, IngestCheckpoint::default()), 0, 0),
     };
     let mut input = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(path)?);
@@ -1414,10 +1454,7 @@ fn process_source(
         run.corpus_file = output_name.clone();
     }
     if records > 0 || !append {
-        if output_path.exists() {
-            fs::remove_file(&output_path)?;
-        }
-        fs::rename(&partial_path, &output_path)?;
+        replace_file(&partial_path, &output_path)?;
         if !append {
             remove_source_corpus_files_except(active_files, &output_path)?;
         }
@@ -1836,10 +1873,7 @@ fn write_source_inputs(corpus: &Path, inputs: &[String]) -> io::Result<()> {
     let partial_path = corpus.join(format!("{}.partial", SOURCE_INPUTS_FILE));
     let complete_path = corpus.join(SOURCE_INPUTS_FILE);
     write_source_inputs_partial(corpus, inputs)?;
-    if complete_path.exists() {
-        fs::remove_file(&complete_path)?;
-    }
-    fs::rename(partial_path, complete_path)?;
+    replace_file(&partial_path, &complete_path)?;
     Ok(())
 }
 
@@ -1956,10 +1990,7 @@ fn write_source_availability(
     }
     writer.flush()?;
     drop(writer);
-    if complete_path.exists() {
-        fs::remove_file(&complete_path)?;
-    }
-    fs::rename(partial_path, complete_path)?;
+    replace_file(&partial_path, &complete_path)?;
     Ok(())
 }
 
@@ -2233,10 +2264,7 @@ fn write_timeline_catalog(
     }
     writer.flush()?;
     drop(writer);
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(partial_path, path)?;
+    replace_file(&partial_path, &path)?;
     Ok(())
 }
 

@@ -469,8 +469,7 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "search" | "history" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
-            let _lock = corpus::lock_shared(&root)?;
+            let _lock = corpus::read_lock(&root)?;
             let request = search_request(
                 args,
                 if command == "history" { "history" } else { "" },
@@ -480,19 +479,21 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "timeline" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
             if has_flag(args, "--rebuild") {
+                // Checked before the lock too, so that a lock file is not made where no
+                // corpus is.
+                corpus::require_corpus(&root)?;
                 let _lock = corpus::lock_exclusive(&root)?;
+                corpus::require_corpus(&root)?;
                 return corpus::rebuild_timeline(&root);
             }
-            let _lock = corpus::lock_shared(&root)?;
+            let _lock = corpus::read_lock(&root)?;
             let request = timeline_request(args, corpus::corpus_offset_minutes(&root)?)?;
             search::timeline(&root, request)
         }
         "commits" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
-            let _lock = corpus::lock_shared(&root)?;
+            let _lock = corpus::read_lock(&root)?;
             let offset_minutes = corpus::corpus_offset_minutes(&root)?;
             let (from, to, range) = range_options(args, offset_minutes)?;
             let request = commits::CommitRequest {
@@ -508,8 +509,7 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "resume" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
-            let _lock = corpus::lock_shared(&root)?;
+            let _lock = corpus::read_lock(&root)?;
             let source_id = option_values(args, "--source-id").into_iter().next();
             let session = option_values(args, "--session").into_iter().next();
             resume::resume(
@@ -521,8 +521,7 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "said" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
-            let _lock = corpus::lock_shared(&root)?;
+            let _lock = corpus::read_lock(&root)?;
             let offset_minutes = corpus::corpus_offset_minutes(&root)?;
             let (from, to, range) = range_options(args, offset_minutes)?;
             let request = said::SaidRequest {
@@ -569,8 +568,7 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "context" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
-            let _lock = corpus::lock_shared(&root)?;
+            let _lock = corpus::read_lock(&root)?;
             let source_id = one_option(args, "--source-id")?;
             let byte_start = number_option_u64(args, "--byte-start")?;
             let byte_len = number_option_u64(args, "--byte-len")?;
@@ -585,7 +583,6 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "follow" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
             let after_byte = match option_values(args, "--after-byte").into_iter().next() {
                 Some(value) => Some(value.parse::<u64>().map_err(|_| {
                     io::Error::new(
@@ -616,8 +613,7 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "status" => {
             let root = corpus_path(args)?;
-            corpus::require_corpus(&root)?;
-            let _lock = corpus::lock_shared(&root)?;
+            let _lock = corpus::read_lock(&root)?;
             corpus::status(&root)
         }
         _ => Err(unknown_command(command)),

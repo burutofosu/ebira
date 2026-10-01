@@ -93,13 +93,21 @@ unreadable.
 ## Concurrency
 
 `sync`, `import`, and `timeline --rebuild` hold the lock file `ebira.lock` in the
-corpus directory exclusively; the commands that read the corpus hold it shared.
-Two writers never interleave their catalog, registry, or segment updates, and a
-reader never sees a sync half done. The lock is released when the process ends,
-also abnormally. `follow` reads the transcript itself and takes no lock while it
-waits. It reads with the reader a sync uses (`corpus::LogReader`), starting from
-the checkpoint the catalog holds for that transcript, so its messages carry the
-sender, channel, timestamp, and byte range the corpus gives the same records.
+corpus directory exclusively; the commands that read the corpus hold it shared,
+and check that the corpus is current only once they hold it
+(`corpus::read_lock`), since a corpus in the middle of a rebuild can look
+missing or outdated. A finished file takes the place of the one before it in one
+rename (`corpus::replace_file`), so its name never stands empty. Two writers
+never interleave their catalog, registry, or segment updates, and a reader never
+sees a sync half done. The lock is released when the process ends, also
+abnormally.
+
+`follow` holds the lock only while it reads the catalog, and reads the
+transcript itself while it waits. It reads with the reader a sync uses
+(`corpus::LogReader`), starting from the checkpoint the catalog holds for that
+transcript while the transcript is still the file the corpus read, and from its
+start otherwise. Its messages carry the sender, channel, timestamp, and byte
+range the corpus gives the same records.
 
 ## Senders
 
@@ -173,8 +181,12 @@ Each projected event contains a `SourceRef` with a source ID, byte offset, and
 byte length. `ebira context` uses this location to read the corresponding JSONL
 record. Managed imports resolve to the copied JSONL.
 
-A context read verifies the source state recorded during indexing. Changed
-sources return `source_changed_since_projection`.
+A record is read from its log only while the log is the file the corpus read
+(`corpus::open_log`, by the freshness test below). A log that only grew keeps
+every byte a reference names. For a log replaced or rewritten since the sync,
+`context` returns `source_changed_since_projection` and no bytes, a raw search
+counts the log unreachable, `resume --brief` quotes no reply from it, and
+`follow` reads it from its start; the next sync reads it again.
 
 ## Scope and freshness
 
@@ -212,7 +224,9 @@ The person's messages have one definition, in `core.rs`, which `said`,
 `resume`, and `follow` share: records whose sender is the person, listed once
 when the same text was stored twice with the same timestamp
 (`core::SeenMessages`). Imported copies (`via: imported`) are counted but listed
-only when requested. A message is read whole, however long. `said` reads only
+only when requested. A message is read whole, however long, and in whatever
+shape the log writes it; `follow` keeps no list of shapes of its own for them.
+`said` reads only
 such events; a session scope reads the segments of the session's sources, and
 the other filters apply to event headers.
 

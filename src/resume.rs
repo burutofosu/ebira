@@ -347,7 +347,8 @@ fn brief_json(
 ) -> String {
     let source_path = &entry.path;
     let boundary_reached = corpus::source_is_complete(entry);
-    let freshness = corpus::freshness(entry);
+    // Replies and commands are read from the log itself, and only from the log the corpus read.
+    let (mut log, freshness) = corpus::open_log(entry);
     let source_ref = |event: &RecoveryEvent| source_ref_json(&event.source_ref, source_path);
 
     let mut budget = BRIEF_HUMAN_TEXT_BUDGET;
@@ -378,7 +379,7 @@ fn brief_json(
         if texts.len() == BRIEF_ASSISTANT_TEXTS {
             break;
         }
-        let text = original_fields(source_path, &event.source_ref)
+        let text = original_fields(log.as_mut(), &event.source_ref)
             .map(|fields| assistant_text(&fields))
             .unwrap_or_default();
         if !text.trim().is_empty() {
@@ -396,7 +397,7 @@ fn brief_json(
     texts.reverse();
 
     let commands = scanned.recent_commands.iter().map(|event| {
-        let calls = original_fields(source_path, &event.source_ref)
+        let calls = original_fields(log.as_mut(), &event.source_ref)
             .map(|fields| tool_calls(&fields))
             .unwrap_or_default();
         let (name, input) = calls.into_iter().last().unwrap_or_else(|| {
@@ -493,11 +494,13 @@ fn source_ref_json(source_ref: &SourceRef, source_path: &str) -> String {
     )
 }
 
-fn original_fields(source_path: &str, source_ref: &SourceRef) -> Option<Vec<Field>> {
+/// A record read from its log, opened by `corpus::open_log` only when it is the log the corpus
+/// read.
+fn original_fields(log: Option<&mut File>, source_ref: &SourceRef) -> Option<Vec<Field>> {
     if source_ref.byte_len == 0 || source_ref.byte_len > MAX_ORIGINAL_RECORD_BYTES {
         return None;
     }
-    let mut file = File::open(source_path).ok()?;
+    let file = log?;
     file.seek(io::SeekFrom::Start(source_ref.byte_start)).ok()?;
     let mut bytes = vec![0; source_ref.byte_len as usize];
     file.read_exact(&mut bytes).ok()?;

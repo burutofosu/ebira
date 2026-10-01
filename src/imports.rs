@@ -483,10 +483,7 @@ fn write_registry(path: &Path, imports: &[ManagedImport]) -> io::Result<()> {
     }
     writer.flush()?;
     drop(writer);
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(partial, path)?;
+    crate::corpus::replace_file(&partial, path)?;
     Ok(())
 }
 

@@ -206,8 +206,9 @@ ebira context --source-id <id> --byte-start <n> --byte-len <n> --before 5 --afte
 
 `disposition` reports each result. A search miss in the corpus is
 `no_match_in_projection`; a raw scan that finds nothing is
-`no_match_in_source_records` and states the time it covered. A source that
-changed after indexing reads as `source_changed_since_projection` until the next
+`no_match_in_source_records` and states the time it covered. A log that was
+replaced or rewritten after the sync is not read through old references:
+`context` reports `source_changed_since_projection` with no bytes until the next
 sync.
 
 ## Following another session

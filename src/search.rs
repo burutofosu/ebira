@@ -96,6 +96,9 @@ struct SearchStats {
 }
 
 #[derive(Default)]
+/// The logs a raw search reads, each opened once. A log that was replaced or rewritten since
+/// the sync is not read: its records are elsewhere now, so it counts as unreachable until the
+/// next sync.
 struct SourceReaders {
     open: BTreeMap<String, Option<File>>,
 }
@@ -111,7 +114,7 @@ impl SourceReaders {
             .or_insert_with(|| {
                 catalog
                     .get(source_id)
-                    .and_then(|entry| File::open(&entry.path).ok())
+                    .and_then(|entry| corpus::open_log(entry).0)
             })
             .as_mut()
     }
@@ -1421,13 +1424,101 @@ pub fn context(
             format!("source_id not found in catalog: {}", source_id),
         )
     })?;
+    let (file, freshness) = corpus::open_log(entry);
+    if freshness == corpus::Freshness::Unreachable {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{}: the log of {} cannot be read", entry.path, source_id),
+        ));
+    }
     let (byte_start, byte_len, neighbours, line) = if before == 0 && after == 0 {
         (byte_start, byte_len, 1, None)
     } else {
         neighbouring_span(root, source_id, byte_start, byte_len, before, after)?
     };
-    let mut file = File::open(&entry.path)?;
-    let source_size = file.metadata()?.len();
+    let observed = match &file {
+        Some(file) => file.metadata().ok(),
+        None => std::fs::metadata(&entry.path).ok(),
+    };
+    let observed_size = observed
+        .as_ref()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let observed_modified_ms = observed
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    // A log that was replaced or rewritten holds other records at these bytes now: they are
+    // not returned as the record the reference names.
+    let read = match file {
+        Some(file) => Some(read_range(file, byte_start, byte_len, observed_size)?),
+        None => None,
+    };
+    let next_actions = if read.is_some() {
+        Vec::new()
+    } else {
+        vec![json::Object::new()
+            .name("action", "sync")
+            .raw("request", &sync_request_json(root))
+            .finish()]
+    };
+    let state = |size: u64, modified_ms: u64| {
+        json::Object::new()
+            .number("size", size)
+            .number("modified_ms", modified_ms)
+            .finish()
+    };
+    println!(
+        "{}",
+        json::Object::new()
+            .name(
+                "disposition",
+                if read.is_some() {
+                    "ready"
+                } else {
+                    "source_changed_since_projection"
+                },
+            )
+            .name("mode", "source_context")
+            .raw(
+                "source_ref",
+                &json::source_ref(source_id, &entry.path, line, byte_start, byte_len),
+            )
+            .name("source_freshness", freshness.as_str())
+            .number("records", if read.is_some() { neighbours } else { 0 })
+            .boolean(
+                "closes_on_record",
+                read.as_ref()
+                    .is_some_and(|bytes| bytes.last() == Some(&b'\n')),
+            )
+            .raw("source_recorded", &state(entry.size, entry.modified_ms))
+            .raw(
+                "source_observed",
+                &state(observed_size, observed_modified_ms)
+            )
+            .raw(
+                "raw",
+                &json::or_null(
+                    read.as_ref()
+                        .map(|bytes| json::string(&String::from_utf8_lossy(bytes))),
+                ),
+            )
+            .raw("next_actions", &json::array(next_actions))
+            .finish()
+    );
+    Ok(())
+}
+
+/// The bytes of a log from `byte_start`, `byte_len` of them, within the log and the context
+/// bound.
+fn read_range(
+    mut file: File,
+    byte_start: u64,
+    byte_len: u64,
+    source_size: u64,
+) -> io::Result<Vec<u8>> {
     let byte_end = byte_start.checked_add(byte_len).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1461,55 +1552,7 @@ pub fn context(
     })?;
     let mut bytes = vec![0; length];
     file.read_exact(&mut bytes)?;
-    let raw = String::from_utf8_lossy(&bytes);
-
-    let observed_modified_ms = file
-        .metadata()
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0);
-    let closes_on_record = bytes.last() == Some(&b'\n');
-    let source_moved = source_size < entry.size
-        || (source_size == entry.size && observed_modified_ms != entry.modified_ms);
-    let disposition = if source_moved {
-        "source_changed_since_projection"
-    } else {
-        "ready"
-    };
-    let next_actions = if disposition == "ready" {
-        Vec::new()
-    } else {
-        vec![json::Object::new()
-            .name("action", "sync")
-            .raw("request", &sync_request_json(root))
-            .finish()]
-    };
-    let state = |size: u64, modified_ms: u64| {
-        json::Object::new()
-            .number("size", size)
-            .number("modified_ms", modified_ms)
-            .finish()
-    };
-    println!(
-        "{}",
-        json::Object::new()
-            .name("disposition", disposition)
-            .name("mode", "source_context")
-            .raw(
-                "source_ref",
-                &json::source_ref(source_id, &entry.path, line, byte_start, byte_len),
-            )
-            .number("records", neighbours)
-            .boolean("closes_on_record", closes_on_record)
-            .raw("source_recorded", &state(entry.size, entry.modified_ms))
-            .raw("source_observed", &state(source_size, observed_modified_ms))
-            .text("raw", &raw)
-            .raw("next_actions", &json::array(next_actions))
-            .finish()
-    );
-    Ok(())
+    Ok(bytes)
 }
 
 fn scan_file(

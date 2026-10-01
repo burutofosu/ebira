@@ -618,6 +618,10 @@ fn said_resume_and_follow_mean_the_same_by_the_persons_messages() {
             "{command} lists the person's own message and not the imported copy: {output}"
         );
     }
+    assert!(
+        followed.contains("\"source_id\":\"codex-"),
+        "a transcript the corpus has read keeps its source id: {followed}"
+    );
     assert!(said.contains("\"imported_skipped\":1"), "{said}");
     assert!(
         brief.contains("\"human_messages_seen\":1") && brief.contains("\"imported_skipped\":1"),
@@ -740,4 +744,156 @@ fn search_matches_what_was_written_not_how_the_corpus_stores_it() {
         day.contains("\"snippet\":\"please build the map\"") && !day.contains("\t"),
         "a listing quotes values, not their framing: {day}"
     );
+}
+
+#[test]
+fn follow_takes_every_record_that_is_the_persons_message() {
+    let root = std::env::temp_dir().join(format!("ebira-sender-event-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let sessions = root.join(".codex").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create session directory");
+    let log = sessions.join("rollout-2026-09-01T00-00-00-c-event.jsonl");
+    std::fs::write(
+        &log,
+        concat!(
+            r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"c-event","originator":"Codex Desktop","source":"vscode"}}"#, "\n",
+            r#"{"timestamp":"2026-09-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#, "\n",
+            r#"{"timestamp":"2026-09-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"twice written"}]}}"#, "\n",
+            r#"{"timestamp":"2026-09-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"twice written"}}"#, "\n",
+        ),
+    )
+    .expect("write rollout");
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    run(&[
+        "sync",
+        "--corpus",
+        corpus,
+        "--source",
+        sessions.to_str().expect("utf-8 path"),
+    ]);
+    let said = run(&["said", "--corpus", corpus, "--order", "asc"]);
+    let followed = run(&[
+        "follow",
+        "--corpus",
+        corpus,
+        "--source",
+        log.to_str().expect("utf-8 path"),
+        "--after-byte",
+        "0",
+        "--seconds",
+        "0",
+        "--sender",
+        "human",
+    ]);
+    for (command, output) in [("said", &said), ("follow", &followed)] {
+        assert_eq!(
+            output.matches("\"text\":\"hello\"").count(),
+            1,
+            "{command}: {output}"
+        );
+        assert_eq!(
+            output.matches("\"text\":\"twice written\"").count(),
+            1,
+            "{command} lists a message written twice once: {output}"
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+/// Puts `contents` in place of the file at `path` as another file, the way a log is replaced.
+fn replace_with(path: &std::path::Path, contents: &str) {
+    let staged = path.with_extension("staged");
+    std::fs::write(&staged, contents).expect("write the replacement");
+    std::fs::rename(&staged, path).expect("replace the file");
+}
+
+#[test]
+fn resume_does_not_quote_a_replaced_log() {
+    let logs = Logs::new("replaced");
+    let transcript = logs.path(".claude/projects/C--work-game/s-main.jsonl");
+    let brief = || {
+        run(&[
+            "resume",
+            "--corpus",
+            &logs.corpus(),
+            "--session",
+            "s-main",
+            "--brief",
+        ])
+    };
+    assert!(brief().contains("kept the colors"));
+    // Same length, other words: every old reference now falls on a whole record of the new file.
+    let contents = std::fs::read_to_string(&transcript).expect("read transcript");
+    replace_with(
+        std::path::Path::new(&transcript),
+        &contents.replace("kept the colors", "kept the colour"),
+    );
+    let after = brief();
+    assert!(
+        !after.contains("kept the colour") && after.contains("\"source_freshness\":\"rewritten\""),
+        "{after}"
+    );
+}
+
+#[test]
+fn follow_does_not_carry_the_state_of_a_replaced_log() {
+    let root = std::env::temp_dir().join(format!("ebira-sender-restate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let sessions = root.join(".codex").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create session directory");
+    let log = sessions.join("rollout-2026-09-01T00-00-00-c-restate.jsonl");
+    let meta = r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"id":"c-restate","originator":"Codex Desktop","source":"vscode"}}"#;
+    let message = |text: &str| {
+        format!(
+            r#"{{"timestamp":"2026-09-01T00:00:01Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
+        )
+    };
+    let turn = |id: &str| {
+        format!(
+            r#"{{"timestamp":"2026-09-01T00:00:00Z","type":"event_msg","payload":{{"type":"task_started","turn_id":"{id}"}}}}"#
+        )
+    };
+    // The corpus reads the log just after an imported turn opened, before any message in it.
+    let original = format!("{meta}\n{}\n", turn("external-import-turn-1"));
+    std::fs::write(&log, &original).expect("write rollout");
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    run(&[
+        "sync",
+        "--corpus",
+        corpus,
+        "--source",
+        sessions.to_str().expect("utf-8 path"),
+    ]);
+    // Another log takes its place: as long up to there, but in a turn of its own, and it goes
+    // on with the person's message.
+    assert_eq!(
+        turn("turn-00000000000000001").len(),
+        turn("external-import-turn-1").len()
+    );
+    let replacement = format!(
+        "{meta}\n{}\n{}\n",
+        turn("turn-00000000000000001"),
+        message("new words")
+    );
+    replace_with(&log, &replacement);
+    let followed = run(&[
+        "follow",
+        "--corpus",
+        corpus,
+        "--source",
+        log.to_str().expect("utf-8 path"),
+        "--after-byte",
+        &original.len().to_string(),
+        "--seconds",
+        "0",
+        "--sender",
+        "human",
+    ]);
+    assert!(
+        followed.contains("\"text\":\"new words\""),
+        "the replaced log is read from its own start, not the corpus's checkpoint: {followed}"
+    );
+    std::fs::remove_dir_all(root).expect("remove test root");
 }

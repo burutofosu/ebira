@@ -1300,3 +1300,115 @@ fn commits_are_the_names_that_start_one_commit() {
         "{commits}"
     );
 }
+
+/// A reader started while a writer holds the corpus waits for it, and only then checks the
+/// corpus: here the catalog is missing while the writer works, as it can be mid-sync.
+#[test]
+fn readers_wait_for_a_writer_before_checking_the_corpus() {
+    let fixture = Fixture::new("reader-waits");
+    let corpus = fixture.corpus();
+    let catalog = fixture.path().join("corpus").join("sources.tsv");
+    let saved = std::fs::read(&catalog).expect("read catalog");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.path().join("corpus").join("ebira.lock"))
+        .expect("open the lock file");
+    lock.lock().expect("hold the corpus as a writer");
+    std::fs::remove_file(&catalog).expect("remove catalog");
+    let log = fixture.path().join("log.jsonl");
+    let readers = [
+        vec!["status", "--corpus", &corpus],
+        vec!["search", "--corpus", &corpus, "--query", "probe"],
+        vec![
+            "follow",
+            "--corpus",
+            &corpus,
+            "--source",
+            log.to_str().expect("utf-8 path"),
+            "--seconds",
+            "0",
+        ],
+    ]
+    .map(|args| {
+        ebira()
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start ebira")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::write(&catalog, saved).expect("restore catalog");
+    lock.unlock().expect("release the corpus");
+    for reader in readers {
+        let output = reader.wait_with_output().expect("ebira finishes");
+        assert!(
+            output.status.success(),
+            "a reader checked the corpus before the writer was done: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn a_replaced_log_is_not_read_through_old_references() {
+    let fixture = Fixture::new("replaced-log");
+    let corpus = fixture.corpus();
+    let log = fixture.path().join("log.jsonl");
+    let search = run(&["search", "--corpus", &corpus, "--query", "surface probe"]);
+    let reference = &search[search.find("\"source_ref\":{").expect("a match")..];
+    let value = |key: &str| {
+        let start = reference.find(&format!("\"{key}\":")).expect("key") + key.len() + 3;
+        reference[start..]
+            .split([',', '}'])
+            .next()
+            .expect("value")
+            .trim_matches('"')
+            .to_string()
+    };
+    let (source_id, byte_start, byte_len) =
+        (value("source_id"), value("byte_start"), value("byte_len"));
+
+    // Another file, longer than the first, takes the log's place.
+    let replacement = fixture.path().join("replacement.jsonl");
+    let other = r#"{"type":"turn_started","session_id":"s9","turn_id":"t9","timestamp":"2026-08-17T00:00:00Z","cwd":"elsewhere","note":"replacement words replacement words"}"#;
+    std::fs::write(
+        &replacement,
+        format!("{other}\n{other}\n{other}\n{other}\n"),
+    )
+    .expect("write");
+    std::fs::rename(&replacement, &log).expect("replace the log");
+
+    let context = run(&[
+        "context",
+        "--corpus",
+        &corpus,
+        "--source-id",
+        &source_id,
+        "--byte-start",
+        &byte_start,
+        "--byte-len",
+        &byte_len,
+    ]);
+    assert!(
+        context.contains("\"disposition\":\"source_changed_since_projection\"")
+            && context.contains("\"raw\":null")
+            && !context.contains("replacement words"),
+        "an old reference does not read another file's bytes: {context}"
+    );
+    let raw = run(&[
+        "search",
+        "--corpus",
+        &corpus,
+        "--query",
+        "replacement words",
+        "--raw",
+    ]);
+    assert!(
+        raw.contains("\"total_candidates\":0")
+            && raw.contains("\"absence_settled_through\":null")
+            && raw.contains("\"action\":\"sync\""),
+        "a raw search does not pair old headers with a replaced log: {raw}"
+    );
+}

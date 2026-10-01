@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::core::{human_text_from_body, persons_message, PersonsMessage};
+use crate::core::{human_text_from_body, persons_message, PersonsMessage, SeenMessages};
 use crate::corpus::{self, LogReader, ReadRecord, SourceEntry};
 use crate::json;
 use crate::jsonl::{Field, ScalarKind};
@@ -54,8 +54,16 @@ struct Target {
 }
 
 pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
-    let catalog = corpus::source_catalog(root)?;
-    let target = resolve_target(root, &catalog, request)?;
+    // The corpus is read under its lock, which is released before the wait: a sync is not held
+    // up while follow waits for a message.
+    let (catalog, inputs) = {
+        let _lock = corpus::read_lock(root)?;
+        (
+            corpus::source_catalog(root)?,
+            corpus::registered_sources(root)?,
+        )
+    };
+    let target = resolve_target(&catalog, &inputs, request)?;
     let path = target.path.as_path();
     let size = fs::metadata(path)?.len();
     let start = request.after_byte.unwrap_or(size).min(size);
@@ -89,8 +97,8 @@ pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
 /// the session's transcript in the corpus (`corpus::session_sources`), else the
 /// newest file named by it under the registered source roots.
 fn resolve_target(
-    root: &Path,
     catalog: &BTreeMap<String, SourceEntry>,
+    inputs: &[String],
     request: &FollowRequest,
 ) -> io::Result<Target> {
     if let Some(path) = &request.path {
@@ -101,10 +109,14 @@ fn resolve_target(
                 format!("transcript not found: {}", path.display()),
             ));
         }
-        return Ok(Target {
-            source_id: String::new(),
-            path,
-        });
+        // A transcript the corpus has read keeps its source id, as its references do.
+        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let source_id = catalog
+            .values()
+            .find(|entry| Path::new(&entry.path) == canonical)
+            .map(|entry| entry.source_id.clone())
+            .unwrap_or_default();
+        return Ok(Target { source_id, path });
     }
     if let Some(source_id) = &request.source_id {
         let entry = catalog.get(source_id).ok_or_else(|| {
@@ -132,8 +144,8 @@ fn resolve_target(
             });
         }
         let mut found: Vec<(u64, PathBuf)> = Vec::new();
-        for input in corpus::registered_sources(root)? {
-            collect_session_files(Path::new(&input), session, &mut found, 0)?;
+        for input in inputs {
+            collect_session_files(Path::new(input), session, &mut found, 0)?;
         }
         found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         let Some((_, path)) = found.into_iter().next() else {
@@ -237,9 +249,11 @@ fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
     }
 }
 
-/// Read every complete line after `cursor`; return the messages found and the
-/// boundary after the last line read. `lines` counts the lines before `cursor`
-/// and is moved past the lines read.
+/// Read the complete lines after `cursor`; return the messages found and the
+/// boundary after the last line they account for. `lines` counts the lines
+/// before `cursor` and is moved past the lines read. Once `limit` messages are
+/// found, the lines after them are still read up to the next message, so that a
+/// copy of a message already returned is not returned by the next call.
 fn scan(
     path: &Path,
     reader: &mut LogReader,
@@ -256,7 +270,9 @@ fn scan(
     let mut bounded = input.take(size - cursor);
     let mut line = Vec::new();
     let mut messages = Vec::new();
+    let mut seen = SeenMessages::default();
     let mut position = cursor;
+    let mut end = cursor;
     while let Some(read) = corpus::read_bounded_line(&mut bounded, &mut line)? {
         if !read.complete {
             break;
@@ -265,14 +281,23 @@ fn scan(
         let byte_start = position;
         position += read.total_len;
         *lines += 1;
-        if let Some(message) = message(&record, request, *lines, byte_start, read.total_len) {
-            messages.push(message);
+        let found = message(
+            &record,
+            request,
+            &mut seen,
+            *lines,
+            byte_start,
+            read.total_len,
+        );
+        if let Some(found) = found {
             if messages.len() >= request.limit {
                 break;
             }
+            messages.push(found);
         }
+        end = position;
     }
-    Ok((messages, position))
+    Ok((messages, end))
 }
 
 fn value<'a>(fields: &'a [Field], path: &str) -> Option<&'a str> {
@@ -292,24 +317,26 @@ fn value<'a>(fields: &'a [Field], path: &str) -> Option<&'a str> {
 /// person's messages are those `said` lists (`core::persons_message`), with the
 /// text `said` shows: without the blocks the tools inject, and imported copies
 /// only for `--sender any`.
+/// The message a record carries, from the sender the corpus gives it.
+///
+/// The person's messages are the records `core::persons_message` names, in
+/// whatever shape the log writes them, with the text `said` shows: without the
+/// blocks the tools inject, listed once when written twice (`SeenMessages`),
+/// and imported copies only for `--sender any`. The other senders' messages are
+/// the records that carry one in either format: in Codex `/type =
+/// response_item` with `/payload/type = message` and text parts under
+/// `/payload/content/<n>/text`; in Claude Code `/type = assistant|user` with
+/// text parts under `/message/content`, or a plain string content, and a prompt
+/// typed while the agent was working, a `queued_command` attachment with the
+/// text in `/attachment/prompt`.
 fn message(
     record: &ReadRecord,
     request: &FollowRequest,
+    seen: &mut SeenMessages,
     line: u64,
     byte_start: u64,
     byte_len: u64,
 ) -> Option<Message> {
-    let fields = record.fields.as_slice();
-    let text = match value(fields, "/type")? {
-        "response_item" if value(fields, "/payload/type") == Some("message") => {
-            collect_text(fields, "/payload/content/", &["input_text", "output_text"])
-        }
-        "assistant" | "user" => plain_or_parts(fields, "/message/content"),
-        "attachment" if value(fields, "/attachment/type") == Some("queued_command") => {
-            plain_or_parts(fields, "/attachment/prompt")
-        }
-        _ => return None,
-    };
     let meta = &record.event.meta;
     let persons = persons_message(meta.sender.as_str(), &meta.via);
     let wanted = match request.sender.as_str() {
@@ -320,9 +347,16 @@ fn message(
     if !wanted {
         return None;
     }
+    let timestamp = meta.timestamp.clone().unwrap_or_default();
     let (text, images) = match persons {
-        Some(_) => human_text_from_body(&record.event.body),
-        None => (text, 0),
+        Some(_) => {
+            let (text, images) = human_text_from_body(&record.event.body);
+            if !seen.first(&timestamp, &text) {
+                return None;
+            }
+            (text, images)
+        }
+        None => (message_text(&record.fields)?, 0),
     };
     if text.trim().is_empty() && images == 0 {
         return None;
@@ -335,12 +369,26 @@ fn message(
     Some(Message {
         sender: meta.sender.as_str(),
         via: meta.via.clone(),
-        timestamp: meta.timestamp.clone().unwrap_or_default(),
+        timestamp,
         line,
         byte_start,
         byte_len,
         text,
         images,
+    })
+}
+
+/// The text of a record that carries a message of another sender than the person.
+fn message_text(fields: &[Field]) -> Option<String> {
+    Some(match value(fields, "/type")? {
+        "response_item" if value(fields, "/payload/type") == Some("message") => {
+            collect_text(fields, "/payload/content/", &["input_text", "output_text"])
+        }
+        "assistant" | "user" => plain_or_parts(fields, "/message/content"),
+        "attachment" if value(fields, "/attachment/type") == Some("queued_command") => {
+            plain_or_parts(fields, "/attachment/prompt")
+        }
+        _ => return None,
     })
 }
 
