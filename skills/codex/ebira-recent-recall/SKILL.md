@@ -73,6 +73,7 @@ PowerShell).
 | `system` | Tool results, notifications, injected context |
 | `summary` | A compaction summary |
 | `assistant` | The recording agent's replies and tool calls |
+| `unknown` | A record in a log format that marks no sender |
 
 `human` means the person sent it, not that every word in it is theirs: a message
 can quote or paste another model's answer, a review, or a document. Take the

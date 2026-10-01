@@ -129,6 +129,7 @@ event:
 | `system` | Tool results, notifications, injected context, skill text, harness metadata |
 | `summary` | A compaction summary |
 | `assistant` | The recording agent's replies and tool calls |
+| `unknown` | A record in a log format that marks no sender |
 
 `human` marks what the person sent, including text they pasted into a message:
 another model's answer, a review, a document. Their own words in it are their

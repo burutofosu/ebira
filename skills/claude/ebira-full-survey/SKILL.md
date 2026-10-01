@@ -70,6 +70,7 @@ If it reports `source_changed_since_projection`, run `ebira sync` and search aga
 | `system` | Tool results, notifications, injected context |
 | `summary` | A compaction summary |
 | `assistant` | The recording agent's replies and tool calls |
+| `unknown` | A record in a log format that marks no sender |
 
 `human` means the person sent it; text they quoted or pasted inside it (another
 model's opinion, a review, a document) is material they shared, not their
