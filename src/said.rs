@@ -7,7 +7,8 @@
 
 use crate::core::{human_text_from_body, persons_message, PersonsMessage, SeenMessages, Sender};
 use crate::corpus::{self, SourceEntry};
-use crate::format::{json_string, parse_event_header, EventHeader};
+use crate::format::{parse_event_header, EventHeader};
+use crate::json;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -22,8 +23,8 @@ pub struct SaidRequest {
     pub source_id: Option<String>,
     /// Case-insensitive substring of the working directory the message was sent in.
     pub cwd: Option<String>,
-    /// `claude` or `codex`: the agent whose log recorded the message.
-    pub agent: Option<String>,
+    /// `claude` or `codex`: the app whose log recorded the message.
+    pub app: Option<String>,
     pub query: Option<String>,
     pub fold_ascii_case: bool,
     pub from: Option<String>,
@@ -65,7 +66,7 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
         request.source_id.as_deref(),
         request.session.as_deref(),
     );
-    if let Some(app) = request.agent.as_deref() {
+    if let Some(app) = request.app.as_deref() {
         scope.sources.retain(|entry| entry.app == app);
         scope.whole = false;
     }
@@ -153,65 +154,49 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
         );
         return Ok(());
     }
-    let mut output = String::from("{");
-    field(
-        &mut output,
-        "disposition",
-        if total == 0 {
-            "no_human_messages"
-        } else if has_more {
-            "result_page_truncated"
-        } else {
-            "ready"
-        },
-        true,
-    );
-    field(&mut output, "mode", "said", false);
-    field(
-        &mut output,
-        "order",
-        if request.newest_first { "desc" } else { "asc" },
-        false,
-    );
-    output.push_str(",\"applied_filters\":{");
-    optional_field(&mut output, "session", request.session.as_deref(), true);
-    optional_field(
-        &mut output,
-        "source_id",
-        request.source_id.as_deref(),
-        false,
-    );
-    optional_field(&mut output, "cwd", request.cwd.as_deref(), false);
-    optional_field(&mut output, "agent", request.agent.as_deref(), false);
-    optional_field(&mut output, "query", request.query.as_deref(), false);
-    optional_field(&mut output, "from", request.from.as_deref(), false);
-    optional_field(&mut output, "to", request.to.as_deref(), false);
-    output.push('}');
-    number(&mut output, "total_messages", total);
-    number(&mut output, "copies_skipped", copies);
-    number(&mut output, "imported_skipped", imported);
-    number(&mut output, "returned", page.len() as u64);
-    number(&mut output, "offset", request.offset);
-    boolean(&mut output, "truncated", has_more);
-    if has_more {
-        number(&mut output, "next_offset", next_offset);
-    }
-    number(&mut output, "max_chars", request.max_chars as u64);
-    number(&mut output, "scanned_files", files.len() as u64);
-    number(&mut output, "scanned_bytes", scanned_bytes);
-    number(&mut output, "sources_in_scope", scope.sources.len() as u64);
-    number(&mut output, "stale_sources", stale_sources);
-    number(&mut output, "unscanned_source_bytes", unscanned_bytes);
-    number(&mut output, "duration_ms", duration_ms);
-    output.push_str(",\"messages\":[");
-    for (index, (said, text, cut)) in page.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&message_json(said, text, *cut, request.offset_minutes));
-    }
-    output.push_str("]}\n");
-    print!("{}", output);
+    let filters = json::Object::new()
+        .optional("session", request.session.as_deref())
+        .optional("source_id", request.source_id.as_deref())
+        .optional("cwd", request.cwd.as_deref())
+        .optional("app", request.app.as_deref())
+        .optional("query", request.query.as_deref())
+        .optional("from", request.from.as_deref())
+        .optional("to", request.to.as_deref())
+        .finish();
+    let messages = page
+        .iter()
+        .map(|(said, text, cut)| message_json(said, text, *cut, request.offset_minutes));
+    let output = json::Object::new()
+        .name(
+            "disposition",
+            if total == 0 {
+                "no_human_messages"
+            } else if has_more {
+                "result_page_truncated"
+            } else {
+                "ready"
+            },
+        )
+        .name("mode", "said")
+        .name("order", if request.newest_first { "desc" } else { "asc" })
+        .raw("applied_filters", &filters)
+        .number("total_messages", total)
+        .number("copies_skipped", copies)
+        .number("imported_skipped", imported)
+        .number("returned", page.len() as u64)
+        .number("offset", request.offset)
+        .boolean("truncated", has_more)
+        .optional_number("next_offset", has_more.then_some(next_offset))
+        .number("max_chars", request.max_chars as u64)
+        .number("scanned_files", files.len() as u64)
+        .number("scanned_bytes", scanned_bytes)
+        .number("sources_in_scope", scope.sources.len() as u64)
+        .number("stale_sources", stale_sources)
+        .number("unscanned_source_bytes", unscanned_bytes)
+        .number("duration_ms", duration_ms)
+        .raw("messages", &json::array(messages))
+        .finish();
+    println!("{}", output);
     Ok(())
 }
 
@@ -313,32 +298,28 @@ fn local_time(timestamp: &str, offset_minutes: i64) -> String {
 
 fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> String {
     let header = &said.header;
-    let mut output = String::from("{");
-    field(&mut output, "timestamp", &header.timestamp, true);
-    field(
-        &mut output,
-        "local_time",
-        &local_time(&header.timestamp, offset_minutes),
-        false,
-    );
-    field(&mut output, "agent", &said.app, false);
-    field(&mut output, "via", &header.via, false);
-    field(&mut output, "session", &header.session, false);
-    field(&mut output, "cwd", &header.cwd, false);
-    field(&mut output, "text", text, false);
-    number(&mut output, "chars", said.text.chars().count() as u64);
-    boolean(&mut output, "text_truncated", cut);
-    number(&mut output, "images", said.images as u64);
-    output.push_str(&format!(
-        ",\"source_ref\":{{\"source_id\":{},\"source_path\":{},\"line\":{},\"byte_start\":{},\"byte_len\":{}}}",
-        json_string(&header.source_id),
-        json_string(&said.source_path),
-        header.line,
-        header.byte_start,
-        header.byte_len,
-    ));
-    output.push('}');
-    output
+    json::Object::new()
+        .name("timestamp", &header.timestamp)
+        .name("local_time", &local_time(&header.timestamp, offset_minutes))
+        .name("app", &said.app)
+        .name("via", &header.via)
+        .name("session", &header.session)
+        .name("cwd", &header.cwd)
+        .text("text", text)
+        .number("chars", said.text.chars().count() as u64)
+        .boolean("text_truncated", cut)
+        .number("images", said.images as u64)
+        .raw(
+            "source_ref",
+            &json::source_ref(
+                &header.source_id,
+                &said.source_path,
+                Some(header.line),
+                header.byte_start,
+                header.byte_len,
+            ),
+        )
+        .finish()
 }
 
 fn text_output(
@@ -396,29 +377,4 @@ fn text_output(
         output.push_str(&format!("\n# more: --offset {}\n", next_offset));
     }
     output
-}
-
-fn field(output: &mut String, key: &str, value: &str, first: bool) {
-    if !first {
-        output.push(',');
-    }
-    output.push_str(&format!("\"{}\":{}", key, json_string(value)));
-}
-
-fn optional_field(output: &mut String, key: &str, value: Option<&str>, first: bool) {
-    if !first {
-        output.push(',');
-    }
-    match value {
-        Some(value) => output.push_str(&format!("\"{}\":{}", key, json_string(value))),
-        None => output.push_str(&format!("\"{}\":null", key)),
-    }
-}
-
-fn number(output: &mut String, key: &str, value: u64) {
-    output.push_str(&format!(",\"{}\":{}", key, value));
-}
-
-fn boolean(output: &mut String, key: &str, value: bool) {
-    output.push_str(&format!(",\"{}\":{}", key, value));
 }

@@ -3,9 +3,10 @@ use crate::core::{
     RecoverySnapshot, RecoveryState, SeenMessages, Sender, SourceRef,
 };
 use crate::corpus::{self, SourceEntry};
-use crate::format::{body_fields, json_string, parse_event_header, push_field};
+use crate::format::{body_fields, parse_event_header, push_field};
+use crate::json;
 use crate::jsonl::{parse_record, Field};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -130,81 +131,74 @@ pub fn resume(
 
     let boundary_reached = corpus::source_is_complete(entry);
     let freshness = corpus::freshness(entry);
-    let disposition = resume_disposition(entry);
     let source_path = &entry.path;
-    let latest_event = current.events.last();
-    let completion = completion_state(&current, entry);
-    let current_turn_state = current_turn_state(&current);
-    let mut output = String::new();
-    output.push('{');
-    field(&mut output, "disposition", disposition, true);
-    field(&mut output, "mode", "resume", false);
-    field(&mut output, "source_id", &source_id, false);
-    field(&mut output, "source_path", source_path, false);
-    field(&mut output, "source_disposition", &entry.disposition, false);
-    field(&mut output, "completion_state", completion, false);
-    field(&mut output, "current_turn_state", current_turn_state, false);
-    field(
-        &mut output,
-        "source_boundary_state",
-        if boundary_reached { "reached" } else { "open" },
-        false,
-    );
-    output.push_str(",\"observed_boundary\":{");
-    field(&mut output, "source_id", &source_id, true);
-    number(&mut output, "byte_end", entry.committed_byte_end);
-    number(&mut output, "source_size", entry.size);
-    number(&mut output, "last_line", entry.last_line);
-    number(&mut output, "event_count", entry.event_count);
-    output.push('}');
+    let observed_boundary = json::Object::new()
+        .name("source_id", &source_id)
+        .number("byte_end", entry.committed_byte_end)
+        .number("source_size", entry.size)
+        .number("last_line", entry.last_line)
+        .number("event_count", entry.event_count)
+        .finish();
+    let next_cursor = json::Object::new()
+        .name("source_id", &source_id)
+        .number(
+            "after_event_index",
+            scanned
+                .latest_event_index
+                .unwrap_or(entry.event_count.saturating_sub(1)),
+        )
+        .number("after_byte", entry.committed_byte_end)
+        .finish();
+    let mut output = json::Object::new();
+    output
+        .name("disposition", resume_disposition(entry))
+        .name("mode", "resume")
+        .name("source_id", &source_id)
+        .name("source_path", source_path)
+        .name("source_disposition", &entry.disposition)
+        .name("current_turn_state", current_turn_state(&current))
+        .name(
+            "source_boundary_state",
+            if boundary_reached { "reached" } else { "open" },
+        )
+        .raw("observed_boundary", &observed_boundary);
     freshness_fields(&mut output, boundary_reached, freshness);
-    boolean(&mut output, "checkpoint_valid", entry.checkpoint_valid);
-    number(&mut output, "committed_byte_end", entry.committed_byte_end);
-    number(&mut output, "source_size", entry.size);
-    field(&mut output, "session_id", &current.session, false);
-    field(&mut output, "latest_turn_id", &current.turn, false);
-    number(&mut output, "matched_events", scanned.matched_events);
-    output.push_str(",\"current\":");
-    output.push_str(&snapshot_json(&current, source_path));
-    output.push_str(",\"latest_human_message\":");
-    output.push_str(
-        scanned
-            .humans
-            .last()
-            .map(|event| event_json(event, source_path))
-            .unwrap_or_else(|| "null".to_string())
-            .as_str(),
-    );
-    output.push_str(",\"compactions\":");
-    output.push_str(&compactions_json(&scanned));
-    output.push_str(",\"latest_event\":");
-    output.push_str(
-        latest_event
-            .map(|event| event_json(event, source_path))
-            .unwrap_or_else(|| "null".to_string())
-            .as_str(),
-    );
-    output.push_str(",\"previous_turn\":");
-    output.push_str(
-        scanned
-            .previous
-            .as_ref()
-            .map(|turn| snapshot_json(turn, source_path))
-            .unwrap_or_else(|| "null".to_string())
-            .as_str(),
-    );
-    output.push_str(",\"next_cursor\":{");
-    field(&mut output, "source_id", &source_id, true);
-    number(
-        &mut output,
-        "after_event_index",
-        scanned
-            .latest_event_index
-            .unwrap_or(entry.event_count.saturating_sub(1)),
-    );
-    number(&mut output, "after_byte", entry.committed_byte_end);
-    output.push_str("}}\n");
-    print!("{}", output);
+    output
+        .boolean("checkpoint_valid", entry.checkpoint_valid)
+        .name("session_id", &current.session)
+        .name("latest_turn_id", &current.turn)
+        .number("matched_events", scanned.matched_events)
+        .raw("current", &snapshot_json(&current, source_path))
+        .raw(
+            "latest_human_message",
+            &json::or_null(
+                scanned
+                    .humans
+                    .last()
+                    .map(|event| event_json(event, source_path)),
+            ),
+        )
+        .raw("compactions", &compactions_json(&scanned))
+        .raw(
+            "latest_event",
+            &json::or_null(
+                current
+                    .events
+                    .last()
+                    .map(|event| event_json(event, source_path)),
+            ),
+        )
+        .raw(
+            "previous_turn",
+            &json::or_null(
+                scanned
+                    .previous
+                    .as_ref()
+                    .map(|turn| snapshot_json(turn, source_path)),
+            ),
+        )
+        .raw("next_cursor", &next_cursor);
+    println!("{}", output.finish());
     Ok(())
 }
 
@@ -335,12 +329,11 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
 }
 
 fn compactions_json(scanned: &ScanResult) -> String {
-    let mut output = String::from("{");
-    output.push_str(&format!("\"count\":{}", scanned.compactions));
-    field(&mut output, "last_at", &scanned.last_compaction_at, false);
-    number(&mut output, "summaries_seen", scanned.summaries);
-    output.push('}');
-    output
+    json::Object::new()
+        .number("count", scanned.compactions)
+        .name("last_at", &scanned.last_compaction_at)
+        .number("summaries_seen", scanned.summaries)
+        .finish()
 }
 
 /// `resume --brief`: the person's recent messages in full, the agent's latest words and
@@ -355,29 +348,7 @@ fn brief_json(
     let source_path = &entry.path;
     let boundary_reached = corpus::source_is_complete(entry);
     let freshness = corpus::freshness(entry);
-    let mut output = String::from("{");
-    field(&mut output, "disposition", resume_disposition(entry), true);
-    field(&mut output, "mode", "resume_brief", false);
-    field(&mut output, "source_id", source_id, false);
-    field(&mut output, "source_path", source_path, false);
-    field(&mut output, "session_id", &current.session, false);
-    field(&mut output, "latest_turn_id", &current.turn, false);
-    field(
-        &mut output,
-        "current_turn_state",
-        current_turn_state(current),
-        false,
-    );
-    output.push_str(",\"cwd\":");
-    output.push_str(&string_array(&current.cwd));
-    output.push_str(",\"observed_boundary\":{");
-    field(&mut output, "source_id", source_id, true);
-    number(&mut output, "byte_end", entry.committed_byte_end);
-    number(&mut output, "source_size", entry.size);
-    output.push('}');
-    freshness_fields(&mut output, boundary_reached, freshness);
-    output.push_str(",\"compactions\":");
-    output.push_str(&compactions_json(scanned));
+    let source_ref = |event: &RecoveryEvent| source_ref_json(&event.source_ref, source_path);
 
     let mut budget = BRIEF_HUMAN_TEXT_BUDGET;
     let mut humans = Vec::new();
@@ -385,35 +356,23 @@ fn brief_json(
         let (text, images) = human_text_from_body(&event.body);
         let (text, cut) = bounded(&text, BRIEF_HUMAN_TEXT_LIMIT.min(budget));
         budget = budget.saturating_sub(text.chars().count());
-        humans.push((Arc::clone(event), text, cut, images));
+        humans.push(
+            json::Object::new()
+                .name("timestamp", &event.timestamp)
+                .name("via", &event.via)
+                .text("text", &text)
+                .boolean("text_truncated", cut)
+                .number("images", images as u64)
+                .raw("source_ref", &source_ref(event))
+                .finish(),
+        );
         if budget == 0 {
             break;
         }
     }
     humans.reverse();
-    number(&mut output, "human_messages_seen", scanned.humans_seen);
-    number(&mut output, "human_messages_returned", humans.len() as u64);
-    number(&mut output, "copies_skipped", scanned.copies_skipped);
-    number(&mut output, "imported_skipped", scanned.imported_skipped);
-    output.push_str(",\"human_messages\":[");
-    for (index, (event, text, cut, images)) in humans.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        field(&mut output, "timestamp", &event.timestamp, true);
-        field(&mut output, "via", &event.via, false);
-        field(&mut output, "text", text, false);
-        boolean(&mut output, "text_truncated", *cut);
-        number(&mut output, "images", *images as u64);
-        output.push_str(",\"source_ref\":");
-        output.push_str(&source_ref_json(&event.source_ref, source_path));
-        output.push('}');
-    }
-    output.push(']');
+    let human_count = humans.len() as u64;
 
-    output.push_str(",\"latest_assistant_texts\":[");
-    let mut written = 0usize;
     let mut texts = Vec::new();
     for event in scanned.recent_assistants.iter().rev() {
         if texts.len() == BRIEF_ASSISTANT_TEXTS {
@@ -423,75 +382,98 @@ fn brief_json(
             .map(|fields| assistant_text(&fields))
             .unwrap_or_default();
         if !text.trim().is_empty() {
-            texts.push((Arc::clone(event), text));
+            let (text, cut) = bounded(text.trim(), BRIEF_ASSISTANT_TEXT_LIMIT);
+            texts.push(
+                json::Object::new()
+                    .name("timestamp", &event.timestamp)
+                    .text("text", &text)
+                    .boolean("text_truncated", cut)
+                    .raw("source_ref", &source_ref(event))
+                    .finish(),
+            );
         }
     }
-    for (event, text) in texts.iter().rev() {
-        let (text, cut) = bounded(text.trim(), BRIEF_ASSISTANT_TEXT_LIMIT);
-        if written != 0 {
-            output.push(',');
-        }
-        written += 1;
-        output.push('{');
-        field(&mut output, "timestamp", &event.timestamp, true);
-        field(&mut output, "text", &text, false);
-        boolean(&mut output, "text_truncated", cut);
-        output.push_str(",\"source_ref\":");
-        output.push_str(&source_ref_json(&event.source_ref, source_path));
-        output.push('}');
-    }
-    output.push(']');
+    texts.reverse();
 
-    output.push_str(",\"latest_commands\":[");
-    for (index, event) in scanned.recent_commands.iter().enumerate() {
+    let commands = scanned.recent_commands.iter().map(|event| {
         let calls = original_fields(source_path, &event.source_ref)
             .map(|fields| tool_calls(&fields))
             .unwrap_or_default();
-        let (name, input) = calls
-            .into_iter()
-            .last()
-            .unwrap_or_else(|| (event.event_type.clone(), event.body.clone()));
+        let (name, input) = calls.into_iter().last().unwrap_or_else(|| {
+            let values = body_fields(&event.body)
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>();
+            (event.event_type.clone(), values.join("\n"))
+        });
         let (input, cut) = bounded(&input, BRIEF_COMMAND_LIMIT);
-        if index != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        field(&mut output, "timestamp", &event.timestamp, true);
-        field(&mut output, "name", &name, false);
-        field(&mut output, "input", &input, false);
-        boolean(&mut output, "input_truncated", cut);
-        output.push_str(",\"source_ref\":");
-        output.push_str(&source_ref_json(&event.source_ref, source_path));
-        output.push('}');
-    }
-    output.push(']');
-    output.push_str(",\"next_cursor\":{");
-    field(&mut output, "source_id", source_id, true);
-    number(&mut output, "after_byte", entry.committed_byte_end);
-    output.push_str("}}\n");
+        json::Object::new()
+            .name("timestamp", &event.timestamp)
+            .name("name", &name)
+            .text("input", &input)
+            .boolean("input_truncated", cut)
+            .raw("source_ref", &source_ref(event))
+            .finish()
+    });
+
+    let observed_boundary = json::Object::new()
+        .name("source_id", source_id)
+        .number("byte_end", entry.committed_byte_end)
+        .number("source_size", entry.size)
+        .finish();
+    let next_cursor = json::Object::new()
+        .name("source_id", source_id)
+        .number("after_byte", entry.committed_byte_end)
+        .finish();
+    let mut output = json::Object::new();
     output
+        .name("disposition", resume_disposition(entry))
+        .name("mode", "resume_brief")
+        .name("source_id", source_id)
+        .name("source_path", source_path)
+        .name("session_id", &current.session)
+        .name("latest_turn_id", &current.turn)
+        .name("current_turn_state", current_turn_state(current))
+        .raw(
+            "cwd",
+            &json::strings(current.cwd.iter().map(String::as_str)),
+        )
+        .raw("observed_boundary", &observed_boundary);
+    freshness_fields(&mut output, boundary_reached, freshness);
+    output
+        .raw("compactions", &compactions_json(scanned))
+        .number("human_messages_seen", scanned.humans_seen)
+        .number("human_messages_returned", human_count)
+        .number("copies_skipped", scanned.copies_skipped)
+        .number("imported_skipped", scanned.imported_skipped)
+        .raw("human_messages", &json::array(humans))
+        .raw("latest_assistant_texts", &json::array(texts))
+        .raw("latest_commands", &json::array(commands))
+        .raw("next_cursor", &next_cursor);
+    let mut text = output.finish();
+    text.push('\n');
+    text
 }
 
 /// How the transcript stands against the result: `source_freshness` and the bytes the corpus
 /// has not read (`corpus::freshness`), and the next step. A transcript still being written is
 /// `behind` until the next sync.
-fn freshness_fields(output: &mut String, boundary_reached: bool, freshness: corpus::Freshness) {
-    field(output, "source_freshness", freshness.as_str(), false);
-    number(
-        output,
-        "unscanned_source_bytes",
-        freshness.unscanned_bytes(),
-    );
-    field(
-        output,
-        "next_recall",
-        match freshness {
-            corpus::Freshness::Unreachable => "source_unreachable",
-            corpus::Freshness::Current if boundary_reached => "none",
-            _ => "sync_then_resume",
-        },
-        false,
-    );
+fn freshness_fields(
+    output: &mut json::Object,
+    boundary_reached: bool,
+    freshness: corpus::Freshness,
+) {
+    output
+        .name("source_freshness", freshness.as_str())
+        .number("unscanned_source_bytes", freshness.unscanned_bytes())
+        .name(
+            "next_recall",
+            match freshness {
+                corpus::Freshness::Unreachable => "source_unreachable",
+                corpus::Freshness::Current if boundary_reached => "none",
+                _ => "sync_then_resume",
+            },
+        );
 }
 
 fn bounded(text: &str, limit: usize) -> (String, bool) {
@@ -502,11 +484,10 @@ fn bounded(text: &str, limit: usize) -> (String, bool) {
 }
 
 fn source_ref_json(source_ref: &SourceRef, source_path: &str) -> String {
-    format!(
-        "{{\"source_id\":{},\"source_path\":{},\"line\":{},\"byte_start\":{},\"byte_len\":{}}}",
-        json_string(&source_ref.source_id),
-        json_string(source_path),
-        source_ref.line,
+    json::source_ref(
+        &source_ref.source_id,
+        source_path,
+        Some(source_ref.line),
         source_ref.byte_start,
         source_ref.byte_len,
     )
@@ -707,119 +688,77 @@ fn skip_body_and_separator<R: Read>(reader: &mut R, body_len: u64) -> io::Result
 
 fn snapshot_json(snapshot: &RecoverySnapshot, source_path: &str) -> String {
     let partial = snapshot.reentered;
-    let mut output = String::new();
-    output.push('{');
-    field(&mut output, "session_id", &snapshot.session, true);
-    field(&mut output, "turn_id", &snapshot.turn, false);
-    number(&mut output, "events_seen", snapshot.events_seen);
-    number(&mut output, "events_returned", snapshot.events.len() as u64);
-    boolean(
-        &mut output,
-        "events_truncated",
-        partial || snapshot.events_seen > snapshot.events.len() as u64,
-    );
-    number(&mut output, "user_messages_seen", snapshot.users_seen);
-    number(
-        &mut output,
-        "user_messages_returned",
-        snapshot.users.len() as u64,
-    );
-    boolean(
-        &mut output,
-        "user_messages_truncated",
-        partial || snapshot.users_seen > snapshot.users.len() as u64,
-    );
-    number(
-        &mut output,
-        "assistant_messages_seen",
-        snapshot.assistants_seen,
-    );
-    number(
-        &mut output,
-        "assistant_messages_returned",
-        snapshot.assistants.len() as u64,
-    );
-    boolean(
-        &mut output,
-        "assistant_messages_truncated",
-        partial || snapshot.assistants_seen > snapshot.assistants.len() as u64,
-    );
-    number(&mut output, "commands_seen", snapshot.commands_seen);
-    number(
-        &mut output,
-        "commands_returned",
-        snapshot.commands.len() as u64,
-    );
-    boolean(
-        &mut output,
-        "commands_truncated",
-        partial || snapshot.commands_seen > snapshot.commands.len() as u64,
-    );
-    number(&mut output, "outputs_seen", snapshot.outputs_seen);
-    number(
-        &mut output,
-        "outputs_returned",
-        snapshot.outputs.len() as u64,
-    );
-    boolean(
-        &mut output,
-        "outputs_truncated",
-        partial || snapshot.outputs_seen > snapshot.outputs.len() as u64,
-    );
-    boolean(&mut output, "completed", snapshot.completed);
-    output.push_str(",\"cwd\":");
-    output.push_str(&string_array(&snapshot.cwd));
-    output.push_str(",\"repositories\":");
-    output.push_str(&string_array(&snapshot.repositories));
-    output.push_str(",\"user_messages\":");
-    output.push_str(&events_json(&snapshot.users, source_path));
-    output.push_str(",\"assistant_messages\":");
-    output.push_str(&events_json(&snapshot.assistants, source_path));
-    output.push_str(",\"commands\":");
-    output.push_str(&events_json(&snapshot.commands, source_path));
-    output.push_str(",\"outputs\":");
-    output.push_str(&events_json(&snapshot.outputs, source_path));
-    output.push_str(",\"events\":");
-    output.push_str(&events_json(&snapshot.events, source_path));
-    output.push('}');
+    let mut output = json::Object::new();
     output
+        .name("session_id", &snapshot.session)
+        .name("turn_id", &snapshot.turn)
+        .boolean("completed", snapshot.completed)
+        .raw(
+            "cwd",
+            &json::strings(snapshot.cwd.iter().map(String::as_str)),
+        )
+        .raw(
+            "repositories",
+            &json::strings(snapshot.repositories.iter().map(String::as_str)),
+        );
+    for (name, seen, events) in [
+        ("events", snapshot.events_seen, &snapshot.events),
+        ("user_messages", snapshot.users_seen, &snapshot.users),
+        (
+            "assistant_messages",
+            snapshot.assistants_seen,
+            &snapshot.assistants,
+        ),
+        ("commands", snapshot.commands_seen, &snapshot.commands),
+        ("outputs", snapshot.outputs_seen, &snapshot.outputs),
+    ] {
+        output
+            .number(&format!("{name}_seen"), seen)
+            .number(&format!("{name}_returned"), events.len() as u64)
+            .boolean(
+                &format!("{name}_truncated"),
+                partial || seen > events.len() as u64,
+            )
+            .raw(name, &events_json(events, source_path));
+    }
+    output.finish()
 }
 
 fn events_json(events: &[Arc<RecoveryEvent>], source_path: &str) -> String {
-    let mut output = String::from("[");
-    for (index, event) in events.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&event_json(event, source_path));
-    }
-    output.push(']');
-    output
+    json::array(events.iter().map(|event| event_json(event, source_path)))
 }
 
 fn event_json(event: &RecoveryEvent, source_path: &str) -> String {
     let source_ref = &event.source_ref;
-    format!(
-        "{{\"event_id\":{},\"source_ref\":{{\"source_id\":{},\"source_path\":{},\"line\":{},\"byte_start\":{},\"byte_len\":{}}},\"session\":{},\"turn\":{},\"kind\":{},\"role\":{},\"sender\":{},\"via\":{},\"event_type\":{},\"timestamp\":{},\"call_id\":{},\"body\":{},\"body_truncated\":{},\"embedded_history\":{}}}",
-        json_string(&format!("{}:{}", source_ref.source_id, event.event_index)),
-        json_string(&source_ref.source_id),
-        json_string(source_path),
-        source_ref.line,
-        source_ref.byte_start,
-        source_ref.byte_len,
-        json_string(&event.session),
-        json_string(&event.turn),
-        json_string(event.kind.as_str()),
-        json_string(&event.role),
-        json_string(event.sender.as_str()),
-        json_string(&event.via),
-        json_string(&event.event_type),
-        json_string(&event.timestamp),
-        json_string(&event.call_id),
-        json_string(&event.body),
-        event.body_truncated,
-        event.embedded_history,
-    )
+    json::Object::new()
+        .name(
+            "event_id",
+            &format!("{}:{}", source_ref.source_id, event.event_index),
+        )
+        .raw("source_ref", &source_ref_json(source_ref, source_path))
+        .name("session", &event.session)
+        .name("turn", &event.turn)
+        .name("kind", event.kind.as_str())
+        .name("role", &event.role)
+        .name("sender", event.sender.as_str())
+        .name("via", &event.via)
+        .name("event_type", &event.event_type)
+        .name("timestamp", &event.timestamp)
+        .name("call_id", &event.call_id)
+        .raw("fields", &fields_json(&event.body))
+        .boolean("fields_truncated", event.body_truncated)
+        .boolean("embedded_history", event.embedded_history)
+        .finish()
+}
+
+/// The fields a corpus body keeps, in order, each with its path.
+fn fields_json(body: &str) -> String {
+    json::array(body_fields(body).iter().map(|(path, value)| {
+        json::Object::new()
+            .name("path", path)
+            .text("value", value)
+            .finish()
+    }))
 }
 
 fn sort_by_recency(
@@ -893,62 +832,49 @@ fn print_ambiguous(
     candidates: &[String],
     requested_session: Option<&str>,
 ) {
-    let mut output = String::new();
-    output.push('{');
-    field(
-        &mut output,
-        "disposition",
-        "ambiguous_current_session",
-        true,
+    let listed = candidates.iter().take(50).filter_map(|source_id| {
+        let entry = catalog.get(source_id)?;
+        Some(
+            json::Object::new()
+                .name("source_id", source_id)
+                .name("source_path", &entry.path)
+                .name("last_session", &entry.last_session)
+                .optional(
+                    "last_event_at",
+                    last_event_at.get(source_id).map(String::as_str),
+                )
+                .number("modified_ms", entry.modified_ms)
+                .number("synced_at_ms", entry.synced_at_ms)
+                .name("disposition", &entry.disposition)
+                .finish(),
+        )
+    });
+    println!(
+        "{}",
+        json::Object::new()
+            .name("disposition", "ambiguous_current_session")
+            .name("mode", "resume")
+            .optional("requested_session", requested_session)
+            .name(
+                "candidate_order",
+                "last_event_at_desc_then_modified_ms_desc"
+            )
+            .number("candidate_count", candidates.len() as u64)
+            .number("candidates_returned", candidates.len().min(50) as u64)
+            .boolean("candidates_truncated", candidates.len() > 50)
+            .raw("candidates", &json::array(listed))
+            .finish()
     );
-    field(&mut output, "mode", "resume", false);
-    if let Some(session) = requested_session {
-        field(&mut output, "requested_session", session, false);
-    }
-    field(
-        &mut output,
-        "candidate_order",
-        "last_event_at_desc_then_modified_ms_desc",
-        false,
-    );
-    number(&mut output, "candidate_count", candidates.len() as u64);
-    number(
-        &mut output,
-        "candidates_returned",
-        candidates.len().min(50) as u64,
-    );
-    boolean(&mut output, "candidates_truncated", candidates.len() > 50);
-    output.push_str(",\"candidates\":[");
-    for (index, source_id) in candidates.iter().take(50).enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        if let Some(entry) = catalog.get(source_id) {
-            let last_event_at = last_event_at
-                .get(source_id)
-                .map(|timestamp| json_string(timestamp))
-                .unwrap_or_else(|| "null".to_string());
-            output.push_str(&format!(
-                "{{\"source_id\":{},\"source_path\":{},\"last_session\":{},\"last_event_at\":{},\"modified_ms\":{},\"synced_at_ms\":{},\"disposition\":{}}}",
-                json_string(source_id),
-                json_string(&entry.path),
-                json_string(&entry.last_session),
-                last_event_at,
-                entry.modified_ms,
-                entry.synced_at_ms,
-                json_string(&entry.disposition),
-            ));
-        }
-    }
-    output.push_str("]}\n");
-    print!("{}", output);
 }
 
 fn print_not_found(kind: &str, value: &str) {
     println!(
-        "{{\"disposition\":\"not_found\",\"mode\":\"resume\",\"{}\":{}}}",
-        kind,
-        json_string(value)
+        "{}",
+        json::Object::new()
+            .name("disposition", "not_found")
+            .name("mode", "resume")
+            .name(kind, value)
+            .finish()
     );
 }
 
@@ -968,48 +894,10 @@ fn current_turn_state(current: &RecoverySnapshot) -> &'static str {
     }
 }
 
-fn completion_state(current: &RecoverySnapshot, entry: &SourceEntry) -> &'static str {
-    if current.completed {
-        "completed"
-    } else if corpus::source_is_complete(entry) {
-        "source_boundary_reached"
-    } else {
-        "open"
-    }
-}
-
-fn field(output: &mut String, key: &str, value: &str, first: bool) {
-    if !first {
-        output.push(',');
-    }
-    output.push_str(&format!("\"{}\":{}", key, json_string(value)));
-}
-
-fn number(output: &mut String, key: &str, value: u64) {
-    output.push_str(&format!(",\"{}\":{}", key, value));
-}
-
-fn boolean(output: &mut String, key: &str, value: bool) {
-    output.push_str(&format!(",\"{}\":{}", key, value));
-}
-
-fn string_array(values: &BTreeSet<String>) -> String {
-    let mut output = String::from("[");
-    for (index, value) in values.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&json_string(value));
-    }
-    output.push(']');
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_state, current_turn_state, embedded_messages, read_body, resume_disposition,
-        scan_source,
+        current_turn_state, embedded_messages, read_body, resume_disposition, scan_source,
     };
     use crate::core::{EventKind, RecoveryEvent, RecoverySnapshot, SourceRef};
     use crate::corpus::SourceEntry;
@@ -1058,10 +946,7 @@ mod tests {
             ..SourceEntry::default()
         };
         assert_eq!(resume_disposition(&entry), "ready");
-        assert_eq!(
-            completion_state(&current, &entry),
-            "source_boundary_reached"
-        );
+        assert!(crate::corpus::source_is_complete(&entry));
         assert_eq!(current_turn_state(&current), "active");
     }
 

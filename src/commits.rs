@@ -1,5 +1,6 @@
 use crate::corpus::{self, SourceEntry};
-use crate::format::{json_string, parse_event_header};
+use crate::format::parse_event_header;
+use crate::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -15,11 +16,10 @@ const MIN_HASH_LEN: usize = 7;
 const MAX_HASH_LEN: usize = 40;
 const MENTIONS_PER_COMMIT: usize = 16;
 
-fn retain_earliest(mentions: &mut Vec<Mention>, keep: usize) {
+/// Keeps the `keep` earliest mentions, by the instants their timestamps name.
+fn retain_earliest(mentions: &mut Vec<Mention>, keep: usize, offset_minutes: i64) {
     mentions.sort_by(|left, right| {
-        let left_key = (left.timestamp.is_empty(), left.timestamp.as_str());
-        let right_key = (right.timestamp.is_empty(), right.timestamp.as_str());
-        left_key.cmp(&right_key)
+        crate::time::compare(&left.timestamp, &right.timestamp, offset_minutes)
     });
     mentions.truncate(keep);
 }
@@ -86,7 +86,10 @@ pub fn run(root: &Path, request: &CommitRequest) -> io::Result<()> {
     let (candidates, _) = scan_all(&files, request, Some(&wanted))?;
 
     let mut joined = facts.into_iter().collect::<Vec<_>>();
-    joined.sort_by(|left, right| right.1.date.cmp(&left.1.date).then(left.0.cmp(&right.0)));
+    joined.sort_by(|left, right| {
+        crate::time::compare(&right.1.date, &left.1.date, request.offset_minutes)
+            .then(left.0.cmp(&right.0))
+    });
     let total = joined.len() as u64;
     let start = usize::try_from(request.offset)
         .unwrap_or(usize::MAX)
@@ -174,7 +177,11 @@ fn scan_all(
                 into.mentions_seen = into.mentions_seen.saturating_add(candidate.mentions_seen);
                 into.written_as.extend(candidate.written_as);
                 into.mentions.extend(candidate.mentions);
-                retain_earliest(&mut into.mentions, MENTIONS_PER_COMMIT);
+                retain_earliest(
+                    &mut into.mentions,
+                    MENTIONS_PER_COMMIT,
+                    request.offset_minutes,
+                );
             }
         }
         match first_failure {
@@ -227,7 +234,11 @@ fn scan_segment(
                     timestamp: header.timestamp.clone(),
                 });
                 if entry.mentions.len() > MENTIONS_PER_COMMIT * 2 {
-                    retain_earliest(&mut entry.mentions, MENTIONS_PER_COMMIT);
+                    retain_earliest(
+                        &mut entry.mentions,
+                        MENTIONS_PER_COMMIT,
+                        request.offset_minutes,
+                    );
                 }
             }
         }
@@ -410,23 +421,47 @@ fn git_batch(repo: &Path, args: &[&str], names: &[String]) -> io::Result<String>
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The names that start exactly one commit of the repository, each with that commit. Git
+/// lists the commits once; asking it about every name in a large corpus took minutes when the
+/// repository sat on a slow file system, such as a Windows drive seen from WSL.
 fn resolve_commits(repo: &Path, names: &[String]) -> io::Result<BTreeMap<String, String>> {
+    let commits = repository_commits(repo)?;
     let mut resolved = BTreeMap::new();
-    let answered = git_batch(
-        repo,
-        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
-        names,
-    )?;
-    for (name, line) in names.iter().zip(answered.lines()) {
-        let mut parts = line.split(' ');
-        let (Some(object), Some(kind)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        if kind == "commit" {
-            resolved.insert(name.clone(), object.to_string());
+    for name in names {
+        let first = commits.partition_point(|commit| commit.as_str() < name.as_str());
+        let mut matching = commits[first..]
+            .iter()
+            .take_while(|commit| commit.starts_with(name.as_str()));
+        if let (Some(commit), None) = (matching.next(), matching.next()) {
+            resolved.insert(name.clone(), commit.clone());
         }
     }
     Ok(resolved)
+}
+
+/// Every commit the refs and reflogs of the repository reach, sorted.
+fn repository_commits(repo: &Path) -> io::Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--all", "--reflog"])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git rev-list failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut commits = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    commits.sort();
+    commits.dedup();
+    Ok(commits)
 }
 
 fn commit_facts(
@@ -481,42 +516,7 @@ fn print_result(
         }
     }
 
-    let mut output = String::new();
-    output.push_str("{\"disposition\":\"commits_joined\",\"mode\":\"commit_join\"");
-    output.push_str(&format!(",\"repo\":{}", json_string(&request.repo)));
-    output.push_str(&format!(
-        ",\"corpus\":{}",
-        json_string(&root.to_string_lossy())
-    ));
-    output.push_str(&format!(",\"scanned_files\":{}", counts.scanned_files));
-    output.push_str(&format!(",\"scanned_bytes\":{}", counts.scanned_bytes));
-    output.push_str(&format!(",\"scanned_records\":{}", counts.scanned_records));
-    output.push_str(&format!(",\"candidate_names\":{}", counts.candidate_names));
-    output.push_str(&format!(",\"resolved_names\":{}", counts.resolved_names));
-    output.push_str(&format!(",\"total_commits\":{}", counts.total));
-    output.push_str(&format!(",\"returned\":{}", page.len()));
-    output.push_str(&format!(",\"offset\":{}", request.offset));
-    output.push_str(",\"applied_filters\":{\"from\":");
-    output.push_str(
-        &request
-            .from
-            .as_deref()
-            .map(json_string)
-            .unwrap_or_else(|| "null".to_string()),
-    );
-    output.push_str(",\"to\":");
-    output.push_str(
-        &request
-            .to
-            .as_deref()
-            .map(json_string)
-            .unwrap_or_else(|| "null".to_string()),
-    );
-    output.push_str("},\"commits\":[");
-    for (index, (object, facts)) in page.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
+    let commits = page.iter().map(|(object, facts)| {
         let group = by_object.get(object.as_str()).cloned().unwrap_or_default();
         let mentions_seen: u64 = group.iter().map(|candidate| candidate.mentions_seen).sum();
         let mut ordered = group
@@ -524,9 +524,7 @@ fn print_result(
             .flat_map(|candidate| candidate.mentions.iter())
             .collect::<Vec<_>>();
         ordered.sort_by(|left, right| {
-            let left_key = (left.timestamp.is_empty(), left.timestamp.as_str());
-            let right_key = (right.timestamp.is_empty(), right.timestamp.as_str());
-            left_key.cmp(&right_key)
+            crate::time::compare(&left.timestamp, &right.timestamp, request.offset_minutes)
         });
         ordered.truncate(MENTIONS_PER_COMMIT);
         let mut written = group
@@ -535,44 +533,66 @@ fn print_result(
             .collect::<Vec<_>>();
         written.sort();
         written.dedup();
-        output.push_str(&format!("{{\"commit\":{}", json_string(object)));
-        output.push_str(&format!(",\"author_date\":{}", json_string(&facts.date)));
-        output.push_str(&format!(",\"subject\":{}", json_string(&facts.subject)));
-        output.push_str(",\"written_as\":[");
-        for (position, name) in written.iter().enumerate() {
-            if position != 0 {
-                output.push(',');
-            }
-            output.push_str(&json_string(name));
-        }
-        output.push_str("],\"mentions\":");
-        output.push_str(&mentions_seen.to_string());
-        output.push_str(",\"source_refs\":[");
-        for (position, mention) in ordered.iter().enumerate() {
-            if position != 0 {
-                output.push(',');
-            }
+        let mentions = ordered.iter().map(|mention| {
             let path = catalog
                 .get(&mention.source_id)
                 .map(|entry| entry.path.as_str())
                 .unwrap_or("");
-            output.push_str(&format!(
-                "{{\"source_id\":{},\"source_path\":{},\"line\":{},\"byte_start\":{},\"byte_len\":{},\"session\":{},\"timestamp\":{}}}",
-                json_string(&mention.source_id),
-                json_string(path),
-                mention.line,
-                mention.byte_start,
-                mention.byte_len,
-                json_string(&mention.session),
-                json_string(&mention.timestamp)
-            ));
-        }
-        output.push_str("],\"source_refs_returned\":");
-        output.push_str(&ordered.len().to_string());
-        output.push('}');
-    }
-    output.push_str("]}");
-    println!("{}", output);
+            json::Object::new()
+                .name("session", &mention.session)
+                .name("timestamp", &mention.timestamp)
+                .raw(
+                    "source_ref",
+                    &json::source_ref(
+                        &mention.source_id,
+                        path,
+                        Some(mention.line),
+                        mention.byte_start,
+                        mention.byte_len,
+                    ),
+                )
+                .finish()
+        });
+        json::Object::new()
+            .name("commit", object)
+            .name("author_date", &facts.date)
+            .text("subject", &facts.subject)
+            .raw(
+                "written_as",
+                &json::strings(written.iter().map(String::as_str)),
+            )
+            .number("mentions_seen", mentions_seen)
+            .number("mentions_returned", ordered.len() as u64)
+            .raw("mentions", &json::array(mentions))
+            .finish()
+    });
+    let filters = json::Object::new()
+        .optional("from", request.from.as_deref())
+        .optional("to", request.to.as_deref())
+        .finish();
+    let next_offset = request.offset.saturating_add(page.len() as u64);
+    let has_more = next_offset < counts.total;
+    println!(
+        "{}",
+        json::Object::new()
+            .name("disposition", "commits_joined")
+            .name("mode", "commit_join")
+            .name("repo", &request.repo)
+            .name("corpus", &root.to_string_lossy())
+            .number("scanned_files", counts.scanned_files)
+            .number("scanned_bytes", counts.scanned_bytes)
+            .number("scanned_records", counts.scanned_records)
+            .number("candidate_names", counts.candidate_names)
+            .number("resolved_names", counts.resolved_names)
+            .number("total_commits", counts.total)
+            .number("returned", page.len() as u64)
+            .number("offset", request.offset)
+            .boolean("truncated", has_more)
+            .optional_number("next_offset", has_more.then_some(next_offset))
+            .raw("applied_filters", &filters)
+            .raw("commits", &json::array(commits))
+            .finish()
+    );
 }
 
 #[cfg(test)]
@@ -624,7 +644,7 @@ mod tests {
             at("2026-08-13T11:46:01Z"),
             at("2026-08-13T12:26:33Z"),
         ];
-        super::retain_earliest(&mut mentions, 3);
+        super::retain_earliest(&mut mentions, 3, 0);
         let kept = mentions
             .iter()
             .map(|mention| mention.timestamp.as_str())

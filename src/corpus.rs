@@ -4,9 +4,9 @@ use crate::core::{
     TurnReducerState,
 };
 use crate::format::{
-    decode_token, encode_token, event_header_line, json_string, parse_event_header, push_field,
-    EventHeader,
+    decode_token, encode_token, event_header_line, parse_event_header, push_field, EventHeader,
 };
+use crate::json;
 use crate::jsonl::{parse_record, Field};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -150,6 +150,32 @@ pub fn build(
     )
 }
 
+/// The sources `--rebuild-source` names: a log, or every log under a directory, among those
+/// this sync reads. A path that names none of them is an error, not a rebuild of nothing.
+fn forced_source_ids(force_paths: &[String], snapshot: &[SourceEntry]) -> io::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for path in force_paths {
+        let named = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        let before = ids.len();
+        ids.extend(
+            snapshot
+                .iter()
+                .filter(|entry| Path::new(&entry.path).starts_with(&named))
+                .map(|entry| entry.source_id.clone()),
+        );
+        if ids.len() == before {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--rebuild-source names no log that this sync reads: {}",
+                    path
+                ),
+            ));
+        }
+    }
+    Ok(ids)
+}
+
 pub fn build_with_preview(
     sources: &[String],
     corpus: &Path,
@@ -222,14 +248,7 @@ pub fn build_with_preview(
     for files in existing_files.values_mut() {
         discard_partial_corpus_files(files)?;
     }
-    let forced_ids = force_paths
-        .iter()
-        .filter_map(|path| {
-            source_entry(Path::new(path), 300)
-                .map(|entry| entry.map(|entry| entry.source_id))
-                .transpose()
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+    let forced_ids = forced_source_ids(force_paths, &snapshot)?;
     // The date offset is fixed when the corpus is built: an incremental sync keeps the one in
     // the catalog, so every segment of one corpus puts records on the same dates.
     let offset_minutes = if incremental && !previous.is_empty() {
@@ -577,74 +596,84 @@ pub fn status(path: &Path) -> io::Result<()> {
             }
         }
     }
-    let availability_observed_at_ms = if availability.observed_at_ms == 0 {
-        "null".to_string()
-    } else {
-        availability.observed_at_ms.to_string()
+    let file_len = |name: &str| {
+        fs::metadata(corpus.join(name))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
     };
     println!(
-        "{{\"disposition\":{},\"mode\":\"compact_literal_corpus\",\"corpus\":{},\"rules_version\":{},\"rules_current\":{},\"sources\":{},\"complete_sources\":{},\"incomplete_sources\":{},\"corpus_files\":{},\"partial_files\":{},\"corpus_bytes\":{},\"catalog_bytes\":{},\"timeline_present\":{},\"timeline_sources\":{},\"timeline_runs\":{},\"timeline_bytes\":{},\"registered_source_inputs\":{},\"managed_imports\":{},\"unavailable_managed_imports\":{},\"imports\":{},\"unavailable_source_paths\":{},\"source_availability_observed_at_ms\":{},\"source_availability_total\":{},\"source_availability_truncated\":{},\"source_availability\":{},\"source_availability_bytes\":{}}}",
-        json_string(if managed.unavailable_imports != 0 {
-            "managed_imports_unavailable"
-        } else if unavailable_source_paths != 0 {
-            "source_paths_unavailable"
-        } else {
-            "observed"
-        }),
-        json_string(&corpus.to_string_lossy()),
-        rules_version,
-        rules_version == RULES_VERSION,
-        sources.len(),
-        complete_sources,
-        incomplete_sources,
-        files,
-        partial_files,
-        bytes,
-        fs::metadata(corpus.join("sources.tsv"))
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
-        timeline_catalog_present(&corpus),
-        timeline.len(),
-        timeline_runs,
-        fs::metadata(corpus.join("timeline.tsv"))
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
-        registered_inputs.len(),
-        managed.entries.len(),
-        managed.unavailable_imports,
-        managed.entries_json(),
-        unavailable_source_paths,
-        availability_observed_at_ms,
-        availability.entries.len(),
-        availability.entries.len() > SOURCE_AVAILABILITY_OUTPUT_LIMIT,
-        source_availability_json(&availability),
-        fs::metadata(corpus.join(SOURCE_AVAILABILITY_FILE))
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
+        "{}",
+        json::Object::new()
+            .name(
+                "disposition",
+                if managed.unavailable_imports != 0 {
+                    "managed_imports_unavailable"
+                } else if unavailable_source_paths != 0 {
+                    "source_paths_unavailable"
+                } else {
+                    "observed"
+                },
+            )
+            .name("mode", "compact_literal_corpus")
+            .name("corpus", &corpus.to_string_lossy())
+            .number("rules_version", rules_version)
+            .boolean("rules_current", rules_version == RULES_VERSION)
+            .number("sources", sources.len() as u64)
+            .number("complete_sources", complete_sources as u64)
+            .number("incomplete_sources", incomplete_sources as u64)
+            .number("corpus_files", files)
+            .number("partial_files", partial_files)
+            .number("corpus_bytes", bytes)
+            .number("catalog_bytes", file_len("sources.tsv"))
+            .boolean("timeline_present", timeline_catalog_present(&corpus))
+            .number("timeline_sources", timeline.len() as u64)
+            .number("timeline_runs", timeline_runs as u64)
+            .number("timeline_bytes", file_len("timeline.tsv"))
+            .number("registered_source_inputs", registered_inputs.len() as u64)
+            .number("managed_imports", managed.entries.len() as u64)
+            .number("unavailable_managed_imports", managed.unavailable_imports)
+            .raw("imports", &managed.entries_json())
+            .number("unavailable_source_paths", unavailable_source_paths as u64)
+            .optional_number(
+                "source_availability_observed_at_ms",
+                (availability.observed_at_ms != 0).then_some(availability.observed_at_ms),
+            )
+            .number(
+                "source_availability_total",
+                availability.entries.len() as u64
+            )
+            .boolean(
+                "source_availability_truncated",
+                availability.entries.len() > SOURCE_AVAILABILITY_OUTPUT_LIMIT,
+            )
+            .raw(
+                "source_availability",
+                &source_availability_json(&availability)
+            )
+            .number(
+                "source_availability_bytes",
+                file_len(SOURCE_AVAILABILITY_FILE),
+            )
+            .finish()
     );
     Ok(())
 }
 
 fn source_availability_json(snapshot: &SourceAvailabilitySnapshot) -> String {
-    let rows = snapshot
-        .entries
-        .iter()
-        .take(SOURCE_AVAILABILITY_OUTPUT_LIMIT)
-        .map(|entry| {
-            format!(
-                "{{\"input_path\":{},\"observed_path\":{},\"disposition\":{},\"source_id\":{}}}",
-                json_string(&entry.input_path),
-                json_string(&entry.observed_path),
-                json_string(&entry.disposition),
-                if entry.source_id.is_empty() {
-                    "null".to_string()
-                } else {
-                    json_string(&entry.source_id)
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", rows.join(","))
+    json::array(
+        snapshot
+            .entries
+            .iter()
+            .take(SOURCE_AVAILABILITY_OUTPUT_LIMIT)
+            .map(|entry| {
+                json::Object::new()
+                    .name("input_path", &entry.input_path)
+                    .name("observed_path", &entry.observed_path)
+                    .name("disposition", &entry.disposition)
+                    .name("source_id", &entry.source_id)
+                    .finish()
+            }),
+    )
 }
 
 /// The sources a read covers: the one named by `--source-id`, the sources of a `--session`, or
@@ -1239,27 +1268,28 @@ fn checkpoint_of(entry: &SourceEntry) -> IngestCheckpoint {
     }
 }
 
-/// A reader for the log at `path` that has read it up to `cursor`, a line start: it starts from
-/// the catalog's checkpoint when the corpus has read the log no further than `cursor`, else
-/// from the start of the log. `None` while the log has no complete record, before which the
-/// agent that writes it cannot be told.
+/// A reader for the log at `path` that has read it up to `cursor`, a line start, and the number
+/// of lines before `cursor`: it starts from the catalog's checkpoint when the corpus has read
+/// the log no further than `cursor`, else from the start of the log. `None` while the log has
+/// no complete record, before which the agent that writes it cannot be told.
 pub fn log_reader_at(
     catalog: &BTreeMap<String, SourceEntry>,
     path: &Path,
     cursor: u64,
-) -> io::Result<Option<LogReader>> {
+) -> io::Result<Option<(LogReader, u64)>> {
     if !first_line_complete(path) {
         return Ok(None);
     }
     let Some(entry) = source_entry(path, 300)? else {
         return Ok(None);
     };
-    let (mut log, from) = match catalog.get(&entry.source_id) {
+    let (mut log, from, mut lines) = match catalog.get(&entry.source_id) {
         Some(known) if known.checkpoint_valid && known.committed_byte_end <= cursor => (
             LogReader::new(known, checkpoint_of(known)),
             known.committed_byte_end,
+            known.last_line,
         ),
-        _ => (LogReader::new(&entry, IngestCheckpoint::default()), 0),
+        _ => (LogReader::new(&entry, IngestCheckpoint::default()), 0, 0),
     };
     let mut input = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(path)?);
     input.seek(SeekFrom::Start(from))?;
@@ -1272,8 +1302,9 @@ pub fn log_reader_at(
         }
         log.read(&line, position, read.oversized);
         position += read.total_len;
+        lines += 1;
     }
-    Ok(Some(log))
+    Ok(Some((log, lines)))
 }
 
 fn process_source(
@@ -2053,11 +2084,15 @@ pub fn rebuild_timeline(path: &Path) -> io::Result<()> {
     write_timeline_catalog(&corpus, &sources, &runs_by_source)?;
     let run_count = runs_by_source.values().map(Vec::len).sum::<usize>();
     println!(
-        "{{\"disposition\":\"timeline_rebuilt\",\"mode\":\"timeline_catalog\",\"files\":{},\"runs\":{},\"scanned_bytes\":{},\"corpus\":{}}}",
-        files.len(),
-        run_count,
-        scanned_bytes,
-        json_string(&corpus.to_string_lossy()),
+        "{}",
+        json::Object::new()
+            .name("disposition", "timeline_rebuilt")
+            .name("mode", "timeline_catalog")
+            .number("files", files.len() as u64)
+            .number("runs", run_count as u64)
+            .number("scanned_bytes", scanned_bytes)
+            .name("corpus", &corpus.to_string_lossy())
+            .finish()
     );
     Ok(())
 }

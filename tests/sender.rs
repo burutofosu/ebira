@@ -195,7 +195,7 @@ fn said_lists_only_what_the_person_sent() {
     let oldest = said.find("please build the map").expect("first message");
     assert!(newest < oldest, "said lists the newest first: {said}");
 
-    let codex = run(&["said", "--corpus", &logs.corpus(), "--agent", "codex"]);
+    let codex = run(&["said", "--corpus", &logs.corpus(), "--app", "codex"]);
     assert!(codex.contains("\"total_messages\":1"), "{codex}");
     let project = run(&["said", "--corpus", &logs.corpus(), "--cwd", "work/game"]);
     assert!(
@@ -286,7 +286,7 @@ fn search_filters_by_sender() {
         "desc",
     ]);
     assert!(
-        newest.contains("\"order\":\"reverse_chronological\"")
+        newest.contains("\"order\":\"desc\"")
             && newest.find("keep the old colors") < newest.find("please build the map"),
         "{newest}"
     );
@@ -465,7 +465,7 @@ fn follow_finds_a_session_registered_as_a_file_or_in_a_directory() {
     .expect("write a new transcript");
     let unread = follow("s-new");
     assert!(
-        unread.contains("written after the sync") && unread.contains("\"source_id\":\"\""),
+        unread.contains("written after the sync") && unread.contains("\"source_id\":null"),
         "{unread}"
     );
 }

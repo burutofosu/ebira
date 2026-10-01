@@ -299,7 +299,6 @@ fn command_output_matches_declared_schema() {
             "source_id",
             "source_path",
             "source_disposition",
-            "completion_state",
             "current_turn_state",
             "source_boundary_state",
             "observed_boundary",
@@ -307,8 +306,6 @@ fn command_output_matches_declared_schema() {
             "unscanned_source_bytes",
             "next_recall",
             "checkpoint_valid",
-            "committed_byte_end",
-            "source_size",
             "session_id",
             "latest_turn_id",
             "matched_events",
@@ -489,8 +486,7 @@ fn sync_and_timeline_report_value_scopes() {
     );
     let timeline = run(&["timeline", "--corpus", &corpus, "--limit", "5"]);
     assert!(
-        timeline.contains("\"snippet\":\"\"")
-            && timeline.contains("\"snippet_state\":\"not_loaded_in_map\""),
+        timeline.contains("\"snippet\":null,\"snippet_state\":\"not_loaded_in_map\""),
         "timeline did not identify an unloaded snippet: {timeline}"
     );
 }
@@ -538,6 +534,7 @@ fn resume_candidates_report_order_and_coverage() {
         &[
             "disposition",
             "mode",
+            "requested_session",
             "candidate_order",
             "candidate_count",
             "candidates_returned",
@@ -1126,8 +1123,180 @@ fn a_log_gets_its_source_id_once_it_holds_a_record() {
     assert!(
         said.contains("first words")
             && said.contains("\"source_id\":\"claude-")
-            && said.contains("\"agent\":\"claude\""),
+            && said.contains("\"app\":\"claude\""),
         "{said}"
     );
     std::fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[test]
+fn options_take_only_what_the_corpus_holds() {
+    let fixture = Fixture::new("options");
+    let corpus = fixture.corpus();
+    let kind = run_failure(&[
+        "search", "--corpus", &corpus, "--query", "probe", "--kind", "message",
+    ]);
+    assert!(
+        kind.contains("--kind must be user|assistant|command|output|patch|summary|unknown|invalid"),
+        "{kind}"
+    );
+    run(&[
+        "search", "--corpus", &corpus, "--query", "probe", "--sender", "unknown",
+    ]);
+    let map = run_failure(&["timeline", "--corpus", &corpus, "--session", "s1"]);
+    assert!(map.contains("need --date"), "{map}");
+
+    let absent = fixture.path().join("absent");
+    let nothing = run_failure(&[
+        "sync",
+        "--corpus",
+        &corpus,
+        "--rebuild-source",
+        absent.to_str().expect("utf-8 path"),
+    ]);
+    assert!(
+        nothing.contains("--rebuild-source names no log that this sync reads"),
+        "{nothing}"
+    );
+    let directory = run(&[
+        "sync",
+        "--corpus",
+        &corpus,
+        "--rebuild-source",
+        fixture.path().to_str().expect("utf-8 path"),
+    ]);
+    assert!(
+        directory.contains("\"sources_processed\":1") && directory.contains("\"sources_reused\":0"),
+        "a directory names every log under it: {directory}"
+    );
+}
+
+#[test]
+fn every_result_names_a_record_the_same_way() {
+    let fixture = Fixture::new("one-shape");
+    let corpus = fixture.corpus();
+    let log = fixture.path().join("log.jsonl");
+    let log = log.to_str().expect("utf-8 path");
+    let search = run(&["search", "--corpus", &corpus, "--query", "probe"]);
+    let first_ref = &search[search.find("\"source_ref\":{").expect("a match")..];
+    let value = |key: &str| {
+        let start = first_ref.find(&format!("\"{key}\":")).expect("key") + key.len() + 3;
+        first_ref[start..]
+            .split([',', '}'])
+            .next()
+            .expect("value")
+            .trim_matches('"')
+            .to_string()
+    };
+    let (source_id, byte_start, byte_len) =
+        (value("source_id"), value("byte_start"), value("byte_len"));
+    let outputs = [
+        search.clone(),
+        run(&["history", "--corpus", &corpus, "--query", "probe"]),
+        run(&["said", "--corpus", &corpus]),
+        run(&["resume", "--corpus", &corpus]),
+        run(&["resume", "--corpus", &corpus, "--brief"]),
+        run(&["timeline", "--corpus", &corpus]),
+        run(&["timeline", "--corpus", &corpus, "--date", "2026-08-16"]),
+        run(&[
+            "follow",
+            "--corpus",
+            &corpus,
+            "--source",
+            log,
+            "--after-byte",
+            "0",
+            "--seconds",
+            "0",
+            "--sender",
+            "any",
+        ]),
+        run(&[
+            "context",
+            "--corpus",
+            &corpus,
+            "--source-id",
+            &source_id,
+            "--byte-start",
+            &byte_start,
+            "--byte-len",
+            &byte_len,
+        ]),
+    ];
+    let mut references = 0;
+    for output in &outputs {
+        for (at, marker) in output.match_indices("\"source_ref\":") {
+            let object = &output[at + marker.len()..];
+            let object = &object[..=object.find('}').expect("an object")];
+            assert_eq!(
+                top_level_keys(object),
+                ["source_id", "source_path", "line", "byte_start", "byte_len"],
+                "{output}"
+            );
+            references += 1;
+        }
+        assert!(
+            !output.contains("\":\"\""),
+            "a value that is not there is null: {output}"
+        );
+    }
+    assert!(references >= outputs.len(), "{references} references");
+}
+
+#[test]
+fn commits_are_the_names_that_start_one_commit() {
+    let fixture = Fixture::new("commit-names");
+    let repo = fixture.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repository directory");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).expect("git writes UTF-8")
+    };
+    git(&["init", "--quiet"]);
+    git(&["commit", "--quiet", "--allow-empty", "-m", "first change"]);
+    git(&["commit", "--quiet", "--allow-empty", "-m", "second change"]);
+    let first = git(&["rev-parse", "HEAD~1"]).trim().to_string();
+    let log = fixture.path().join("commits.jsonl");
+    std::fs::write(
+        &log,
+        format!(
+            concat!(
+                r#"{{"type":"note","text":"landed {} and also deadbeefcafe0"}}"#,
+                "\n"
+            ),
+            &first[..9]
+        ),
+    )
+    .expect("write log");
+    let corpus = fixture.corpus();
+    run(&[
+        "sync",
+        "--corpus",
+        &corpus,
+        "--source",
+        log.to_str().expect("utf-8 path"),
+    ]);
+    let commits = run(&[
+        "commits",
+        "--corpus",
+        &corpus,
+        "--repo",
+        repo.to_str().expect("utf-8 path"),
+    ]);
+    assert!(
+        commits.contains("\"total_commits\":1")
+            && commits.contains(&format!("\"commit\":\"{first}\""))
+            && commits.contains("\"subject\":\"first change\"")
+            && commits.contains("\"mentions_seen\":1"),
+        "{commits}"
+    );
 }

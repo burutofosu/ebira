@@ -1,6 +1,7 @@
 use crate::core::TimelineRef;
 use crate::corpus::{self, SourceEntry, TimelineRun};
-use crate::format::{self, json_string, parse_event_header, EventHeader};
+use crate::format::{self, parse_event_header, EventHeader};
+use crate::json;
 use crate::time::{self, Range};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,6 +14,8 @@ use std::time::Instant;
 
 const SEARCH_BUFFER_SIZE: usize = 1024 * 1024;
 const TIMELINE_SNIPPET_BYTES: usize = 240;
+/// Values listed per facet.
+const FACET_LIMIT: usize = 50;
 const SNIPPET_CONTEXT_BYTES: usize = 120;
 const BODY_CHUNK_SIZE: usize = 64 * 1024;
 const HISTORY_SAMPLES_PER_DATE: usize = 4;
@@ -70,6 +73,15 @@ pub enum TimelineOrder {
     Desc,
 }
 
+impl TimelineOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
 #[derive(Default)]
 struct SearchStats {
     scanned_bytes: u64,
@@ -120,7 +132,8 @@ struct SearchHit {
     source_path: String,
     /// The path of the field whose value holds the query; none for raw records and listings.
     field: Option<String>,
-    snippet: String,
+    /// The text quoted from the record; none when it has none, or was not read.
+    snippet: Option<String>,
     /// The instant of `header.timestamp` at the corpus offset, for ordering.
     instant: Option<i128>,
 }
@@ -212,10 +225,10 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
     let started = Instant::now();
     let catalog = corpus::source_catalog(root)?;
     if !corpus::timeline_catalog_present(root) {
-        println!(
-            "{{\"disposition\":\"timeline_unavailable\",\"mode\":\"timeline\",\"reason\":\"timeline.tsv is not present; run an explicit corpus sync to create the disposable map\"}}"
-        );
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the corpus has no timeline.tsv; rebuild it with `ebira timeline --rebuild`",
+        ));
     }
     let runs_by_source = corpus::timeline_catalog(root)?;
     if request.date.is_some() {
@@ -226,10 +239,10 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
         || request.kind.is_some()
         || request.sender.is_some()
     {
-        println!(
-            "{{\"disposition\":\"timeline_filter_unavailable\",\"mode\":\"timeline_map\",\"reason\":\"session, role, kind, and sender filters require an explicit --date so event rows can be verified\"}}"
-        );
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--session, --role, --kind, and --sender need --date: the date map counts runs of              records, not the records themselves",
+        ));
     }
     let scope = corpus::scope(&catalog, request.source_id.as_deref(), None);
     let mut dates = BTreeMap::<String, TimelineMapBucket>::new();
@@ -451,7 +464,7 @@ fn timeline_hit(
         },
         source_path: source_path.to_string(),
         field: None,
-        snippet: String::new(),
+        snippet: None,
     }
 }
 
@@ -499,99 +512,68 @@ fn print_timeline_map(
         .collect::<Vec<_>>();
     let page_end = request.offset.saturating_add(selected.len() as u64);
     let has_more = page_end < dates.len() as u64;
-    let mut output = String::new();
-    output.push('{');
-    field(&mut output, "disposition", disposition, true);
-    field(&mut output, "mode", "timeline_map", false);
-    field(
-        &mut output,
-        "order",
-        match request.order {
-            TimelineOrder::Asc => "asc",
-            TimelineOrder::Desc => "desc",
-        },
-        false,
-    );
-    field(
-        &mut output,
-        "coverage",
-        if missing_sources == 0 && incomplete_sources == 0 {
-            "complete"
-        } else {
-            "partial"
-        },
-        false,
-    );
-    number(&mut output, "source_count", expected_sources as u64);
-    number(&mut output, "covered_sources", covered_sources as u64);
-    number(&mut output, "missing_sources", missing_sources as u64);
-    number(&mut output, "incomplete_sources", incomplete_sources as u64);
-    number(&mut output, "stale_sources", staleness.stale_sources);
-    number(
-        &mut output,
-        "unscanned_source_bytes",
-        staleness.unscanned_source_bytes,
-    );
-    number(&mut output, "date_count", dates.len() as u64);
-    number(&mut output, "returned_dates", selected.len() as u64);
-    number(&mut output, "offset", request.offset);
-    number(&mut output, "duration_ms", duration_ms);
-    boolean(&mut output, "truncated", has_more);
-    if has_more {
-        number(&mut output, "next_offset", page_end);
-    }
-    output.push_str(",\"dates\":[");
-    for (index, (date, bucket)) in selected.into_iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        field(&mut output, "date", date, true);
-        number(&mut output, "event_count", bucket.event_count);
-        number(&mut output, "session_run_occurrences", bucket.session_count);
-        number(&mut output, "source_count", bucket.source_ids.len() as u64);
-        number(&mut output, "runs", bucket.runs);
-        output.push_str(",\"kind_counts\":");
-        output.push_str(&map_json(&bucket.kind_counts));
-        output.push_str(",\"first\":");
-        output.push_str(
-            &bucket
-                .first
-                .as_ref()
-                .map(timeline_map_hit_json)
-                .unwrap_or_else(|| "null".to_string()),
-        );
-        output.push_str(",\"last\":");
-        output.push_str(
-            &bucket
-                .last
-                .as_ref()
-                .map(timeline_map_hit_json)
-                .unwrap_or_else(|| "null".to_string()),
-        );
-        output.push('}');
-    }
-    output.push_str("],\"next_actions\":[");
+    let listed = selected.into_iter().map(|(date, bucket)| {
+        json::Object::new()
+            .name("date", date)
+            .number("event_count", bucket.event_count)
+            .number("session_run_occurrences", bucket.session_count)
+            .number("source_count", bucket.source_ids.len() as u64)
+            .number("runs", bucket.runs)
+            .raw("kind_counts", &facet_json(&bucket.kind_counts, FACET_LIMIT))
+            .raw(
+                "first",
+                &json::or_null(bucket.first.as_ref().map(timeline_map_hit_json)),
+            )
+            .raw(
+                "last",
+                &json::or_null(bucket.last.as_ref().map(timeline_map_hit_json)),
+            )
+            .finish()
+    });
     let mut action_dates = dates.keys().collect::<Vec<_>>();
     action_dates.sort_by(|left, right| timeline_date_order(left, right, request.order));
-    for (index, date) in action_dates
+    let actions = action_dates
         .into_iter()
         .skip(page_start)
         .take(limit.min(12))
-        .enumerate()
-    {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&format!(
-            "{{\"action\":\"list_date_events\",\"date\":{},\"limit\":{},\"request\":{}}}",
-            json_string(date),
-            limit,
-            timeline_request_json(request, Some(date), 0),
-        ));
-    }
-    output.push_str("]}\n");
-    print!("{}", output);
+        .map(|date| {
+            json::Object::new()
+                .name("action", "list_date_events")
+                .name("date", date)
+                .number("limit", limit as u64)
+                .raw("request", &timeline_request_json(request, Some(date), 0))
+                .finish()
+        });
+    println!(
+        "{}",
+        json::Object::new()
+            .name("disposition", disposition)
+            .name("mode", "timeline_map")
+            .name("order", request.order.as_str())
+            .name(
+                "coverage",
+                if missing_sources == 0 && incomplete_sources == 0 {
+                    "complete"
+                } else {
+                    "partial"
+                },
+            )
+            .number("source_count", expected_sources as u64)
+            .number("covered_sources", covered_sources as u64)
+            .number("missing_sources", missing_sources as u64)
+            .number("incomplete_sources", incomplete_sources as u64)
+            .number("stale_sources", staleness.stale_sources)
+            .number("unscanned_source_bytes", staleness.unscanned_source_bytes)
+            .number("date_count", dates.len() as u64)
+            .number("returned_dates", listed.len() as u64)
+            .number("offset", request.offset)
+            .number("duration_ms", duration_ms)
+            .boolean("truncated", has_more)
+            .optional_number("next_offset", has_more.then_some(page_end))
+            .raw("dates", &json::array(listed))
+            .raw("next_actions", &json::array(actions))
+            .finish()
+    );
 }
 
 fn timeline_events(
@@ -658,35 +640,26 @@ fn timeline_events(
         "timeline_events_ready"
     };
     let staleness = corpus::Staleness::of(scope.sources.iter().copied());
-    let mut output = String::new();
-    output.push('{');
-    field(&mut output, "disposition", disposition, true);
-    field(&mut output, "mode", "timeline_events", false);
-    field(&mut output, "date", date, false);
-    number(&mut output, "scanned_runs", scanned_runs);
-    number(&mut output, "scanned_bytes", scanned_bytes);
-    number(&mut output, "stale_sources", staleness.stale_sources);
-    number(
-        &mut output,
-        "unscanned_source_bytes",
-        staleness.unscanned_source_bytes,
+    println!(
+        "{}",
+        json::Object::new()
+            .name("disposition", disposition)
+            .name("mode", "timeline_events")
+            .name("date", date)
+            .name("order", request.order.as_str())
+            .number("scanned_runs", scanned_runs)
+            .number("scanned_bytes", scanned_bytes)
+            .number("stale_sources", staleness.stale_sources)
+            .number("unscanned_source_bytes", staleness.unscanned_source_bytes)
+            .number("total_events", total)
+            .number("returned", page_hits.len() as u64)
+            .number("offset", request.offset)
+            .number("duration_ms", started.elapsed().as_millis() as u64)
+            .boolean("truncated", has_more)
+            .optional_number("next_offset", has_more.then_some(page_end))
+            .raw("events", &hits_json(&page_hits))
+            .finish()
     );
-    number(&mut output, "total_events", total);
-    number(&mut output, "returned", page_hits.len() as u64);
-    number(&mut output, "offset", request.offset);
-    number(
-        &mut output,
-        "duration_ms",
-        started.elapsed().as_millis() as u64,
-    );
-    boolean(&mut output, "truncated", has_more);
-    if has_more {
-        number(&mut output, "next_offset", page_end);
-    }
-    output.push_str(",\"events\":[");
-    hits_json(&mut output, &page_hits);
-    output.push_str("]}\n");
-    print!("{}", output);
     Ok(())
 }
 
@@ -971,52 +944,50 @@ fn search_json(
     } else {
         "ready"
     };
-    let mut output = String::new();
-    output.push('{');
-    field(&mut output, "disposition", disposition, true);
-    field(&mut output, "mode", "literal_scan", false);
-    field(
-        &mut output,
-        "operation",
-        if request.operation.is_empty() {
-            "search"
-        } else {
-            request.operation.as_str()
-        },
-        false,
-    );
-    field(&mut output, "search_scope", search_scope(request), false);
-    field(&mut output, "order", match_order(request), false);
-    field(&mut output, "query", &request.query, false);
-    field(&mut output, "normalization", normalization(request), false);
-    number(&mut output, "scanned_files", stats.scanned_files);
-    number(&mut output, "scanned_bytes", stats.scanned_bytes);
-    number(&mut output, "total_candidates", stats.matched_events);
-    number(&mut output, "returned", stats.returned.len() as u64);
-    number(&mut output, "duration_ms", duration_ms);
-    number(&mut output, "offset", request.offset);
+    let mut output = json::Object::new();
+    output
+        .name("disposition", disposition)
+        .name("mode", "literal_scan")
+        .name("operation", operation(request, "search"))
+        .name("search_scope", search_scope(request))
+        .name("order", match_order(request))
+        .text("query", &request.query)
+        .name("normalization", normalization(request))
+        .number("scanned_files", stats.scanned_files)
+        .number("scanned_bytes", stats.scanned_bytes)
+        .number("total_candidates", stats.matched_events)
+        .number("returned", stats.returned.len() as u64)
+        .number("duration_ms", duration_ms)
+        .number("offset", request.offset);
     coverage.write_fields(&mut output);
-    output.push_str(",\"applied_filters\":");
-    output.push_str(&applied_filters_json(request));
-    boolean(&mut output, "truncated", has_more);
-    if has_more {
-        number(&mut output, "next_offset", page_end);
+    output
+        .raw("applied_filters", &applied_filters_json(request))
+        .boolean("truncated", has_more)
+        .optional_number("next_offset", has_more.then_some(page_end))
+        .raw("facets", &facets_json(&stats.facets))
+        .raw("matches", &hits_json(&stats.returned))
+        .raw(
+            "next_actions",
+            &search_next_actions(
+                root,
+                request,
+                page_end,
+                has_more,
+                &coverage,
+                stats.matched_events,
+            ),
+        );
+    let mut text = output.finish();
+    text.push('\n');
+    Ok(text)
+}
+
+fn operation<'a>(request: &'a SearchRequest, default: &'a str) -> &'a str {
+    if request.operation.is_empty() {
+        default
+    } else {
+        request.operation.as_str()
     }
-    output.push_str(",\"facets\":");
-    output.push_str(&facets_json(&stats.facets));
-    output.push_str(",\"matches\":[");
-    hits_json(&mut output, &stats.returned);
-    output.push_str("],\"next_actions\":");
-    output.push_str(&search_next_actions(
-        root,
-        request,
-        page_end,
-        has_more,
-        &coverage,
-        stats.matched_events,
-    ));
-    output.push_str("}\n");
-    Ok(output)
 }
 
 fn history_json(
@@ -1037,61 +1008,57 @@ fn history_json(
     } else {
         "history_map_partial"
     };
-    let operation = if request.operation.is_empty() {
-        "history"
-    } else {
-        request.operation.as_str()
-    };
-    let mut output = String::new();
-    output.push('{');
-    field(&mut output, "disposition", disposition, true);
-    field(&mut output, "mode", "literal_history_map", false);
-    field(&mut output, "operation", operation, false);
-    field(&mut output, "search_scope", search_scope(request), false);
-    field(&mut output, "match_order", match_order(request), false);
-    field(&mut output, "date_order", "desc", false);
-    field(&mut output, "query", &request.query, false);
-    field(&mut output, "normalization", normalization(request), false);
-    coverage.write_fields(&mut output);
-    output.push_str(",\"applied_filters\":");
-    output.push_str(&applied_filters_json(request));
-    number(&mut output, "scanned_files", stats.scanned_files);
-    number(&mut output, "scanned_bytes", stats.scanned_bytes);
-    number(&mut output, "total_candidates", stats.matched_events);
-    number(&mut output, "returned", stats.returned.len() as u64);
-    number(&mut output, "offset", request.offset);
-    number(&mut output, "duration_ms", duration_ms);
-    boolean(&mut output, "truncated", has_more);
-    if has_more {
-        number(&mut output, "next_offset", page_end);
-    }
     let date_limit = if request.date_limit == 0 {
         HISTORY_MAP_DATE_LIMIT
     } else {
         request.date_limit.max(1)
     };
-    output.push_str(",\"map\":");
-    output.push_str(&history_map_json(stats, request.date_offset, date_limit));
-    output.push_str(",\"facets\":");
-    output.push_str(&facets_json(&stats.facets));
-    output.push_str(",\"matches\":[");
-    hits_json(&mut output, &stats.returned);
-    output.push_str("],\"next_actions\":");
-    output.push_str(&history_next_actions(
-        root,
-        request,
-        page_end,
-        has_more,
-        DatePage {
-            timeline: &stats.timeline,
-            offset: request.date_offset,
-            limit: date_limit,
-        },
-        &coverage,
-        stats.matched_events,
-    ));
-    output.push_str("}\n");
-    Ok(output)
+    let mut output = json::Object::new();
+    output
+        .name("disposition", disposition)
+        .name("mode", "literal_history_map")
+        .name("operation", operation(request, "history"))
+        .name("search_scope", search_scope(request))
+        .name("match_order", match_order(request))
+        .name("date_order", "desc")
+        .text("query", &request.query)
+        .name("normalization", normalization(request));
+    coverage.write_fields(&mut output);
+    output
+        .raw("applied_filters", &applied_filters_json(request))
+        .number("scanned_files", stats.scanned_files)
+        .number("scanned_bytes", stats.scanned_bytes)
+        .number("total_candidates", stats.matched_events)
+        .number("returned", stats.returned.len() as u64)
+        .number("offset", request.offset)
+        .number("duration_ms", duration_ms)
+        .boolean("truncated", has_more)
+        .optional_number("next_offset", has_more.then_some(page_end))
+        .raw(
+            "map",
+            &history_map_json(stats, request.date_offset, date_limit),
+        )
+        .raw("facets", &facets_json(&stats.facets))
+        .raw("matches", &hits_json(&stats.returned))
+        .raw(
+            "next_actions",
+            &history_next_actions(
+                root,
+                request,
+                page_end,
+                has_more,
+                DatePage {
+                    timeline: &stats.timeline,
+                    offset: request.date_offset,
+                    limit: date_limit,
+                },
+                &coverage,
+                stats.matched_events,
+            ),
+        );
+    let mut text = output.finish();
+    text.push('\n');
+    Ok(text)
 }
 
 fn history_map_json(stats: &SearchStats, date_offset: u64, date_limit: usize) -> String {
@@ -1107,45 +1074,36 @@ fn history_map_json(stats: &SearchStats, date_offset: u64, date_limit: usize) ->
         .collect::<Vec<_>>();
     let page_end = date_offset.saturating_add(selected.len() as u64);
     let truncated = page_end < stats.timeline.len() as u64;
-    let mut output = format!("{{\"source_count\":{}", stats.facets.source.len());
-    number(
-        &mut output,
-        "session_count",
-        stats.facets.session.len() as u64,
-    );
-    number(&mut output, "date_count", stats.timeline.len() as u64);
-    number(&mut output, "returned_dates", selected.len() as u64);
-    number(&mut output, "date_offset", date_offset);
-    number(&mut output, "date_limit", date_limit as u64);
-    boolean(&mut output, "truncated", truncated);
-    if truncated {
-        number(&mut output, "next_date_offset", page_end);
-    }
-    number(&mut output, "kind_count", stats.facets.kind.len() as u64);
-    output.push_str(",\"timeline\":[");
-    for (index, (date, bucket)) in selected.into_iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        field(&mut output, "date", date, true);
-        number(&mut output, "matched_events", bucket.matched_events);
-        number(&mut output, "distinct_sources", bucket.source.len() as u64);
-        number(
-            &mut output,
-            "distinct_sessions",
-            bucket.session.len() as u64,
-        );
-        output.push_str(",\"source_counts\":");
-        output.push_str(&map_json_limited(&bucket.source, HISTORY_MAP_FACET_LIMIT));
-        output.push_str(",\"session_counts\":");
-        output.push_str(&map_json_limited(&bucket.session, HISTORY_MAP_FACET_LIMIT));
-        output.push_str(",\"kinds\":");
-        output.push_str(&map_json_limited(&bucket.kind, HISTORY_MAP_FACET_LIMIT));
-        output.push('}');
-    }
-    output.push_str("]}");
-    output
+    let returned = selected.len() as u64;
+    let timeline = selected.into_iter().map(|(date, bucket)| {
+        json::Object::new()
+            .name("date", date)
+            .number("matched_events", bucket.matched_events)
+            .number("distinct_sources", bucket.source.len() as u64)
+            .number("distinct_sessions", bucket.session.len() as u64)
+            .raw(
+                "source_counts",
+                &facet_json(&bucket.source, HISTORY_MAP_FACET_LIMIT),
+            )
+            .raw(
+                "session_counts",
+                &facet_json(&bucket.session, HISTORY_MAP_FACET_LIMIT),
+            )
+            .raw("kinds", &facet_json(&bucket.kind, HISTORY_MAP_FACET_LIMIT))
+            .finish()
+    });
+    json::Object::new()
+        .number("source_count", stats.facets.source.len() as u64)
+        .number("session_count", stats.facets.session.len() as u64)
+        .number("date_count", stats.timeline.len() as u64)
+        .number("returned_dates", returned)
+        .number("date_offset", date_offset)
+        .number("date_limit", date_limit as u64)
+        .boolean("truncated", truncated)
+        .optional_number("next_date_offset", truncated.then_some(page_end))
+        .number("kind_count", stats.facets.kind.len() as u64)
+        .raw("timeline", &json::array(timeline))
+        .finish()
 }
 
 fn history_date_order(left: &str, right: &str) -> Ordering {
@@ -1178,8 +1136,7 @@ fn history_next_actions(
         limit: date_limit,
     } = dates;
     let map_has_more = date_offset.saturating_add(date_limit as u64) < timeline.len() as u64;
-    let mut output = String::from("[");
-    let mut action_count = 0usize;
+    let mut actions = Vec::new();
     let mut buckets = timeline.iter().collect::<Vec<_>>();
     buckets.sort_by(|(left_date, left), (right_date, right)| {
         right
@@ -1191,90 +1148,70 @@ fn history_next_actions(
         if date == "undated" {
             continue;
         }
-        if action_count != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        field(&mut output, "action", "expand_time_bucket", true);
-        field(&mut output, "query", &request.query, false);
-        field(&mut output, "from", date, false);
-        field(&mut output, "to", date, false);
-        number(&mut output, "limit", request.limit as u64);
-        output.push_str(",\"request\":");
-        output.push_str(&search_request_json(request, 0, Some((date, date)), 0));
-        number(&mut output, "matched_events", bucket.matched_events);
-        output.push('}');
-        action_count += 1;
+        actions.push(
+            json::Object::new()
+                .name("action", "expand_time_bucket")
+                .text("query", &request.query)
+                .name("from", date)
+                .name("to", date)
+                .number("limit", request.limit as u64)
+                .raw(
+                    "request",
+                    &search_request_json(request, 0, Some((date, date)), 0),
+                )
+                .number("matched_events", bucket.matched_events)
+                .finish(),
+        );
     }
     if has_more {
-        if action_count != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        field(&mut output, "action", "expand_literal_page", true);
-        field(&mut output, "query", &request.query, false);
-        number(&mut output, "offset", next_offset);
-        number(&mut output, "limit", request.limit as u64);
-        output.push_str(",\"request\":");
-        output.push_str(&search_request_json(
-            request,
-            next_offset,
-            None,
-            request.date_offset,
-        ));
-        output.push('}');
+        actions.push(
+            json::Object::new()
+                .name("action", "expand_literal_page")
+                .text("query", &request.query)
+                .number("offset", next_offset)
+                .number("limit", request.limit as u64)
+                .raw(
+                    "request",
+                    &search_request_json(request, next_offset, None, request.date_offset),
+                )
+                .finish(),
+        );
     }
     if map_has_more {
-        if action_count != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        field(&mut output, "action", "expand_history_date_page", true);
-        output.push_str(",\"request\":");
-        output.push_str(&search_request_json(
-            request,
-            request.offset,
-            None,
-            date_offset.saturating_add(date_limit as u64),
-        ));
-        number(
-            &mut output,
-            "date_offset",
-            date_offset.saturating_add(date_limit as u64),
+        let next_date_offset = date_offset.saturating_add(date_limit as u64);
+        actions.push(
+            json::Object::new()
+                .name("action", "expand_history_date_page")
+                .raw(
+                    "request",
+                    &search_request_json(request, request.offset, None, next_date_offset),
+                )
+                .number("date_offset", next_date_offset)
+                .number("date_limit", date_limit as u64)
+                .finish(),
         );
-        number(&mut output, "date_limit", date_limit as u64);
-        output.push('}');
     }
-    for action in recovery_actions(root, request, coverage, matched_events) {
-        if action_count != 0 {
-            output.push(',');
-        }
-        output.push_str(&action);
-        action_count += 1;
-    }
-    let _ = action_count;
-    output.push(']');
-    output
+    actions.extend(recovery_actions(root, request, coverage, matched_events));
+    json::array(actions)
 }
 
 fn applied_filters_json(request: &SearchRequest) -> String {
-    let mut output = String::from("{");
-    optional_field_first(&mut output, "session", request.session.as_deref());
-    optional_field(&mut output, "source_id", request.source_id.as_deref());
-    optional_field(&mut output, "role", request.role.as_deref());
-    optional_field(&mut output, "kind", request.kind.as_deref());
-    optional_field(&mut output, "sender", request.sender.as_deref());
-    optional_field(&mut output, "from", request.from.as_deref());
-    optional_field(&mut output, "to", request.to.as_deref());
-    output.push('}');
-    output
+    json::Object::new()
+        .optional("session", request.session.as_deref())
+        .optional("source_id", request.source_id.as_deref())
+        .optional("role", request.role.as_deref())
+        .optional("kind", request.kind.as_deref())
+        .optional("sender", request.sender.as_deref())
+        .optional("from", request.from.as_deref())
+        .optional("to", request.to.as_deref())
+        .finish()
 }
 
 fn match_order(request: &SearchRequest) -> &'static str {
     if request.newest_first {
-        "reverse_chronological"
+        "desc"
     } else {
-        "chronological"
+        "asc"
     }
 }
 
@@ -1302,22 +1239,35 @@ fn recovery_actions(
 ) -> Vec<String> {
     let mut actions = Vec::new();
     if coverage.stale_sources > 0 {
-        actions.push(format!(
-            "{{\"action\":\"sync\",\"request\":{{\"corpus\":{}}},\"unscanned_source_bytes\":{}}}",
-            json_string(&root.to_string_lossy()),
-            coverage.unscanned_source_bytes,
-        ));
+        actions.push(
+            json::Object::new()
+                .name("action", "sync")
+                .raw("request", &sync_request_json(root))
+                .number("unscanned_source_bytes", coverage.unscanned_source_bytes)
+                .finish(),
+        );
     }
     if matched_events == 0 && !request.raw {
         let mut raw_request = request.clone();
         raw_request.raw = true;
         raw_request.offset = 0;
-        actions.push(format!(
-            "{{\"action\":\"scan_source_records\",\"request\":{}}}",
-            search_request_json(&raw_request, 0, None, request.date_offset),
-        ));
+        actions.push(
+            json::Object::new()
+                .name("action", "scan_source_records")
+                .raw(
+                    "request",
+                    &search_request_json(&raw_request, 0, None, request.date_offset),
+                )
+                .finish(),
+        );
     }
     actions
+}
+
+fn sync_request_json(root: &Path) -> String {
+    json::Object::new()
+        .name("corpus", &root.to_string_lossy())
+        .finish()
 }
 
 fn search_next_actions(
@@ -1330,13 +1280,18 @@ fn search_next_actions(
 ) -> String {
     let mut actions = Vec::new();
     if has_more {
-        actions.push(format!(
-            "{{\"action\":\"expand_literal_page\",\"request\":{}}}",
-            search_request_json(request, next_offset, None, request.date_offset),
-        ));
+        actions.push(
+            json::Object::new()
+                .name("action", "expand_literal_page")
+                .raw(
+                    "request",
+                    &search_request_json(request, next_offset, None, request.date_offset),
+                )
+                .finish(),
+        );
     }
     actions.extend(recovery_actions(root, request, coverage, matched_events));
-    format!("[{}]", actions.join(","))
+    json::array(actions)
 }
 
 fn search_request_json(
@@ -1348,64 +1303,44 @@ fn search_request_json(
     let (from, to) = range_override
         .map(|(from, to)| (Some(from), Some(to)))
         .unwrap_or((request.from.as_deref(), request.to.as_deref()));
-    let mut output = String::from("{");
-    field(&mut output, "query", &request.query, true);
-    number(&mut output, "limit", request.limit as u64);
-    number(&mut output, "offset", offset);
-    field(&mut output, "operation", &request.operation, false);
-    optional_field(&mut output, "source_id", request.source_id.as_deref());
-    optional_field(&mut output, "session", request.session.as_deref());
-    optional_field(&mut output, "role", request.role.as_deref());
-    optional_field(&mut output, "kind", request.kind.as_deref());
-    optional_field(&mut output, "sender", request.sender.as_deref());
-    optional_field(&mut output, "from", from);
-    optional_field(&mut output, "to", to);
-    number(&mut output, "date_limit", request.date_limit as u64);
-    number(&mut output, "date_offset", date_offset);
-    boolean(&mut output, "raw", request.raw);
-    boolean(&mut output, "ignore_case", request.fold_ascii_case);
-    field(
-        &mut output,
-        "order",
-        if request.newest_first { "desc" } else { "asc" },
-        false,
-    );
-    output.push('}');
-    output
+    json::Object::new()
+        .text("query", &request.query)
+        .number("limit", request.limit as u64)
+        .number("offset", offset)
+        .name("operation", operation(request, "search"))
+        .optional("source_id", request.source_id.as_deref())
+        .optional("session", request.session.as_deref())
+        .optional("role", request.role.as_deref())
+        .optional("kind", request.kind.as_deref())
+        .optional("sender", request.sender.as_deref())
+        .optional("from", from)
+        .optional("to", to)
+        .number("date_limit", request.date_limit as u64)
+        .number("date_offset", date_offset)
+        .boolean("raw", request.raw)
+        .boolean("ignore_case", request.fold_ascii_case)
+        .name("order", match_order(request))
+        .finish()
 }
 
 fn timeline_request_json(request: &TimelineRequest, date: Option<&str>, offset: u64) -> String {
-    let mut output = String::from("{");
-    optional_field_first(&mut output, "date", date.or(request.date.as_deref()));
-    optional_field(&mut output, "from", request.from.as_deref());
-    optional_field(&mut output, "to", request.to.as_deref());
-    optional_field(&mut output, "source_id", request.source_id.as_deref());
-    optional_field(&mut output, "session", request.session.as_deref());
-    optional_field(&mut output, "role", request.role.as_deref());
-    optional_field(&mut output, "kind", request.kind.as_deref());
-    optional_field(&mut output, "sender", request.sender.as_deref());
-    number(&mut output, "limit", request.limit as u64);
-    number(&mut output, "offset", offset);
-    field(
-        &mut output,
-        "order",
-        match request.order {
-            TimelineOrder::Asc => "asc",
-            TimelineOrder::Desc => "desc",
-        },
-        false,
-    );
-    output.push('}');
-    output
+    json::Object::new()
+        .optional("date", date.or(request.date.as_deref()))
+        .optional("from", request.from.as_deref())
+        .optional("to", request.to.as_deref())
+        .optional("source_id", request.source_id.as_deref())
+        .optional("session", request.session.as_deref())
+        .optional("role", request.role.as_deref())
+        .optional("kind", request.kind.as_deref())
+        .optional("sender", request.sender.as_deref())
+        .number("limit", request.limit as u64)
+        .number("offset", offset)
+        .name("order", request.order.as_str())
+        .finish()
 }
 
-fn hits_json(output: &mut String, hits: &[SearchHit]) {
-    for (index, hit) in hits.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&hit_json(hit));
-    }
+fn hits_json(hits: &[SearchHit]) -> String {
+    json::array(hits.iter().map(hit_json))
 }
 
 fn neighbouring_span(
@@ -1415,9 +1350,10 @@ fn neighbouring_span(
     byte_len: u64,
     before: usize,
     after: usize,
-) -> io::Result<(u64, u64, u64)> {
-    let mut preceding: std::collections::VecDeque<(u64, u64)> = Default::default();
+) -> io::Result<(u64, u64, u64, Option<u64>)> {
+    let mut preceding: std::collections::VecDeque<(u64, u64, u64)> = Default::default();
     let mut anchor_seen = false;
+    let mut anchor_line = None;
     let mut following = Vec::new();
     let mut included = 0u64;
     for path in corpus::source_files(root, source_id)? {
@@ -1436,13 +1372,14 @@ fn neighbouring_span(
             if header.source_id != source_id {
                 continue;
             }
-            let bounds = (header.byte_start, header.byte_len);
+            let bounds = (header.byte_start, header.byte_len, header.line);
             if anchor_seen {
                 if following.len() < after {
                     following.push(bounds);
                 }
             } else if header.byte_start == byte_start {
                 anchor_seen = true;
+                anchor_line = Some(header.line);
             } else if before > 0 {
                 if preceding.len() == before {
                     preceding.pop_front();
@@ -1456,15 +1393,17 @@ fn neighbouring_span(
     }
     let mut start = byte_start;
     let mut end = byte_start.saturating_add(byte_len);
+    // The span opens on its first record: the earliest one kept before the anchor.
+    let line = preceding.front().map(|(_, _, line)| *line).or(anchor_line);
     if anchor_seen {
         included += 1;
-        for (position, length) in preceding.iter().chain(following.iter()) {
+        for (position, length, _) in preceding.iter().chain(following.iter()) {
             included += 1;
             start = start.min(*position);
             end = end.max(position.saturating_add(*length));
         }
     }
-    Ok((start, end.saturating_sub(start), included))
+    Ok((start, end.saturating_sub(start), included, line))
 }
 
 pub fn context(
@@ -1482,8 +1421,8 @@ pub fn context(
             format!("source_id not found in catalog: {}", source_id),
         )
     })?;
-    let (byte_start, byte_len, neighbours) = if before == 0 && after == 0 {
-        (byte_start, byte_len, 1)
+    let (byte_start, byte_len, neighbours, line) = if before == 0 && after == 0 {
+        (byte_start, byte_len, 1, None)
     } else {
         neighbouring_span(root, source_id, byte_start, byte_len, before, after)?
     };
@@ -1540,28 +1479,35 @@ pub fn context(
         "ready"
     };
     let next_actions = if disposition == "ready" {
-        String::from("[]")
+        Vec::new()
     } else {
-        format!(
-            "[{{\"action\":\"sync\",\"request\":{{\"corpus\":{}}}}}]",
-            json_string(&root.to_string_lossy()),
-        )
+        vec![json::Object::new()
+            .name("action", "sync")
+            .raw("request", &sync_request_json(root))
+            .finish()]
+    };
+    let state = |size: u64, modified_ms: u64| {
+        json::Object::new()
+            .number("size", size)
+            .number("modified_ms", modified_ms)
+            .finish()
     };
     println!(
-        "{{\"disposition\":{},\"mode\":\"source_context\",\"source_ref\":{{\"source_id\":{},\"source_path\":{},\"byte_start\":{},\"byte_len\":{}}},\"records\":{},\"closes_on_record\":{},\"source_recorded\":{{\"size\":{},\"modified_ms\":{}}},\"source_observed\":{{\"size\":{},\"modified_ms\":{}}},\"raw\":{},\"next_actions\":{}}}",
-        json_string(disposition),
-        json_string(source_id),
-        json_string(&entry.path),
-        byte_start,
-        byte_len,
-        neighbours,
-        closes_on_record,
-        entry.size,
-        entry.modified_ms,
-        source_size,
-        observed_modified_ms,
-        json_string(&raw),
-        next_actions,
+        "{}",
+        json::Object::new()
+            .name("disposition", disposition)
+            .name("mode", "source_context")
+            .raw(
+                "source_ref",
+                &json::source_ref(source_id, &entry.path, line, byte_start, byte_len),
+            )
+            .number("records", neighbours)
+            .boolean("closes_on_record", closes_on_record)
+            .raw("source_recorded", &state(entry.size, entry.modified_ms))
+            .raw("source_observed", &state(source_size, observed_modified_ms))
+            .text("raw", &raw)
+            .raw("next_actions", &json::array(next_actions))
+            .finish()
     );
     Ok(())
 }
@@ -1617,10 +1563,10 @@ fn scan_file(
                 .as_ref()
                 .expect("a raw scan parses every header");
             scan_source_record(header, catalog, query, &mut workspace, stats, sources)?
-                .map(|snippet| (None, snippet))
+                .map(|snippet| (None, Some(snippet)))
         } else {
             scan_values(&mut reader, body_len, query, &mut workspace)?
-                .map(|(field, snippet)| (Some(field), snippet))
+                .map(|(field, snippet)| (Some(field), Some(snippet)))
         };
         if let Some((field, snippet)) = body_match {
             let header = match parsed_header {
@@ -1793,42 +1739,30 @@ impl Coverage {
         }
     }
 
-    fn write_fields(&self, output: &mut String) {
-        number(output, "corpus_sources", self.corpus_sources);
-        number(output, "incomplete_sources", self.incomplete_sources);
-        number(
-            output,
-            "output_bounded_sources",
-            self.output_bounded_sources,
-        );
-        number(output, "unreachable_sources", self.unreachable_sources);
-        number(
-            output,
-            "unavailable_source_paths",
-            self.unavailable_source_paths,
-        );
-        number(output, "unreadable_records", self.unreadable_records);
-        number(output, "stale_sources", self.stale_sources);
-        number(
-            output,
-            "unscanned_source_bytes",
-            self.unscanned_source_bytes,
-        );
-        if self.raw {
-            number(output, "scanned_records", self.scanned_records);
-        }
-        field(output, "coverage_disposition", self.disposition(), false);
+    fn write_fields(&self, output: &mut json::Object) {
         let render = |instant: u64| time::rfc3339_from_unix_ms(instant as i64, self.offset_minutes);
-        optional_field(
-            output,
-            "synced_through",
-            self.synced_through_ms.map(render).as_deref(),
-        );
-        optional_field(
-            output,
-            "absence_settled_through",
-            self.absence_settled_through_ms().map(render).as_deref(),
-        );
+        output
+            .number("corpus_sources", self.corpus_sources)
+            .number("incomplete_sources", self.incomplete_sources)
+            .number("output_bounded_sources", self.output_bounded_sources)
+            .number("unreachable_sources", self.unreachable_sources)
+            .number("unavailable_source_paths", self.unavailable_source_paths)
+            .number("unreadable_records", self.unreadable_records)
+            .number("stale_sources", self.stale_sources)
+            .number("unscanned_source_bytes", self.unscanned_source_bytes);
+        if self.raw {
+            output.number("scanned_records", self.scanned_records);
+        }
+        output
+            .name("coverage_disposition", self.disposition())
+            .optional(
+                "synced_through",
+                self.synced_through_ms.map(render).as_deref(),
+            )
+            .optional(
+                "absence_settled_through",
+                self.absence_settled_through_ms().map(render).as_deref(),
+            );
     }
 }
 
@@ -2009,8 +1943,9 @@ fn text_around(value: &[u8], position: usize, length: usize) -> String {
     String::from_utf8_lossy(&value[start..end]).into_owned()
 }
 
-/// The start of a body's values, joined by newlines and cut at `limit` bytes; marked when cut.
-fn values_head(body: &[u8], limit: usize) -> String {
+/// The start of a body's values, joined by newlines and cut at `limit` bytes, marked when cut;
+/// none when the record holds no text.
+fn values_head(body: &[u8], limit: usize) -> Option<String> {
     let mut head = Vec::new();
     let mut cut = false;
     for (_, value) in format::body_field_slices(body) {
@@ -2023,6 +1958,9 @@ fn values_head(body: &[u8], limit: usize) -> String {
             break;
         }
     }
+    if head.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
     let mut end = head.len().min(limit);
     while end > 0 && end < head.len() && head[end] & 0xC0 == 0x80 {
         end -= 1;
@@ -2031,7 +1969,7 @@ fn values_head(body: &[u8], limit: usize) -> String {
     if cut {
         text.push_str(crate::core::PROJECTION_BOUND_MARKER);
     }
-    text
+    Some(text)
 }
 
 /// Reads a body of `body_len` bytes into `body`, reusing its capacity.
@@ -2124,102 +2062,67 @@ fn timeline_map_hit_json(hit: &SearchHit) -> String {
 
 fn hit_json_with_snippet_state(hit: &SearchHit, snippet_state: Option<&str>) -> String {
     let header = &hit.header;
-    let mut output = format!(
-        "{{\"event_id\":{},\"source_ref\":{{\"source_id\":{},\"source_path\":{},\"line\":{},\"byte_start\":{},\"byte_len\":{}}},\"session\":{},\"turn\":{},\"kind\":{},\"role\":{},\"sender\":{},\"via\":{},\"timestamp\":{},\"field\":{},\"snippet\":{}",
-        json_string(&format!("{}:{}", header.source_id, header.event_index)),
-        json_string(&header.source_id),
-        json_string(&hit.source_path),
-        header.line,
-        header.byte_start,
-        header.byte_len,
-        json_string(&header.session),
-        json_string(&header.turn),
-        json_string(&header.kind),
-        json_string(&header.role),
-        json_string(&header.sender),
-        json_string(&header.via),
-        json_string(&header.timestamp),
-        hit.field
-            .as_deref()
-            .map(json_string)
-            .unwrap_or_else(|| "null".to_string()),
-        json_string(&hit.snippet),
-    );
-    if let Some(state) = snippet_state {
-        field(&mut output, "snippet_state", state, false);
-    }
-    output.push('}');
+    let mut output = json::Object::new();
     output
+        .name(
+            "event_id",
+            &format!("{}:{}", header.source_id, header.event_index),
+        )
+        .raw(
+            "source_ref",
+            &json::source_ref(
+                &header.source_id,
+                &hit.source_path,
+                Some(header.line),
+                header.byte_start,
+                header.byte_len,
+            ),
+        )
+        .name("session", &header.session)
+        .name("turn", &header.turn)
+        .name("kind", &header.kind)
+        .name("role", &header.role)
+        .name("sender", &header.sender)
+        .name("via", &header.via)
+        .name("timestamp", &header.timestamp)
+        .optional("field", hit.field.as_deref());
+    match (&hit.snippet, snippet_state) {
+        (_, Some(state)) => output.raw("snippet", "null").name("snippet_state", state),
+        (Some(snippet), None) => output.text("snippet", snippet),
+        (None, None) => output.raw("snippet", "null"),
+    };
+    output.finish()
 }
 
 fn facets_json(facets: &Facets) -> String {
-    format!(
-        "{{\"source\":{},\"session\":{},\"kind\":{},\"sender\":{},\"date\":{}}}",
-        map_json(&facets.source),
-        map_json(&facets.session),
-        map_json(&facets.kind),
-        map_json(&facets.sender),
-        map_json(&facets.date),
-    )
+    json::Object::new()
+        .raw("source", &facet_json(&facets.source, FACET_LIMIT))
+        .raw("session", &facet_json(&facets.session, FACET_LIMIT))
+        .raw("kind", &facet_json(&facets.kind, FACET_LIMIT))
+        .raw("sender", &facet_json(&facets.sender, FACET_LIMIT))
+        .raw("date", &facet_json(&facets.date, FACET_LIMIT))
+        .finish()
 }
 
-fn map_json(values: &BTreeMap<String, u64>) -> String {
-    map_json_limited(values, 50)
-}
-
-fn map_json_limited(values: &BTreeMap<String, u64>, limit: usize) -> String {
+/// The most frequent values of a facet, most frequent first, at most `limit` of them.
+fn facet_json(values: &BTreeMap<String, u64>, limit: usize) -> String {
     let mut entries = values.iter().collect::<Vec<_>>();
     entries.sort_by(|(left_value, left_count), (right_value, right_count)| {
         right_count
             .cmp(left_count)
             .then_with(|| left_value.cmp(right_value))
     });
-    let mut output = format!(
-        "{{\"distinct\":{},\"truncated\":{},\"items\":[",
-        values.len(),
-        values.len() > limit
-    );
-    for (index, (value, count)) in entries.into_iter().take(limit).enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&format!(
-            "{{\"value\":{},\"count\":{}}}",
-            json_string(value),
-            count
-        ));
-    }
-    output.push_str("]}");
-    output
-}
-
-fn field(output: &mut String, key: &str, value: &str, first: bool) {
-    if !first {
-        output.push(',');
-    }
-    output.push_str(&format!("\"{}\":{}", key, json_string(value)));
-}
-
-fn optional_field(output: &mut String, key: &str, value: Option<&str>) {
-    match value {
-        Some(value) => field(output, key, value, false),
-        None => output.push_str(&format!(",\"{}\":null", key)),
-    }
-}
-
-fn optional_field_first(output: &mut String, key: &str, value: Option<&str>) {
-    match value {
-        Some(value) => field(output, key, value, true),
-        None => output.push_str(&format!("\"{}\":null", key)),
-    }
-}
-
-fn number(output: &mut String, key: &str, value: u64) {
-    output.push_str(&format!(",\"{}\":{}", key, value));
-}
-
-fn boolean(output: &mut String, key: &str, value: bool) {
-    output.push_str(&format!(",\"{}\":{}", key, value));
+    let items = entries.into_iter().take(limit).map(|(value, count)| {
+        json::Object::new()
+            .name("value", value)
+            .number("count", *count)
+            .finish()
+    });
+    json::Object::new()
+        .number("distinct", values.len() as u64)
+        .boolean("truncated", values.len() > limit)
+        .raw("items", &json::array(items))
+        .finish()
 }
 
 #[cfg(test)]
@@ -2394,7 +2297,7 @@ mod tests {
             },
             source_path: String::new(),
             field: None,
-            snippet: String::new(),
+            snippet: None,
         };
         let page = search_page(
             vec![

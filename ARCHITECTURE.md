@@ -12,6 +12,7 @@ source retrieval. All commands run locally.
 | `core.rs` | Event classification, field selection, and turn state |
 | `format.rs` | Corpus record encoding and decoding |
 | `time.rs` | Timestamps, dates, offsets, and `--from`/`--to` ranges |
+| `json.rs` | The JSON writer every command's result goes through |
 | `corpus.rs` | Source discovery, indexing, checkpoints, and generated files |
 | `imports.rs` | Managed JSONL imports and provenance records |
 | `search.rs` | Literal search, timeline reads, raw scans, and context reads |
@@ -145,7 +146,9 @@ a turn, so notifications, injected context, and summaries stay inside the
 person's turn.
 
 Source replacement, truncation, and changes observed during a sync receive
-separate dispositions. `--rebuild-source` rebuilds one source projection.
+separate dispositions. `--rebuild-source` reads again the logs at a path, one log
+or every log under a directory; a path that names none of the logs the sync reads
+is an error.
 
 The source catalog is written before processing starts so interrupted builds can
 resume pending paths. Partial corpus segments are removed during recovery.
@@ -254,17 +257,30 @@ inputs from the original records.
 
 ## Commit lookup
 
-The `commits` command extracts hexadecimal names from projected records and asks
-Git which names resolve to commits in the selected repository. It returns the
-resolved object IDs and the earliest source references for each commit.
+The `commits` command extracts hexadecimal names, seven to forty digits with at
+least one letter, from the values of projected records. Git lists the commits
+its refs and reflogs reach once, and a name resolves when it starts exactly one
+of them; asking Git about each name took minutes for a large corpus when the
+repository was on a slow file system. The result lists each commit with the
+earliest records that mention it.
 
 ## Output
 
-Commands write one JSON object to standard output; `help`, `--version`, and
-`said --format text` write plain text. `disposition` identifies the command
-result. Errors use `disposition: "error"` with a `reason` field and exit with
-status 1. A `next_actions` entry names a command and its options without the
-leading dashes, for example `{"action":"sync","request":{"corpus":...}}`.
+Commands write one JSON object to standard output, through one writer
+(`json.rs`); `help`, `--version`, and `said --format text` write plain text.
+`disposition` identifies the command result. Errors use `disposition: "error"`
+with a `reason` field and exit with status 1; a request that cannot be served,
+such as a date-map filter that needs `--date`, is an error too. A
+`next_actions` entry names a command and its options without the leading
+dashes, for example `{"action":"sync","request":{"corpus":...}}`.
+
+The same things look the same in every result. A value that is not there is
+`null`, never `""`; text is written as it is, empty or not. A record is named by
+one `source_ref`, `{source_id, source_path, line, byte_start, byte_len}`, whose
+`line` is `null` only for a byte range not known to start a record. Orders are
+`asc` or `desc`. A paged result always carries `truncated` and `next_offset`,
+`null` on the last page. A corpus body is shown as its `fields`, each a `path`
+and a `value`, never in the encoding the corpus stores it in.
 
 Counts and limits describe the current command. Corpus byte totals describe the
 current generated projection.

@@ -223,28 +223,6 @@ fn hex(value: u8) -> Result<u8, String> {
     }
 }
 
-pub fn json_string(value: &str) -> String {
-    let mut output = String::with_capacity(value.len() + 2);
-    output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            '\u{08}' => output.push_str("\\b"),
-            '\u{0c}' => output.push_str("\\f"),
-            character if character.is_control() => {
-                write!(output, "\\u{:04x}", character as u32).expect("String write");
-            }
-            character => output.push(character),
-        }
-    }
-    output.push('"');
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::{body_field_slices, body_fields, decode_token, encode_token, push_field};

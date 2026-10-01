@@ -21,6 +21,17 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    pub const ALL: [EventKind; 8] = [
+        Self::User,
+        Self::Assistant,
+        Self::Command,
+        Self::Output,
+        Self::Patch,
+        Self::Summary,
+        Self::Unknown,
+        Self::Invalid,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::User => "user",
@@ -65,6 +76,15 @@ pub enum Sender {
 }
 
 impl Sender {
+    pub const ALL: [Sender; 6] = [
+        Self::Human,
+        Self::Agent,
+        Self::System,
+        Self::Summary,
+        Self::Assistant,
+        Self::Unknown,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",

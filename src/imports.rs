@@ -1,4 +1,5 @@
-use crate::format::{decode_token, encode_token, json_string};
+use crate::format::{decode_token, encode_token};
+use crate::json;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -65,23 +66,32 @@ pub struct ImportReport {
 
 impl ImportReport {
     pub fn json(&self) -> String {
-        format!(
-            "{{\"disposition\":\"imported\",\"mode\":\"managed_jsonl_import\",\"import_id\":{},\"provenance\":{},\"label\":{},\"source_computer\":{},\"original_path\":{},\"imported_at_ms\":{},\"store\":{},\"registry\":{},\"managed_source\":{},\"file_manifest\":{},\"files_copied\":{},\"bytes_copied\":{},\"copy_disposition\":\"complete\",\"projection_state\":{},\"next_actions\":[{{\"action\":\"sync\",\"request\":{{\"corpus\":{}}}}}]}}",
-            json_string(&self.import.import_id),
-            json_string(&self.import.provenance),
-            json_string(&self.import.label),
-            optional_json_string(&self.import.source_computer),
-            json_string(&self.import.original_path),
-            self.import.imported_at_ms,
-            json_string(&self.store),
-            json_string(&self.registry),
-            json_string(&self.managed_source),
-            json_string(&self.file_manifest),
-            self.import.files,
-            self.import.bytes,
-            json_string(self.projection_state),
-            json_string(&self.corpus),
-        )
+        let sync = json::Object::new()
+            .name("action", "sync")
+            .raw(
+                "request",
+                &json::Object::new().name("corpus", &self.corpus).finish(),
+            )
+            .finish();
+        json::Object::new()
+            .name("disposition", "imported")
+            .name("mode", "managed_jsonl_import")
+            .name("import_id", &self.import.import_id)
+            .text("provenance", &self.import.provenance)
+            .text("label", &self.import.label)
+            .name("source_computer", &self.import.source_computer)
+            .name("original_path", &self.import.original_path)
+            .number("imported_at_ms", self.import.imported_at_ms)
+            .name("store", &self.store)
+            .name("registry", &self.registry)
+            .name("managed_source", &self.managed_source)
+            .name("file_manifest", &self.file_manifest)
+            .number("files_copied", self.import.files)
+            .number("bytes_copied", self.import.bytes)
+            .name("copy_disposition", "complete")
+            .name("projection_state", self.projection_state)
+            .raw("next_actions", &json::array([sync]))
+            .finish()
     }
 }
 
@@ -498,36 +508,21 @@ fn write_file_manifest(path: &Path, files: &[ImportFile]) -> io::Result<()> {
 }
 
 fn observed_entries_json(entries: &[ObservedImport]) -> String {
-    let mut output = String::from("[");
-    for (index, entry) in entries.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&format!(
-            "{{\"import_id\":{},\"provenance\":{},\"label\":{},\"source_computer\":{},\"original_path\":{},\"imported_at_ms\":{},\"managed_source\":{},\"file_manifest\":{},\"files\":{},\"bytes\":{},\"disposition\":{}}}",
-            json_string(&entry.import.import_id),
-            json_string(&entry.import.provenance),
-            json_string(&entry.import.label),
-            optional_json_string(&entry.import.source_computer),
-            json_string(&entry.import.original_path),
-            entry.import.imported_at_ms,
-            json_string(&entry.managed_source),
-            json_string(&entry.file_manifest),
-            entry.import.files,
-            entry.import.bytes,
-            json_string(&entry.disposition),
-        ));
-    }
-    output.push(']');
-    output
-}
-
-fn optional_json_string(value: &str) -> String {
-    if value.is_empty() {
-        "null".to_string()
-    } else {
-        json_string(value)
-    }
+    json::array(entries.iter().map(|entry| {
+        json::Object::new()
+            .name("import_id", &entry.import.import_id)
+            .text("provenance", &entry.import.provenance)
+            .text("label", &entry.import.label)
+            .name("source_computer", &entry.import.source_computer)
+            .name("original_path", &entry.import.original_path)
+            .number("imported_at_ms", entry.import.imported_at_ms)
+            .name("managed_source", &entry.managed_source)
+            .name("file_manifest", &entry.file_manifest)
+            .number("files", entry.import.files)
+            .number("bytes", entry.import.bytes)
+            .name("disposition", &entry.disposition)
+            .finish()
+    }))
 }
 
 fn is_safe_relative(path: &Path) -> bool {

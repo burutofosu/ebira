@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::{human_text_from_body, persons_message, PersonsMessage};
 use crate::corpus::{self, LogReader, ReadRecord, SourceEntry};
-use crate::format::json_string;
+use crate::json;
 use crate::jsonl::{Field, ScalarKind};
 
 pub struct FollowRequest {
@@ -40,6 +40,7 @@ struct Message {
     sender: &'static str,
     via: String,
     timestamp: String,
+    line: u64,
     byte_start: u64,
     /// The whole line, its newline included, as in a corpus `source_ref`.
     byte_len: u64,
@@ -68,7 +69,7 @@ pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
             reader = corpus::log_reader_at(&catalog, path, cursor)?;
         }
         let (messages, next) = match reader.as_mut() {
-            Some(reader) => scan(path, reader, cursor, request)?,
+            Some((reader, lines)) => scan(path, reader, lines, cursor, request)?,
             None => (Vec::new(), cursor),
         };
         if !messages.is_empty() {
@@ -237,10 +238,12 @@ fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
 }
 
 /// Read every complete line after `cursor`; return the messages found and the
-/// boundary after the last line read.
+/// boundary after the last line read. `lines` counts the lines before `cursor`
+/// and is moved past the lines read.
 fn scan(
     path: &Path,
     reader: &mut LogReader,
+    lines: &mut u64,
     cursor: u64,
     request: &FollowRequest,
 ) -> io::Result<(Vec<Message>, u64)> {
@@ -261,7 +264,8 @@ fn scan(
         let record = reader.read(&line, position, read.oversized);
         let byte_start = position;
         position += read.total_len;
-        if let Some(message) = message(&record, request, byte_start, read.total_len) {
+        *lines += 1;
+        if let Some(message) = message(&record, request, *lines, byte_start, read.total_len) {
             messages.push(message);
             if messages.len() >= request.limit {
                 break;
@@ -291,6 +295,7 @@ fn value<'a>(fields: &'a [Field], path: &str) -> Option<&'a str> {
 fn message(
     record: &ReadRecord,
     request: &FollowRequest,
+    line: u64,
     byte_start: u64,
     byte_len: u64,
 ) -> Option<Message> {
@@ -331,6 +336,7 @@ fn message(
         sender: meta.sender.as_str(),
         via: meta.via.clone(),
         timestamp: meta.timestamp.clone().unwrap_or_default(),
+        line,
         byte_start,
         byte_len,
         text,
@@ -374,31 +380,36 @@ fn collect_text(fields: &[Field], content_prefix: &str, kinds: &[&str]) -> Strin
 }
 
 fn print_result(disposition: &str, target: &Target, after_byte: u64, messages: &[Message]) {
-    let mut output = String::new();
-    output.push_str(&format!(
-        "{{\"disposition\":{},\"source_id\":{},\"source_path\":{},\"after_byte\":{},\"messages\":[",
-        json_string(disposition),
-        json_string(&target.source_id),
-        json_string(&target.path.to_string_lossy()),
-        after_byte
-    ));
-    for (index, message) in messages.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push_str(&format!(
-            "{{\"sender\":{},\"via\":{},\"timestamp\":{},\"byte_start\":{},\"byte_len\":{},\"text\":{},\"images\":{}}}",
-            json_string(message.sender),
-            json_string(&message.via),
-            json_string(&message.timestamp),
-            message.byte_start,
-            message.byte_len,
-            json_string(&message.text),
-            message.images
-        ));
-    }
-    output.push_str("]}");
-    println!("{}", output);
+    let source_path = target.path.to_string_lossy();
+    let messages = messages.iter().map(|message| {
+        json::Object::new()
+            .name("sender", message.sender)
+            .name("via", &message.via)
+            .name("timestamp", &message.timestamp)
+            .text("text", &message.text)
+            .number("images", message.images as u64)
+            .raw(
+                "source_ref",
+                &json::source_ref(
+                    &target.source_id,
+                    &source_path,
+                    Some(message.line),
+                    message.byte_start,
+                    message.byte_len,
+                ),
+            )
+            .finish()
+    });
+    println!(
+        "{}",
+        json::Object::new()
+            .name("disposition", disposition)
+            .name("source_id", &target.source_id)
+            .name("source_path", &source_path)
+            .number("after_byte", after_byte)
+            .raw("messages", &json::array(messages))
+            .finish()
+    );
 }
 
 #[cfg(test)]
@@ -439,8 +450,9 @@ mod tests {
 
     /// The messages after `cursor` from `sender`, read as `run` reads them without a corpus.
     fn follow(path: &Path, cursor: u64, sender: &str) -> Option<(Vec<Message>, u64)> {
-        let mut reader = corpus::log_reader_at(&BTreeMap::new(), path, cursor).expect("reader")?;
-        Some(scan(path, &mut reader, cursor, &request(sender)).expect("scan"))
+        let (mut reader, mut lines) =
+            corpus::log_reader_at(&BTreeMap::new(), path, cursor).expect("reader")?;
+        Some(scan(path, &mut reader, &mut lines, cursor, &request(sender)).expect("scan"))
     }
 
     fn append(path: &Path, contents: &str) {
@@ -460,9 +472,9 @@ mod tests {
         assert_eq!(cursor, CODEX_THREAD.len() as u64);
         let line = CODEX_THREAD.lines().nth(1).expect("message line");
         assert_eq!(
-            messages[0].byte_len,
-            line.len() as u64 + 1,
-            "the range covers the newline, as corpus references do"
+            (messages[0].line, messages[0].byte_len),
+            (2, line.len() as u64 + 1),
+            "the line number and the range, newline included, are those of corpus references"
         );
         fs::remove_file(path).expect("remove transcript");
     }

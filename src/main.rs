@@ -4,6 +4,7 @@ mod corpus;
 mod follow;
 mod format;
 mod imports;
+mod json;
 mod jsonl;
 mod resume;
 mod said;
@@ -71,7 +72,7 @@ const COMMANDS: &[CommandSpec] = &[
             "                               without it the first sync reads the Claude Code and Codex",
             "                               transcript directories",
             "  --rebuild                    build the corpus again; with --source, from exactly those",
-            "  --rebuild-source <path>      build one source again",
+            "  --rebuild-source <path>      read again the logs at a path: one log, or all under a directory",
             "  --tool-output-chars <n>      characters kept from each tool output (default 300)",
         ],
         values: &["--corpus", "--source", "--rebuild-source", "--tool-output-chars"],
@@ -87,19 +88,20 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "said",
-        synopsis: "[--session <id>] [--source-id <id>] [--cwd <text>] [--agent claude|codex] [--query <text>] [--ignore-case] [--from <time>] [--to <time>] [--order desc|asc] [--limit <n>] [--offset <n>] [--max-chars <n>] [--format json|text] [--include-imported]",
+        synopsis: "[--session <id>] [--source-id <id>] [--cwd <text>] [--app claude|codex|other] [--query <text>] [--ignore-case] [--from <time>] [--to <time>] [--order desc|asc] [--limit <n>] [--offset <n>] [--max-chars <n>] [--format json|text] [--include-imported]",
         summary: "List the person's own messages, newest first",
         details: &[
             "  --cwd <text>                 messages whose working directory contains the text",
             "  --limit <n>, --max-chars <n> messages and characters per page (default 30 and 15000)",
-            "  --include-imported           also list the copies another agent imported",
+            "  --include-imported           also list copies of the person's messages imported",
+            "                               with another conversation",
         ],
         values: &[
             "--corpus",
             "--session",
             "--source-id",
             "--cwd",
-            "--agent",
+            "--app",
             "--query",
             "--from",
             "--to",
@@ -527,7 +529,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 session: option_values(args, "--session").into_iter().next(),
                 source_id: option_values(args, "--source-id").into_iter().next(),
                 cwd: option_values(args, "--cwd").into_iter().next(),
-                agent: option_values(args, "--agent").into_iter().next(),
+                app: option_values(args, "--app").into_iter().next(),
                 query: option_values(args, "--query").into_iter().next(),
                 fold_ascii_case: has_flag(args, "--ignore-case"),
                 from,
@@ -555,11 +557,11 @@ fn run(args: &[String]) -> io::Result<()> {
                 offset_minutes,
                 include_imported: has_flag(args, "--include-imported"),
             };
-            if let Some(agent) = request.agent.as_deref() {
-                if !matches!(agent, "claude" | "codex") {
+            if let Some(app) = request.app.as_deref() {
+                if !matches!(app, "claude" | "codex" | "other") {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("--agent must be claude or codex, got {}", agent),
+                        format!("--app must be claude, codex, or other, got {}", app),
                     ));
                 }
             }
@@ -598,7 +600,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 .next()
                 .unwrap_or_else(|| "assistant".to_string());
             if sender != "any" {
-                check_sender(&sender, "|any")?;
+                check_sender(&sender, &["any"])?;
             }
             let request = follow::FollowRequest {
                 source_id: option_values(args, "--source-id").into_iter().next(),
@@ -682,28 +684,37 @@ fn sync(args: &[String]) -> io::Result<()> {
         &option_values(args, "--rebuild-source"),
     )?;
     println!(
-        "{{\"disposition\":\"{}\",\"mode\":\"compact_literal_corpus\",\"counter_scope\":\"this_command\",\"sources_seen\":{},\"sources_processed\":{},\"sources_appended\":{},\"sources_reused\":{},\"records\":{},\"invalid_records\":{},\"partial_records\":{},\"timeline_runs\":{},\"corpus_bytes\":{},\"corpus_bytes_scope\":\"current_projection\",\"unreadable_source_paths\":{},\"changed_sources_total\":{},\"changed_sources_truncated\":{},\"changed_sources\":{},\"managed_imports\":{},\"unavailable_managed_imports\":{},\"detected_sources\":{},\"rebuild_cause\":{},\"corpus\":{}}}",
-        report.disposition,
-        report.sources_seen,
-        report.sources_processed,
-        report.sources_appended,
-        report.sources_reused,
-        report.records,
-        report.invalid_records,
-        report.partial_records,
-        report.timeline_runs,
-        report.corpus_bytes,
-        report.unreadable_source_paths,
-        report.changed_sources_total,
-        report.changed_sources_total > report.changed_sources.len() as u64,
-        changed_sources_json(&report),
-        managed.entries.len(),
-        managed.unavailable_imports,
-        string_array_json(&detected),
-        rebuild_cause
-            .map(format::json_string)
-            .unwrap_or_else(|| "null".to_string()),
-        format::json_string(&report.corpus),
+        "{}",
+        json::Object::new()
+            .name("disposition", report.disposition)
+            .name("mode", "compact_literal_corpus")
+            .name("counter_scope", "this_command")
+            .number("sources_seen", report.sources_seen)
+            .number("sources_processed", report.sources_processed)
+            .number("sources_appended", report.sources_appended)
+            .number("sources_reused", report.sources_reused)
+            .number("records", report.records)
+            .number("invalid_records", report.invalid_records)
+            .number("partial_records", report.partial_records)
+            .number("timeline_runs", report.timeline_runs)
+            .number("corpus_bytes", report.corpus_bytes)
+            .name("corpus_bytes_scope", "current_projection")
+            .number("unreadable_source_paths", report.unreadable_source_paths)
+            .number("changed_sources_total", report.changed_sources_total)
+            .boolean(
+                "changed_sources_truncated",
+                report.changed_sources_total > report.changed_sources.len() as u64,
+            )
+            .raw("changed_sources", &changed_sources_json(&report))
+            .number("managed_imports", managed.entries.len() as u64)
+            .number("unavailable_managed_imports", managed.unavailable_imports)
+            .raw(
+                "detected_sources",
+                &json::strings(detected.iter().map(String::as_str)),
+            )
+            .optional("rebuild_cause", rebuild_cause)
+            .name("corpus", &report.corpus)
+            .finish()
     );
     Ok(())
 }
@@ -723,7 +734,7 @@ fn search_request(
         source_id: option_values(args, "--source-id").into_iter().next(),
         session: option_values(args, "--session").into_iter().next(),
         role: option_values(args, "--role").into_iter().next(),
-        kind: option_values(args, "--kind").into_iter().next(),
+        kind: kind_option(args)?,
         sender: sender_option(args)?,
         from,
         to,
@@ -764,52 +775,50 @@ fn sender_option(args: &[String]) -> io::Result<Option<String>> {
     let Some(value) = option_values(args, "--sender").into_iter().next() else {
         return Ok(None);
     };
-    check_sender(&value, "")?;
+    check_sender(&value, &[])?;
     Ok(Some(value))
 }
 
-fn check_sender(value: &str, extra: &str) -> io::Result<()> {
-    if matches!(
-        value,
-        "human" | "agent" | "system" | "summary" | "assistant"
-    ) {
+fn check_sender(value: &str, extra: &[&str]) -> io::Result<()> {
+    let names = core::Sender::ALL
+        .iter()
+        .map(|sender| sender.as_str())
+        .chain(extra.iter().copied())
+        .collect::<Vec<_>>();
+    check_name("--sender", value, &names)
+}
+
+/// A value that must be one of `names`, all of which the error lists.
+fn check_name(option: &str, value: &str, names: &[&str]) -> io::Result<()> {
+    if names.contains(&value) {
         return Ok(());
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!(
-            "--sender must be human|agent|system|summary|assistant{}, got {}",
-            extra, value
-        ),
+        format!("{} must be {}, got {}", option, names.join("|"), value),
     ))
 }
 
-fn string_array_json(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| format::json_string(value))
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
+fn kind_option(args: &[String]) -> io::Result<Option<String>> {
+    let Some(value) = option_values(args, "--kind").into_iter().next() else {
+        return Ok(None);
+    };
+    let names = core::EventKind::ALL.map(core::EventKind::as_str);
+    check_name("--kind", &value, &names)?;
+    Ok(Some(value))
 }
 
 fn changed_sources_json(report: &corpus::BuildReport) -> String {
-    let mut output = String::from("[");
-    for (index, source) in report.changed_sources.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push_str(&format!(
-            "{{\"source_id\":{},\"disposition\":{},\"previous_byte_end\":{},\"committed_byte_end\":{},\"observed_size\":{},\"records_added\":{}}}",
-            format::json_string(&source.source_id),
-            format::json_string(&source.disposition),
-            source.previous_byte_end,
-            source.committed_byte_end,
-            source.observed_size,
-            source.records_added,
-        ));
-    }
-    output.push(']');
-    output
+    json::array(report.changed_sources.iter().map(|source| {
+        json::Object::new()
+            .name("source_id", &source.source_id)
+            .name("disposition", &source.disposition)
+            .number("previous_byte_end", source.previous_byte_end)
+            .number("committed_byte_end", source.committed_byte_end)
+            .number("observed_size", source.observed_size)
+            .number("records_added", source.records_added)
+            .finish()
+    }))
 }
 
 fn timeline_request(args: &[String], offset_minutes: i64) -> io::Result<search::TimelineRequest> {
@@ -834,7 +843,7 @@ fn timeline_request(args: &[String], offset_minutes: i64) -> io::Result<search::
         source_id: option_values(args, "--source-id").into_iter().next(),
         session: option_values(args, "--session").into_iter().next(),
         role: option_values(args, "--role").into_iter().next(),
-        kind: option_values(args, "--kind").into_iter().next(),
+        kind: kind_option(args)?,
         sender: sender_option(args)?,
         limit: number_option(args, "--limit", if date.is_some() { 50 } else { 200 })?,
         offset: number_option_u64_optional(args, "--offset")?,
@@ -867,8 +876,11 @@ fn number_option_u64(args: &[String], name: &str) -> io::Result<u64> {
 fn main() {
     if let Err(error) = run(&std::env::args().skip(1).collect::<Vec<_>>()) {
         println!(
-            "{{\"disposition\":\"error\",\"reason\":{}}}",
-            format::json_string(&error.to_string())
+            "{}",
+            json::Object::new()
+                .name("disposition", "error")
+                .text("reason", &error.to_string())
+                .finish()
         );
         eprintln!("ebira: {}", error);
         std::process::exit(1);
