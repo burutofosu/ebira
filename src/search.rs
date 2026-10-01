@@ -25,6 +25,10 @@ const HISTORY_MAP_DATE_LIMIT: usize = 12;
 const MAX_TIMELINE_PAGE_EVENTS: usize = 100_000;
 const MAX_CONTEXT_BYTES: u64 = 4 * 1024 * 1024;
 
+#[cfg(test)]
+#[path = "search_actions_tests.rs"]
+mod action_tests;
+
 #[derive(Clone, Debug, Default)]
 pub struct SearchRequest {
     pub query: String,
@@ -298,6 +302,7 @@ pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
         }
     }
     print_timeline_map(
+        root,
         &scope,
         &runs_by_source,
         &dates,
@@ -472,6 +477,7 @@ fn timeline_hit(
 }
 
 fn print_timeline_map(
+    root: &Path,
     scope: &corpus::Scope,
     runs_by_source: &BTreeMap<String, Vec<TimelineRun>>,
     dates: &BTreeMap<String, TimelineMapBucket>,
@@ -539,14 +545,7 @@ fn print_timeline_map(
         .into_iter()
         .skip(page_start)
         .take(limit.min(12))
-        .map(|date| {
-            json::Object::new()
-                .name("action", "list_date_events")
-                .name("date", date)
-                .number("limit", limit as u64)
-                .raw("request", &timeline_request_json(request, Some(date), 0))
-                .finish()
-        });
+        .map(|date| timeline_next_action(root, request, date));
     println!(
         "{}",
         json::Object::new()
@@ -1153,14 +1152,14 @@ fn history_next_actions(
         }
         actions.push(
             json::Object::new()
-                .name("action", "expand_time_bucket")
+                .name("action", "history")
                 .text("query", &request.query)
                 .name("from", date)
                 .name("to", date)
                 .number("limit", request.limit as u64)
                 .raw(
                     "request",
-                    &search_request_json(request, 0, Some((date, date)), 0),
+                    &search_request_json(root, request, 0, Some((date, date)), 0),
                 )
                 .number("matched_events", bucket.matched_events)
                 .finish(),
@@ -1169,13 +1168,13 @@ fn history_next_actions(
     if has_more {
         actions.push(
             json::Object::new()
-                .name("action", "expand_literal_page")
+                .name("action", "history")
                 .text("query", &request.query)
                 .number("offset", next_offset)
                 .number("limit", request.limit as u64)
                 .raw(
                     "request",
-                    &search_request_json(request, next_offset, None, request.date_offset),
+                    &search_request_json(root, request, next_offset, None, request.date_offset),
                 )
                 .finish(),
         );
@@ -1184,10 +1183,10 @@ fn history_next_actions(
         let next_date_offset = date_offset.saturating_add(date_limit as u64);
         actions.push(
             json::Object::new()
-                .name("action", "expand_history_date_page")
+                .name("action", "history")
                 .raw(
                     "request",
-                    &search_request_json(request, request.offset, None, next_date_offset),
+                    &search_request_json(root, request, request.offset, None, next_date_offset),
                 )
                 .number("date_offset", next_date_offset)
                 .number("date_limit", date_limit as u64)
@@ -1256,10 +1255,10 @@ fn recovery_actions(
         raw_request.offset = 0;
         actions.push(
             json::Object::new()
-                .name("action", "scan_source_records")
+                .name("action", operation(request, "search"))
                 .raw(
                     "request",
-                    &search_request_json(&raw_request, 0, None, request.date_offset),
+                    &search_request_json(root, &raw_request, 0, None, 0),
                 )
                 .finish(),
         );
@@ -1285,10 +1284,10 @@ fn search_next_actions(
     if has_more {
         actions.push(
             json::Object::new()
-                .name("action", "expand_literal_page")
+                .name("action", "search")
                 .raw(
                     "request",
-                    &search_request_json(request, next_offset, None, request.date_offset),
+                    &search_request_json(root, request, next_offset, None, request.date_offset),
                 )
                 .finish(),
         );
@@ -1298,19 +1297,39 @@ fn search_next_actions(
 }
 
 fn search_request_json(
+    root: &Path,
     request: &SearchRequest,
     offset: u64,
     range_override: Option<(&str, &str)>,
     date_offset: u64,
 ) -> String {
     let (from, to) = range_override
-        .map(|(from, to)| (Some(from), Some(to)))
+        .map(|(from, to)| {
+            // A date bucket narrows the range; retain any tighter timestamp bounds.
+            let from = request
+                .from
+                .as_deref()
+                .filter(|bound| {
+                    time::local_date(bound, request.offset_minutes)
+                        .is_some_and(|day| day.as_str() >= from)
+                })
+                .unwrap_or(from);
+            let to = request
+                .to
+                .as_deref()
+                .filter(|bound| {
+                    time::local_date(bound, request.offset_minutes)
+                        .is_some_and(|day| day.as_str() <= to)
+                })
+                .unwrap_or(to);
+            (Some(from), Some(to))
+        })
         .unwrap_or((request.from.as_deref(), request.to.as_deref()));
     json::Object::new()
+        .name("corpus", &root.to_string_lossy())
         .text("query", &request.query)
         .number("limit", request.limit as u64)
         .number("offset", offset)
-        .name("operation", operation(request, "search"))
         .optional("source_id", request.source_id.as_deref())
         .optional("session", request.session.as_deref())
         .optional("role", request.role.as_deref())
@@ -1326,8 +1345,26 @@ fn search_request_json(
         .finish()
 }
 
-fn timeline_request_json(request: &TimelineRequest, date: Option<&str>, offset: u64) -> String {
+fn timeline_next_action(root: &Path, request: &TimelineRequest, date: &str) -> String {
     json::Object::new()
+        .name("action", "timeline")
+        .name("date", date)
+        .number("limit", request.limit as u64)
+        .raw(
+            "request",
+            &timeline_request_json(root, request, Some(date), 0),
+        )
+        .finish()
+}
+
+fn timeline_request_json(
+    root: &Path,
+    request: &TimelineRequest,
+    date: Option<&str>,
+    offset: u64,
+) -> String {
+    json::Object::new()
+        .name("corpus", &root.to_string_lossy())
         .optional("date", date.or(request.date.as_deref()))
         .optional("from", request.from.as_deref())
         .optional("to", request.to.as_deref())

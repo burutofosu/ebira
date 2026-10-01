@@ -9,7 +9,12 @@ projection called a corpus, which can be rebuilt from them. Nothing is uploaded.
 
 ## Install and index
 
-Requires Rust 1.89 or later:
+Prebuilt Linux x86-64 and Windows x86-64 binaries are available on
+[GitHub Releases](https://github.com/burutofosu/ebira/releases/latest), together
+with `SHA256SUMS.txt`. Extract the archive and put `ebira` or `ebira.exe` on
+`PATH`. Linux and Windows are tested in CI; macOS has not been verified.
+
+To build from source, install Rust 1.89 or later:
 
 ```sh
 cargo install --git https://github.com/burutofosu/ebira

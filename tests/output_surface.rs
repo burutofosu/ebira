@@ -703,7 +703,7 @@ fn next_action_contains_only_request_fields() {
     let corpus = fixture.corpus();
     let miss = run(&["search", "--corpus", &corpus, "--query", "absent-zzz"]);
     assert!(
-        miss.contains("\"scan_source_records\""),
+        miss.contains("\"action\":\"search\"") && miss.contains("\"raw\":true"),
         "a projection miss routes to the source: {miss}"
     );
     for key in ["\"reason\"", "\"advice\"", "\"guidance\""] {

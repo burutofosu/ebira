@@ -298,6 +298,10 @@ with a `reason` field and exit with status 1; a request that cannot be served,
 such as a date-map filter that needs `--date`, is an error too. A
 `next_actions` entry names a command and its options without the leading
 dashes, for example `{"action":"sync","request":{"corpus":...}}`.
+The action is a CLI subcommand. Convert underscores in request keys to hyphens
+(`source_id` becomes `--source-id`), pass true booleans as flags, and omit false
+and null values. Each request includes the selected corpus. A search of the
+original records uses `search` or `history` with `raw: true`.
 
 The same things look the same in every result. A value that is not there is
 `null`, never `""`; text is written as it is, empty or not. A record is named by
