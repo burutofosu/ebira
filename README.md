@@ -181,12 +181,15 @@ ebira history --query <text>
 ebira timeline --date 2026-09-14
 ```
 
-Queries are literal text; `--ignore-case` folds ASCII letters only. Filters are
+Queries are literal text, matched against what the records say: the values of
+their fields, not the field names. Each match names its `field` and quotes that
+value around the match. `--ignore-case` folds ASCII letters only. Filters are
 `--session`, `--source-id`, `--sender`, `--role`, `--kind`, `--from`, and `--to`,
 and pages continue with `--offset`. A `--from` or `--to` date covers that whole
-local day, and a time such as `2026-09-01T12:00:00+09:00` is that instant. The corpus keeps selected fields and shortens
-tool output (`sync --tool-output-chars`, default 300), so `--raw` compares the
-query with the original records instead:
+local day, and a time such as `2026-09-01T12:00:00+09:00` is that instant. The
+corpus keeps selected fields and shortens tool output (`sync
+--tool-output-chars`, default 300), so `--raw` compares the query with the
+original records instead:
 
 ```text
 ebira search --query <text> --raw

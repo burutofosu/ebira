@@ -124,38 +124,54 @@ pub fn push_field(body: &mut String, path: &str, value: &str) {
 
 /// Reads a body written by `push_field` back into its fields.
 pub fn body_fields(body: &str) -> Vec<(String, String)> {
-    let bytes = body.as_bytes();
-    let mut fields = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        let Some(path_end) = bytes[cursor..].iter().position(|byte| *byte == b'\t') else {
-            break;
-        };
-        let path_end = cursor + path_end;
-        let Some(length_end) = bytes[path_end + 1..].iter().position(|byte| *byte == b'\t') else {
-            break;
-        };
-        let length_end = path_end + 1 + length_end;
-        let Some(value_len) = std::str::from_utf8(&bytes[path_end + 1..length_end])
-            .ok()
-            .and_then(|text| text.parse::<usize>().ok())
-        else {
-            break;
-        };
-        let value_start = length_end + 1;
-        let Some(value_end) = value_start.checked_add(value_len) else {
-            break;
-        };
-        if value_end >= bytes.len() || bytes[value_end] != b'\n' {
-            break;
-        }
-        fields.push((
-            String::from_utf8_lossy(&bytes[cursor..path_end]).into_owned(),
-            String::from_utf8_lossy(&bytes[value_start..value_end]).into_owned(),
-        ));
-        cursor = value_end + 1;
+    body_field_slices(body.as_bytes())
+        .map(|(path, value)| {
+            (
+                String::from_utf8_lossy(path).into_owned(),
+                String::from_utf8_lossy(value).into_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The fields of a body in order, as `(path, value)` slices of it. A body that ends inside a
+/// field yields the fields before it.
+pub fn body_field_slices(body: &[u8]) -> BodyFields<'_> {
+    BodyFields {
+        bytes: body,
+        cursor: 0,
     }
-    fields
+}
+
+pub struct BodyFields<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> Iterator for BodyFields<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.bytes;
+        let start = self.cursor;
+        let path_end = start + bytes.get(start..)?.iter().position(|byte| *byte == b'\t')?;
+        let length_start = path_end + 1;
+        let length_end = length_start
+            + bytes[length_start..]
+                .iter()
+                .position(|byte| *byte == b'\t')?;
+        let value_len = std::str::from_utf8(&bytes[length_start..length_end])
+            .ok()?
+            .parse::<usize>()
+            .ok()?;
+        let value_start = length_end + 1;
+        let value_end = value_start.checked_add(value_len)?;
+        if bytes.get(value_end) != Some(&b'\n') {
+            return None;
+        }
+        self.cursor = value_end + 1;
+        Some((&bytes[start..path_end], &bytes[value_start..value_end]))
+    }
 }
 
 pub fn encode_token(value: &str) -> String {
@@ -231,7 +247,17 @@ pub fn json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_fields, decode_token, encode_token, push_field};
+    use super::{body_field_slices, body_fields, decode_token, encode_token, push_field};
+
+    #[test]
+    fn a_body_cut_inside_a_field_yields_the_fields_before_it() {
+        let mut body = String::new();
+        push_field(&mut body, "/first", "kept	whole");
+        push_field(&mut body, "/second", "cut short");
+        let cut = &body.as_bytes()[..body.len() - 4];
+        let fields = body_field_slices(cut).collect::<Vec<_>>();
+        assert_eq!(fields, [(&b"/first"[..], &b"kept	whole"[..])]);
+    }
 
     #[test]
     fn body_fields_read_back_exactly() {

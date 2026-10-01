@@ -711,3 +711,33 @@ fn every_command_reports_what_the_corpus_has_not_read_the_same_way() {
         "{resumed}"
     );
 }
+
+#[test]
+fn search_matches_what_was_written_not_how_the_corpus_stores_it() {
+    let logs = Logs::new("values");
+    let corpus = logs.corpus();
+    let paths = run(&[
+        "search",
+        "--corpus",
+        &corpus,
+        "--query",
+        "message/content",
+        "--sender",
+        "human",
+    ]);
+    assert!(
+        paths.contains("\"total_candidates\":0"),
+        "a field path is not text anyone wrote: {paths}"
+    );
+    let words = run(&["search", "--corpus", &corpus, "--query", "old colors"]);
+    assert!(
+        words.contains("\"field\":\"/message/content")
+            && words.contains("\"snippet\":\"keep the old colors\""),
+        "a hit names its field and quotes that value alone: {words}"
+    );
+    let day = run(&["timeline", "--corpus", &corpus, "--date", "2026-09-01"]);
+    assert!(
+        day.contains("\"snippet\":\"please build the map\"") && !day.contains("\t"),
+        "a listing quotes values, not their framing: {day}"
+    );
+}

@@ -1,6 +1,6 @@
 use crate::core::TimelineRef;
 use crate::corpus::{self, SourceEntry, TimelineRun};
-use crate::format::{json_string, parse_event_header, EventHeader};
+use crate::format::{self, json_string, parse_event_header, EventHeader};
 use crate::time::{self, Range};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,7 +12,8 @@ use std::thread;
 use std::time::Instant;
 
 const SEARCH_BUFFER_SIZE: usize = 1024 * 1024;
-const TIMELINE_SNIPPET_BYTES: u64 = 240;
+const TIMELINE_SNIPPET_BYTES: usize = 240;
+const SNIPPET_CONTEXT_BYTES: usize = 120;
 const BODY_CHUNK_SIZE: usize = 64 * 1024;
 const HISTORY_SAMPLES_PER_DATE: usize = 4;
 const HISTORY_NEXT_ACTION_LIMIT: usize = 12;
@@ -117,6 +118,8 @@ struct Facets {
 struct SearchHit {
     header: EventHeader,
     source_path: String,
+    /// The path of the field whose value holds the query; none for raw records and listings.
+    field: Option<String>,
     snippet: String,
     /// The instant of `header.timestamp` at the corpus offset, for ordering.
     instant: Option<i128>,
@@ -137,6 +140,8 @@ struct ScanWorkspace {
     combined: Vec<u8>,
     overlap: Vec<u8>,
     folded: Vec<u8>,
+    /// One corpus body, read whole to search its values.
+    body: Vec<u8>,
     fold_ascii_case: bool,
 }
 
@@ -148,6 +153,7 @@ impl ScanWorkspace {
             combined: Vec::with_capacity(chunk_size.saturating_add(query_len)),
             overlap: Vec::with_capacity(query_len.saturating_sub(1)),
             folded: Vec::with_capacity(chunk_size.saturating_add(query_len)),
+            body: Vec::new(),
             fold_ascii_case,
         }
     }
@@ -444,6 +450,7 @@ fn timeline_hit(
             ..EventHeader::default()
         },
         source_path: source_path.to_string(),
+        field: None,
         snippet: String::new(),
     }
 }
@@ -707,7 +714,9 @@ fn scan_timeline_run(
         current_offset = current_offset.saturating_add(read as u64);
         let header = parse_event_header_checked(path, &header_line)?;
         let body_len = header.body_len;
-        let head = read_body_head(&mut reader, body_len, TIMELINE_SNIPPET_BYTES)?;
+        let mut body = Vec::new();
+        read_whole(&mut reader, body_len, &mut body)?;
+        let head = values_head(&body, TIMELINE_SNIPPET_BYTES);
         current_offset = current_offset.saturating_add(body_len);
         let mut separator = [0u8; 1];
         reader.read_exact(&mut separator)?;
@@ -749,6 +758,7 @@ fn scan_timeline_run(
             instant: time::instant(&header.timestamp, request.offset_minutes),
             header,
             source_path: source_path.to_string(),
+            field: None,
             snippet: head,
         });
     }
@@ -1607,11 +1617,12 @@ fn scan_file(
                 .as_ref()
                 .expect("a raw scan parses every header");
             scan_source_record(header, catalog, query, &mut workspace, stats, sources)?
+                .map(|snippet| (None, snippet))
         } else {
-            workspace.overlap.clear();
-            scan_body(&mut reader, body_len, query, &mut workspace)?
+            scan_values(&mut reader, body_len, query, &mut workspace)?
+                .map(|(field, snippet)| (Some(field), snippet))
         };
-        if let Some(snippet) = body_match {
+        if let Some((field, snippet)) = body_match {
             let header = match parsed_header {
                 Some(header) => header,
                 None => parse_event_header_checked(path, &header_line)?,
@@ -1643,6 +1654,7 @@ fn scan_file(
                 instant: time::instant(&header.timestamp, request.offset_minutes),
                 header,
                 source_path,
+                field,
                 snippet,
             };
             if is_history_request(request) {
@@ -1696,7 +1708,7 @@ fn scan_source_record(
         return Ok(None);
     }
     workspace.overlap.clear();
-    match scan_body(file, header.byte_len, query, workspace) {
+    match scan_bytes(file, header.byte_len, query, workspace) {
         Ok(matched) => {
             stats.scanned_records += 1;
             stats.scanned_bytes = stats.scanned_bytes.saturating_add(header.byte_len);
@@ -1947,7 +1959,97 @@ fn matches_filters(header: &EventHeader, request: &SearchRequest) -> bool {
         .contains(&header.timestamp, request.offset_minutes)
 }
 
-fn scan_body<R: Read>(
+/// Reads a corpus body and finds `query` in the values of its fields, never in the paths and
+/// lengths that frame them. Returns the path of the first field that holds it and the text of
+/// that value around it.
+fn scan_values<R: Read>(
+    reader: &mut R,
+    body_len: u64,
+    query: &[u8],
+    workspace: &mut ScanWorkspace,
+) -> io::Result<Option<(String, String)>> {
+    let ScanWorkspace {
+        body,
+        folded,
+        fold_ascii_case,
+        ..
+    } = workspace;
+    read_whole(reader, body_len, body)?;
+    for (path, value) in format::body_field_slices(body) {
+        let haystack = if *fold_ascii_case {
+            folded.clear();
+            folded.extend(value.iter().map(u8::to_ascii_lowercase));
+            folded.as_slice()
+        } else {
+            value
+        };
+        if let Some(position) = find_bytes(haystack, query) {
+            return Ok(Some((
+                String::from_utf8_lossy(path).into_owned(),
+                text_around(value, position, query.len()),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Up to `SNIPPET_CONTEXT_BYTES` on each side of a match, on character boundaries.
+fn text_around(value: &[u8], position: usize, length: usize) -> String {
+    let mut start = position.saturating_sub(SNIPPET_CONTEXT_BYTES);
+    while start > 0 && value[start] & 0xC0 == 0x80 {
+        start -= 1;
+    }
+    let mut end = position
+        .saturating_add(length)
+        .saturating_add(SNIPPET_CONTEXT_BYTES)
+        .min(value.len());
+    while end < value.len() && value[end] & 0xC0 == 0x80 {
+        end += 1;
+    }
+    String::from_utf8_lossy(&value[start..end]).into_owned()
+}
+
+/// The start of a body's values, joined by newlines and cut at `limit` bytes; marked when cut.
+fn values_head(body: &[u8], limit: usize) -> String {
+    let mut head = Vec::new();
+    let mut cut = false;
+    for (_, value) in format::body_field_slices(body) {
+        if !head.is_empty() {
+            head.push(b'\n');
+        }
+        head.extend_from_slice(value);
+        if head.len() > limit {
+            cut = true;
+            break;
+        }
+    }
+    let mut end = head.len().min(limit);
+    while end > 0 && end < head.len() && head[end] & 0xC0 == 0x80 {
+        end -= 1;
+    }
+    let mut text = String::from_utf8_lossy(&head[..end]).into_owned();
+    if cut {
+        text.push_str(crate::core::PROJECTION_BOUND_MARKER);
+    }
+    text
+}
+
+/// Reads a body of `body_len` bytes into `body`, reusing its capacity.
+fn read_whole<R: Read>(reader: &mut R, body_len: u64, body: &mut Vec<u8>) -> io::Result<()> {
+    body.clear();
+    let read = reader.take(body_len).read_to_end(body)?;
+    if read as u64 != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "corpus body ended before body_len",
+        ));
+    }
+    Ok(())
+}
+
+/// Finds `query` anywhere in `body_len` bytes, read in chunks: the original records of a raw
+/// search, which are JSON rather than corpus fields.
+fn scan_bytes<R: Read>(
     reader: &mut R,
     body_len: u64,
     query: &[u8],
@@ -1988,18 +2090,6 @@ fn scan_body<R: Read>(
     Ok(matched)
 }
 
-fn read_body_head<R: Read>(reader: &mut R, body_len: u64, limit: u64) -> io::Result<String> {
-    let head_len = body_len.min(limit);
-    let mut head = vec![0; usize::try_from(head_len).unwrap_or(0)];
-    reader.read_exact(&mut head)?;
-    skip_body(reader, body_len.saturating_sub(head_len))?;
-    let mut text = String::from_utf8_lossy(&head).into_owned();
-    if head_len < body_len {
-        text.push_str(crate::core::PROJECTION_BOUND_MARKER);
-    }
-    Ok(text)
-}
-
 fn skip_body<R: Read>(reader: &mut R, body_len: u64) -> io::Result<()> {
     let mut limited = reader.take(body_len);
     io::copy(&mut limited, &mut io::sink())?;
@@ -2035,7 +2125,7 @@ fn timeline_map_hit_json(hit: &SearchHit) -> String {
 fn hit_json_with_snippet_state(hit: &SearchHit, snippet_state: Option<&str>) -> String {
     let header = &hit.header;
     let mut output = format!(
-        "{{\"event_id\":{},\"source_ref\":{{\"source_id\":{},\"source_path\":{},\"line\":{},\"byte_start\":{},\"byte_len\":{}}},\"session\":{},\"turn\":{},\"kind\":{},\"role\":{},\"sender\":{},\"via\":{},\"timestamp\":{},\"snippet\":{}",
+        "{{\"event_id\":{},\"source_ref\":{{\"source_id\":{},\"source_path\":{},\"line\":{},\"byte_start\":{},\"byte_len\":{}}},\"session\":{},\"turn\":{},\"kind\":{},\"role\":{},\"sender\":{},\"via\":{},\"timestamp\":{},\"field\":{},\"snippet\":{}",
         json_string(&format!("{}:{}", header.source_id, header.event_index)),
         json_string(&header.source_id),
         json_string(&hit.source_path),
@@ -2049,6 +2139,10 @@ fn hit_json_with_snippet_state(hit: &SearchHit, snippet_state: Option<&str>) -> 
         json_string(&header.sender),
         json_string(&header.via),
         json_string(&header.timestamp),
+        hit.field
+            .as_deref()
+            .map(json_string)
+            .unwrap_or_else(|| "null".to_string()),
         json_string(&hit.snippet),
     );
     if let Some(state) = snippet_state {
@@ -2299,6 +2393,7 @@ mod tests {
                 ..EventHeader::default()
             },
             source_path: String::new(),
+            field: None,
             snippet: String::new(),
         };
         let page = search_page(

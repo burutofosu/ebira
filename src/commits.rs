@@ -207,7 +207,7 @@ fn scan_segment(
         }
         *scanned_records += 1;
         read_body(&mut reader, header.body_len, &mut body, path)?;
-        for name in hash_candidates(&body) {
+        for name in record_names(&body) {
             let key = name.to_ascii_lowercase();
             if let Some(wanted) = wanted {
                 if !wanted.contains(&key) {
@@ -233,6 +233,17 @@ fn scan_segment(
         }
     }
     Ok(())
+}
+
+/// The names a record mentions: hexadecimal runs in the values of its fields, never in the
+/// paths and lengths that frame them.
+fn record_names(body: &[u8]) -> Vec<String> {
+    let mut names = crate::format::body_field_slices(body)
+        .flat_map(|(_, value)| hash_candidates(value))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn hash_candidates(body: &[u8]) -> Vec<String> {
@@ -566,7 +577,15 @@ fn print_result(
 
 #[cfg(test)]
 mod tests {
-    use super::hash_candidates;
+    use super::{hash_candidates, record_names};
+
+    #[test]
+    fn names_come_from_values_not_from_field_paths() {
+        let mut body = String::new();
+        crate::format::push_field(&mut body, "/snapshot/deadbeef42", "see a878f10d");
+        crate::format::push_field(&mut body, "/text", "and a878f10d again, then 5644ee8");
+        assert_eq!(record_names(body.as_bytes()), ["5644ee8", "a878f10d"]);
+    }
 
     #[test]
     fn hash_candidates_require_complete_hex_runs() {

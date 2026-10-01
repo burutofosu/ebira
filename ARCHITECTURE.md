@@ -191,8 +191,11 @@ written is `behind` until the next sync.
 
 ## Search
 
-Projection search compares a literal query with selected corpus fields. Tool
-output is shortened to `sync --tool-output-chars` characters (default 300).
+Projection search compares a literal query with the values of the selected
+corpus fields, never with the paths and lengths that frame them in a body, and a
+match names its field and quotes that value around it. `commits` reads names
+from the same values, and timeline listings quote the start of them. Tool output
+is shortened to `sync --tool-output-chars` characters (default 300).
 
 Raw search uses corpus entries to select records, then compares the query with
 the original JSONL bytes. The result reports unavailable sources, unreadable
