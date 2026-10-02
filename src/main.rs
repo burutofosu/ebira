@@ -8,6 +8,7 @@ mod json;
 mod jsonl;
 mod output;
 mod private_fs;
+mod questions;
 mod resume;
 mod said;
 mod search;

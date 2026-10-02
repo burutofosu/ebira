@@ -87,7 +87,12 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
             let message = persons_message(&said.header.sender, &said.header.via);
             if message == Some(PersonsMessage::Imported) && !request.include_imported {
                 imported += 1;
-            } else if seen.first(&said.header.timestamp, &said.text) {
+            } else if seen.first(
+                &said.header.timestamp,
+                &said.text,
+                &said.header.via,
+                &said.header.call_id,
+            ) {
                 found.push(said);
             } else {
                 copies += 1;

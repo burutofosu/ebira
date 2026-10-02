@@ -8,6 +8,7 @@ use crate::format::{
 };
 use crate::jsonl::{parse_record, Field};
 use crate::private_fs;
+use crate::questions::QuestionTracker;
 use crate::{json, output};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -112,6 +113,8 @@ pub struct SourceEntry {
     pub synced_at_ms: u64,
     /// The working directory in effect at the checkpoint, carried into appended records.
     pub last_cwd: String,
+    /// Native question calls that can receive an answer after the current checkpoint.
+    pub pending_questions: QuestionTracker,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1231,6 +1234,7 @@ pub struct LogReader {
     machine: IngestStateMachine,
     fallback_session: String,
     output_preview: usize,
+    questions: QuestionTracker,
 }
 
 /// One line of a log, read.
@@ -1245,12 +1249,13 @@ pub struct ReadRecord {
 }
 
 impl LogReader {
-    fn new(entry: &SourceEntry, checkpoint: IngestCheckpoint) -> Self {
+    fn new(entry: &SourceEntry, checkpoint: IngestCheckpoint, questions: QuestionTracker) -> Self {
         Self {
             origin: source_origin(entry),
             machine: IngestStateMachine::from_checkpoint(checkpoint),
             fallback_session: entry.fallback_session.clone(),
             output_preview: entry.output_preview as usize,
+            questions,
         }
     }
 
@@ -1284,7 +1289,10 @@ impl LogReader {
         };
         let mut meta = record_meta(&fields);
         classify_sender(self.origin, &fields, &mut meta);
-        let projection = select_body(&fields, &meta, self.output_preview);
+        let projection = self
+            .questions
+            .project(self.origin, &fields, &mut meta)
+            .unwrap_or_else(|| select_body(&fields, &meta, self.output_preview));
         ReadRecord {
             event: self
                 .machine
@@ -1337,12 +1345,20 @@ pub fn log_reader_at(
                 && matches!(freshness(known), Freshness::Current | Freshness::Behind(_)) =>
         {
             (
-                LogReader::new(known, checkpoint_of(known)),
+                LogReader::new(known, checkpoint_of(known), known.pending_questions.clone()),
                 known.committed_byte_end,
                 known.last_line,
             )
         }
-        _ => (LogReader::new(&entry, IngestCheckpoint::default()), 0, 0),
+        _ => (
+            LogReader::new(
+                &entry,
+                IngestCheckpoint::default(),
+                QuestionTracker::default(),
+            ),
+            0,
+            0,
+        ),
     };
     let mut input = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(path)?);
     input.seek(SeekFrom::Start(from))?;
@@ -1397,7 +1413,12 @@ fn process_source(
     let mut corpus_offset = 0u64;
     let mut timeline = TimelineAccumulator::new(&entry.source_id, &output_name, offset_minutes);
     let checkpoint = old.map(checkpoint_of).unwrap_or_default();
-    let mut log = LogReader::new(entry, checkpoint);
+    let mut log = LogReader::new(
+        entry,
+        checkpoint,
+        old.map(|entry| entry.pending_questions.clone())
+            .unwrap_or_default(),
+    );
 
     while let Some(line_read) = read_bounded_line(&mut bounded, &mut line)? {
         let record_start = committed_byte_end;
@@ -1489,6 +1510,7 @@ fn process_source(
     };
     let checkpoint = log.checkpoint();
     let mut updated = entry.clone();
+    updated.pending_questions = log.questions.clone();
     updated.committed_byte_end = committed_byte_end;
     updated.event_count = checkpoint.next_event_index;
     updated.last_line = line_number;
@@ -1545,7 +1567,7 @@ fn source_catalog_header(offset_minutes: i64) -> String {
 ///
 /// Increase it with every change to what a sync writes for the same logs, together with
 /// `RULES_FINGERPRINT` in the tests of `core.rs`, which fails until both are updated.
-pub const RULES_VERSION: u64 = 3;
+pub const RULES_VERSION: u64 = 4;
 
 /// How a corpus on disk relates to this build of Ebira.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1802,7 +1824,7 @@ fn source_entry_for_preview(
 fn write_source_entry(writer: &mut BufWriter<File>, entry: &SourceEntry) -> io::Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         encode_token(&entry.source_id),
         encode_token(&entry.app),
         encode_token(&entry.path),
@@ -1823,6 +1845,7 @@ fn write_source_entry(writer: &mut BufWriter<File>, entry: &SourceEntry) -> io::
         entry.file_id,
         entry.synced_at_ms,
         encode_token(&entry.last_cwd),
+        encode_token(&entry.pending_questions.encode()),
     )
 }
 
@@ -2525,11 +2548,11 @@ fn load_source_catalog_paths(paths: &[PathBuf]) -> io::Result<BTreeMap<String, S
                 continue;
             }
             let parts = line.split('\t').collect::<Vec<_>>();
-            if parts.len() != 20 {
+            if parts.len() != 21 {
                 return Err(invalid_catalog_line(
                     path,
                     line_number,
-                    "source row does not have the 20 columns this build writes",
+                    "source row does not have the 21 columns this build writes",
                 ));
             }
             let source_id = catalog_token(&parts, 0, None, path, line_number, "source_id")?;
@@ -2576,6 +2599,15 @@ fn load_source_catalog_paths(paths: &[PathBuf]) -> io::Result<BTreeMap<String, S
             let file_id = catalog_u64(&parts, 17, None, path, line_number, "file_id")?;
             let synced_at_ms = catalog_u64(&parts, 18, None, path, line_number, "synced_at_ms")?;
             let last_cwd = catalog_token(&parts, 19, Some(""), path, line_number, "last_cwd")?;
+            let pending_questions = QuestionTracker::decode(&catalog_token(
+                &parts,
+                20,
+                None,
+                path,
+                line_number,
+                "pending_questions",
+            )?)
+            .map_err(|error| invalid_catalog_line(path, line_number, &error))?;
             result.insert(
                 source_id.clone(),
                 SourceEntry {
@@ -2599,6 +2631,7 @@ fn load_source_catalog_paths(paths: &[PathBuf]) -> io::Result<BTreeMap<String, S
                     file_id,
                     synced_at_ms,
                     last_cwd,
+                    pending_questions,
                 },
             );
         }

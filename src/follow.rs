@@ -255,7 +255,12 @@ fn seen_before(
         let meta = &record.event.meta;
         if persons_message(meta.sender.as_str(), &meta.via).is_some() {
             let (text, _) = human_text_from_body(&record.event.body);
-            seen.first(meta.timestamp.as_deref().unwrap_or(""), &text);
+            seen.first(
+                meta.timestamp.as_deref().unwrap_or(""),
+                &text,
+                &meta.via,
+                meta.call_id.as_deref().unwrap_or(""),
+            );
         }
     }
     Ok(seen)
@@ -411,7 +416,12 @@ fn message(
     let (text, images) = match persons {
         Some(_) => {
             let (text, images) = human_text_from_body(&record.event.body);
-            if !seen.first(&timestamp, &text) {
+            if !seen.first(
+                &timestamp,
+                &text,
+                &meta.via,
+                meta.call_id.as_deref().unwrap_or(""),
+            ) {
                 return None;
             }
             (text, images)

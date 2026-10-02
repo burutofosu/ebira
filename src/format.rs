@@ -24,9 +24,9 @@ pub struct EventHeader {
     pub body_len: u64,
 }
 
-/// v7: every body field is length-delimited, the header says whether the body was cut, the
-/// segments live in `segments/`, and managed imports live inside the corpus directory.
-pub const FORMAT_VERSION: &str = "7";
+/// v8 adds pending question calls to source checkpoints. Bodies remain length-delimited;
+/// segments and managed imports remain inside the corpus directory.
+pub const FORMAT_VERSION: &str = "8";
 
 pub fn event_header_line(header: &EventHeader) -> String {
     let mut line = String::with_capacity(256);

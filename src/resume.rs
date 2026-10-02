@@ -282,7 +282,12 @@ fn scan_paths(paths: &[PathBuf], session_filter: Option<&str>) -> io::Result<Sca
             };
             match persons_message(event.sender.as_str(), &event.via) {
                 Some(PersonsMessage::Own) => {
-                    if seen.first(&event.timestamp, &human_text_from_body(&event.body).0) {
+                    if seen.first(
+                        &event.timestamp,
+                        &human_text_from_body(&event.body).0,
+                        &event.via,
+                        &event.call_id,
+                    ) {
                         humans_seen += 1;
                         keep_last(&mut humans, &event, KEPT_HUMAN_MESSAGES);
                     } else {
