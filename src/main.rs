@@ -1,6 +1,8 @@
 mod commits;
 mod core;
 mod corpus;
+mod extract;
+mod extract_inputs;
 mod follow;
 mod format;
 mod imports;
@@ -66,6 +68,7 @@ const SEARCH_VALUES: &[&str] = &[
 ];
 
 const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "extract", synopsis: "--request <file|->", summary: "Score scoped logical events through a local typed-question API", details: &["  JSON request in; progress/item/done JSONL out. See docs/extract-api.md."], values: &["--corpus", "--request"], flags: &[] },
     CommandSpec {
         name: "sync",
         synopsis: "[--source <path>]... [--rebuild] [--rebuild-source <path>]... [--tool-output-chars <n>]",
@@ -453,6 +456,11 @@ fn run(args: &[String]) -> io::Result<()> {
     validate_options(spec, args)?;
     match command {
         "sync" => sync(args),
+        "extract" => {
+            let root = corpus_path(args)?;
+            let _lock = corpus::read_lock(&root)?;
+            extract::run(&root, &one_option(args, "--request")?)
+        }
         "import" => {
             let corpus = corpus_path(args)?;
             let source = PathBuf::from(one_option(args, "--source")?);

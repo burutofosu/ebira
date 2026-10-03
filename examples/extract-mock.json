@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "scope": {"sessions": ["9f1c2a7e-4b1d-4c55-8a3e-2f6b1d0c7a91"], "include_children": false},
+  "targets": {"kinds": ["user"], "senders": ["human"]},
+  "context": {"mode": "event"},
+  "questions": [
+    {"id": "relevant", "type": "noul", "question": "Does the evidence describe retry behavior?"},
+    {"id": "exclude", "type": "noul", "question": "Does the evidence contain only unrelated material?"}
+  ],
+  "select": [
+    {"question": "relevant", "op": "gte", "value": 0.7},
+    {"question": "exclude", "op": "lte", "value": 0.2}
+  ],
+  "runtime": {
+    "backend": "mock",
+    "answers": {
+      "relevant": {"type": "noul", "noul": 0.8},
+      "exclude": {"type": "noul", "noul": 0.1}
+    }
+  }
+}

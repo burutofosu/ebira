@@ -124,3 +124,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for storage and implementation details.
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Experimental local extraction API
+
+The `extract` command scores scoped logical events against typed questions using
+a configured local Clef worker. It emits progress, answers, selection
+and completeness as JSONL. See [the API guide](docs/extract-api.md) for the
+mock example, local model setup and test coverage.
