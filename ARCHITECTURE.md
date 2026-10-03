@@ -10,6 +10,7 @@ source retrieval. All commands run locally.
 | `main.rs` | The command table (help and accepted options), defaults, and dispatch |
 | `jsonl.rs` | JSON parsing and scalar field extraction |
 | `core.rs` | Event classification, field selection, and turn state |
+| `questions.rs` | Native question calls, structured answers, and pending-call state |
 | `format.rs` | Corpus record encoding and decoding |
 | `time.rs` | Timestamps, dates, offsets, and `--from`/`--to` ranges |
 | `json.rs` | The JSON writer every command's result goes through |
@@ -99,6 +100,10 @@ appending is projected again. A file that is gone is dropped; one under a
 directory that could not be listed keeps its projection and is reported as
 unreadable.
 
+Pending native question calls are also checkpointed, so an answer appended after
+a sync can still be matched to its question. Replaying a file reconstructs these
+associations from its records; replacing a file discards its old associations.
+
 ## Concurrency
 
 `sync`, `import`, and `timeline --rebuild` hold the lock file `ebira.lock` in the
@@ -135,6 +140,13 @@ own markers:
   (`task-notification`, `agent-message`, `local-command-stdout`, and similar).
   `queued_command` attachments are the person's prompts typed while the agent
   was working, unless they are notifications.
+- Structured answers to Claude Code's `AskUserQuestion` and Codex's
+  `request_user_input` are the person's messages (`via: question_reply`). Each
+  answer must match a native question call and one of its declared questions.
+  The projection keeps the answer text in full, without the agent's question or
+  the tool's generated explanation. Ordinary, unmatched, cancelled, and failed
+  tool results retain their normal classification. The source reference still
+  points to the complete original record.
 - Codex user messages: child and `codex exec` threads carry another agent's
   prompts. In other threads, context blocks the app injects
   (`environment_context`, `codex_internal_context`, `heartbeat`, and similar)
@@ -237,6 +249,8 @@ when the same text was stored twice with the same timestamp
 (`core::SeenMessages`). Imported copies (`via: imported`) are counted but listed
 only when requested. A message is read whole, however long, and in whatever
 shape the log writes it; `follow` keeps no list of shapes of its own for them.
+Native question replies include the call identity when checking for duplicates,
+so separate questions with identical answers at the same timestamp remain distinct.
 `said` reads only
 such events; a session scope reads the segments of the session's sources, and
 the other filters apply to event headers.

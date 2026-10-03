@@ -134,15 +134,21 @@ pub fn persons_message(sender: &str, via: &str) -> Option<PersonsMessage> {
 
 /// The person's messages already listed. One message stored twice (a session file kept in two
 /// places, or Codex writing it as an event and as a response item) has the same timestamp and
-/// the same text apart from the whitespace around it, and is listed once.
+/// the same text apart from the whitespace around it, and is listed once. Native question
+/// replies also carry their call identity, so equal answers to different questions survive.
 #[derive(Default)]
-pub struct SeenMessages(BTreeSet<(String, String)>);
+pub struct SeenMessages(BTreeSet<(String, String, String)>);
 
 impl SeenMessages {
-    /// Whether this is the first message with this timestamp and text.
-    pub fn first(&mut self, timestamp: &str, text: &str) -> bool {
-        self.0
-            .insert((timestamp.to_string(), text.trim().to_string()))
+    /// Whether this is the first message with this timestamp, text, and question identity.
+    pub fn first(&mut self, timestamp: &str, text: &str, via: &str, call_id: &str) -> bool {
+        // Two distinct questions can receive the same answer at the same timestamp.
+        let reply = if via == "question_reply" { call_id } else { "" };
+        self.0.insert((
+            timestamp.to_string(),
+            text.trim().to_string(),
+            reply.to_string(),
+        ))
     }
 }
 
@@ -2331,7 +2337,7 @@ mod tests {
     /// how representative records are classified and projected changes with any change to
     /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
     /// here: the next sync then rebuilds every corpus made under the old rules.
-    const RULES_FINGERPRINT: (&str, u64, &str) = ("7", 3, "7021927ff4debeec");
+    const RULES_FINGERPRINT: (&str, u64, &str) = ("8", 4, "35e1c7b504c45dd1");
 
     #[test]
     fn reading_rules_are_versioned() {
@@ -2593,6 +2599,43 @@ mod tests {
                 kind.as_str(),
                 body
             ));
+        }
+        // Native question replies depend on a preceding call, including across syncs.
+        for (origin, records) in [
+            (
+                ClaudeMain,
+                [
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"ask","name":"AskUserQuestion","input":{"questions":[{"question":"Which?"}]}}]}}"#,
+                    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"ask","content":"AUTOMATIC_RENDERER"}]},"toolUseResult":{"answers":{"Which?":"First"}}}"#,
+                ],
+            ),
+            (
+                CodexThread,
+                [
+                    r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"ask","arguments":"{\"questions\":[{\"id\":\"q\"}]}"}}"#,
+                    r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"ask","output":"{\"answers\":{\"q\":{\"answers\":[\"First\"]}}}"}}"#,
+                ],
+            ),
+        ] {
+            let mut questions = crate::questions::QuestionTracker::default();
+            for record in records {
+                let fields = crate::jsonl::parse_record(record.as_bytes(), 0).unwrap();
+                let mut meta = record_meta(&fields);
+                super::classify_sender(origin, &fields, &mut meta);
+                let body = questions
+                    .project(origin, &fields, &mut meta)
+                    .unwrap_or_else(|| select_body(&fields, &meta, 300))
+                    .body;
+                lines.push(format!(
+                    "{}|{}|{}|{}|{}\n",
+                    meta.sender.as_str(),
+                    meta.via,
+                    meta.event_kind.as_str(),
+                    meta.call_id.as_deref().unwrap_or(""),
+                    body
+                ));
+                questions = crate::questions::QuestionTracker::decode(&questions.encode()).unwrap();
+            }
         }
         // A sync also puts every record on a date for the timeline.
         for offset_minutes in [0, 9 * 60] {
