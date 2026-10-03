@@ -233,7 +233,7 @@ fn read_event<R: BufRead>(reader: &mut R) -> io::Result<Option<(EventHeader, Fie
     reader.read_exact(&mut body)?;
     let mut separator = [0];
     reader.read_exact(&mut separator)?;
-    if separator != [b'\n'] {
+    if separator != *b"\n" {
         return Err(invalid("missing event separator"));
     }
     let body = std::str::from_utf8(&body).map_err(|_| invalid("event body requires UTF-8"))?;
