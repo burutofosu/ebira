@@ -278,6 +278,8 @@ struct Evidence {
 struct ShownLine {
     author: Author,
     timestamp: String,
+    /// The record's own text: quotes are checked against this, never against what the model
+    /// was shown around it (the header, the authors' labels, the marks of what was left out).
     text: String,
     source_ref: SourceRef,
 }
@@ -444,7 +446,7 @@ struct Claim {
 }
 
 fn claims_to_check(corpus: &Corpus, answer: &Value, evidence: &[Evidence]) -> Vec<Claim> {
-    let list = findings(answer, evidence);
+    let list = findings(corpus, answer, evidence);
     let mut claims: Vec<Claim> = Vec::new();
     for kind in CHECKED_KINDS {
         for finding in list.iter().filter(|finding| finding.kind == kind) {
@@ -779,7 +781,7 @@ fn gather(
         .into_iter()
         .filter(|hit| pool.seen.insert(hit.source_ref.clone()))
         .collect();
-    rank(&mut candidates);
+    rank(corpus, &mut candidates);
     pool.found += candidates.len();
     candidates.truncate(options.candidates);
     match caller {
@@ -834,14 +836,28 @@ fn read_evidence(corpus: &Corpus, mut hits: Vec<Hit>) -> Vec<Evidence> {
 }
 
 fn time_order(corpus: &Corpus, left: &Hit, right: &Hit) -> std::cmp::Ordering {
-    match (
-        corpus.instant(&left.timestamp),
-        corpus.instant(&right.timestamp),
-    ) {
+    earliest_first(corpus, &left.timestamp, &right.timestamp)
+}
+
+/// Earlier first, by the instant each time stands for: logs write the same moment with
+/// different offsets (`2026-10-16T09:00:00+09:00` comes before `2026-10-16T01:00:00Z`). Times
+/// that do not parse go last, in the order of their text.
+fn earliest_first(corpus: &Corpus, left: &str, right: &str) -> std::cmp::Ordering {
+    match (corpus.instant(left), corpus.instant(right)) {
         (Some(left_at), Some(right_at)) => left_at.cmp(&right_at),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => left.timestamp.cmp(&right.timestamp),
+        (None, None) => left.cmp(right),
+    }
+}
+
+/// Newer first, by instant; times that do not parse still go last.
+fn newest_first(corpus: &Corpus, left: &str, right: &str) -> std::cmp::Ordering {
+    match (corpus.instant(left), corpus.instant(right)) {
+        (Some(left_at), Some(right_at)) => right_at.cmp(&left_at),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => right.cmp(left),
     }
 }
 
@@ -981,13 +997,13 @@ fn search(
 }
 
 /// More search strings matched first, then the person's own words, then the newer.
-fn rank(hits: &mut [Hit]) {
+fn rank(corpus: &Corpus, hits: &mut [Hit]) {
     hits.sort_by(|a, b| {
         b.terms
             .len()
             .cmp(&a.terms.len())
             .then_with(|| (b.who == Who::Person).cmp(&(a.who == Who::Person)))
-            .then_with(|| b.timestamp.cmp(&a.timestamp))
+            .then_with(|| newest_first(corpus, &a.timestamp, &b.timestamp))
     });
 }
 
@@ -1223,7 +1239,7 @@ fn compose(corpus: &Corpus, id: String, hit: Hit, lines: Result<Vec<Line>, Strin
                     shown.push(ShownLine {
                         author: Author::Near(line.label),
                         timestamp: line.timestamp.clone(),
-                        text: body,
+                        text: line.text.clone(),
                         source_ref: SourceRef {
                             source_id: hit.source_ref.source_id.clone(),
                             byte_start: line.byte_start,
@@ -1455,10 +1471,17 @@ fn cost_line(spent: &[Spend]) -> String {
     )
 }
 
+/// What the run cost by step, counting the calls whose price is known; `unpriced_calls` says
+/// how many were left out, as `ask-usage` does, so a total is never read as complete when it
+/// is not.
 fn cost_json(spent: &[Spend]) -> String {
     let mut steps: Vec<(&str, f64)> = Vec::new();
+    let mut unpriced: u64 = 0;
     for spend in spent {
-        let usd = spend.usd.unwrap_or(0.0);
+        let usd = spend.usd.unwrap_or_else(|| {
+            unpriced += 1;
+            0.0
+        });
         match steps.iter_mut().find(|(step, _)| *step == spend.step) {
             Some((_, total)) => *total += usd,
             None => steps.push((spend.step, usd)),
@@ -1485,6 +1508,7 @@ fn cost_json(spent: &[Spend]) -> String {
                 .map(|spend| spend.usage.input + spend.usage.output)
                 .sum(),
         )
+        .number("unpriced_calls", unpriced)
         .finish()
 }
 
@@ -1593,7 +1617,9 @@ impl Finding<'_> {
     }
 }
 
-fn findings<'a>(answer: &Value, evidence: &'a [Evidence]) -> Vec<Finding<'a>> {
+/// The answer's findings, oldest first. A quote is verified only when one record's own text
+/// holds it.
+fn findings<'a>(corpus: &Corpus, answer: &Value, evidence: &'a [Evidence]) -> Vec<Finding<'a>> {
     let mut list: Vec<Finding> = answer
         .array_at("findings")
         .iter()
@@ -1611,8 +1637,7 @@ fn findings<'a>(answer: &Value, evidence: &'a [Evidence]) -> Vec<Finding<'a>> {
                     .or_else(|| item.lines.iter().find(quoted))
             });
             Finding {
-                verified: line.is_some()
-                    || item.is_some_and(|item| text::quote_found(&quote, &item.block)),
+                verified: line.is_some(),
                 item,
                 line,
                 evidence: id,
@@ -1623,13 +1648,13 @@ fn findings<'a>(answer: &Value, evidence: &'a [Evidence]) -> Vec<Finding<'a>> {
         })
         .collect();
     list.sort_by(|a, b| {
-        let time = |finding: &Finding| {
+        let time = |finding: &Finding| -> String {
             finding
                 .origin()
                 .map(|(_, time, _)| time.to_string())
                 .unwrap_or_default()
         };
-        time(a).cmp(&time(b))
+        earliest_first(corpus, &time(a), &time(b))
     });
     list
 }
@@ -1654,7 +1679,7 @@ fn answer_report(
 ) -> String {
     let empty = Value::Object(Vec::new());
     let answer_value = answer.unwrap_or(&empty);
-    let list = findings(answer_value, evidence);
+    let list = findings(corpus, answer_value, evidence);
     let more_terms = strings(answer_value, "more_terms");
     if !options.text_format {
         let findings_json = list.iter().map(|finding| {
@@ -1859,7 +1884,7 @@ mod tests {
             hit("c", Who::Agent, "2026-09-01T00:00:00Z", &["色が", "凡例"]),
             hit("d", Who::Person, "2026-10-01T00:00:00Z", &["色が"]),
         ];
-        rank(&mut hits);
+        rank(&corpus(), &mut hits);
         let order: Vec<&str> = hits.iter().map(|hit| hit.text.as_str()).collect();
         assert_eq!(order, vec!["c", "d", "b", "a"]);
     }
@@ -1937,7 +1962,7 @@ mod tests {
                             {"evidence":"E1","kind":"other","quote":"どこにもない言葉","note":""}]}"#,
         )
         .unwrap();
-        let list = findings(&answer, &evidence);
+        let list = findings(&corpus(), &answer, &evidence);
         let first = list
             .iter()
             .find(|finding| finding.kind == "problem")
@@ -1978,7 +2003,7 @@ mod tests {
             r#"{{"findings":[{{"evidence":"E1","kind":"reversal","quote":"{words}","note":""}}]}}"#
         ))
         .unwrap();
-        let list = findings(&answer, &evidence);
+        let list = findings(&corpus(), &answer, &evidence);
         let (who, when, source) = list[0].origin().unwrap();
         assert_eq!(who, Author::Near(Label::Person));
         assert_eq!(when, "2026-10-04T07:21:47Z");
@@ -2125,6 +2150,127 @@ mod tests {
     }
 
     #[test]
+    fn verifies_quotes_against_the_records_not_what_the_model_was_shown() {
+        // The model sees a header, the authors' labels, and marks of what was left out; none
+        // of that is anyone's words.
+        let reply = format!("{}色を元に戻しました", "あ".repeat(700));
+        let lines = vec![
+            line(Label::Agent, "2026-10-13T18:58:00Z", &reply, false, 100),
+            line(
+                Label::Person,
+                "2026-10-13T19:01:10Z",
+                "古い色のままにして",
+                true,
+                10,
+            ),
+        ];
+        let evidence = vec![compose(
+            &corpus(),
+            "E1".to_string(),
+            hit(
+                "古い色のままにして",
+                Who::Person,
+                "2026-10-13T19:01:10Z",
+                &["色"],
+            ),
+            Ok(lines),
+        )];
+        assert!(
+            evidence[0].block.contains("more characters]"),
+            "{}",
+            evidence[0].block
+        );
+        let answer = value::parse(
+            r#"{"findings":[{"evidence":"E1","kind":"other","quote":"more characters]","note":""},
+                            {"evidence":"E1","kind":"other","quote":"E1 | 2026-10-14 04:01","note":""},
+                            {"evidence":"E1","kind":"other","quote":"agent 2026-10-14 03:58","note":""},
+                            {"evidence":"E1","kind":"decision","quote":"古い色のままにして","note":""},
+                            {"evidence":"E1","kind":"attempt","quote":"色を元に戻しました","note":""}]}"#,
+        )
+        .unwrap();
+        let list = findings(&corpus(), &answer, &evidence);
+        let verified = |quote: &str| {
+            list.iter()
+                .find(|finding| finding.quote == quote)
+                .expect("the finding")
+                .verified
+        };
+        assert!(!verified("more characters]"), "a mark of what was cut");
+        assert!(!verified("E1 | 2026-10-14 04:01"), "the header");
+        assert!(!verified("agent 2026-10-14 03:58"), "a label and a time");
+        assert!(verified("古い色のままにして"));
+        assert!(
+            verified("色を元に戻しました"),
+            "words of the record past the cut are still its words"
+        );
+    }
+
+    #[test]
+    fn orders_by_the_instant_not_the_text_of_the_time() {
+        // 09:00 at +09:00 is 00:00 UTC, an hour before 01:00Z, though its text sorts after it.
+        let mut hits = vec![
+            hit("early", Who::Person, "2026-10-16T09:00:00+09:00", &["a"]),
+            hit("undated", Who::Person, "", &["a"]),
+            hit("late", Who::Person, "2026-10-16T01:00:00Z", &["a"]),
+        ];
+        rank(&corpus(), &mut hits);
+        let order: Vec<&str> = hits.iter().map(|hit| hit.text.as_str()).collect();
+        assert_eq!(order, vec!["late", "early", "undated"]);
+
+        let evidence: Vec<Evidence> = [
+            ("E1", "late", "2026-10-16T01:00:00Z"),
+            ("E2", "early", "2026-10-16T09:00:00+09:00"),
+        ]
+        .into_iter()
+        .map(|(id, words, at)| {
+            compose(
+                &corpus(),
+                id.to_string(),
+                hit(words, Who::Person, at, &["a"]),
+                Ok(vec![line(Label::Person, at, words, true, 10)]),
+            )
+        })
+        .collect();
+        let answer = value::parse(
+            r#"{"findings":[{"evidence":"E1","kind":"decision","quote":"late","note":""},
+                            {"evidence":"E2","kind":"decision","quote":"early","note":""}]}"#,
+        )
+        .unwrap();
+        let order: Vec<String> = findings(&corpus(), &answer, &evidence)
+            .into_iter()
+            .map(|finding| finding.quote)
+            .collect();
+        assert_eq!(order, vec!["early", "late"]);
+    }
+
+    #[test]
+    fn says_how_many_calls_have_no_known_price() {
+        let usage = Usage {
+            input: 1000,
+            output: 100,
+            ..Usage::default()
+        };
+        let spent = vec![
+            Spend {
+                step: "answer",
+                model: "claude-opus-5-5".to_string(),
+                usage,
+                usd: Some(0.006),
+            },
+            Spend {
+                step: "screen",
+                model: "mystery-model".to_string(),
+                usage,
+                usd: None,
+            },
+        ];
+        let json = cost_json(&spent);
+        assert!(json.contains(r#""total":0.0060"#), "{json}");
+        assert!(json.contains(r#""unpriced_calls":1"#), "{json}");
+        assert!(cost_line(&spent).contains("not counted"));
+    }
+
+    #[test]
     fn reports_an_answer_as_text_and_as_json() {
         let corpus = corpus();
         let words = "地図の colors を古いままでと言った記憶がない";
@@ -2224,7 +2370,7 @@ mod tests {
         assert!(json.starts_with(r#"{"disposition":"answered","mode":"ask","question":"地図の色の条件は？","answer":"10/4 に条件を外した。""#), "{json}");
         assert!(json.contains(r#""kind":"reversal","quote":"古いままでと言った記憶がない","quote_verified":true,"relevance":"9/27 の条件を外す","author":"person""#), "{json}");
         assert!(json.contains(r#""quote_verified":false"#), "{json}");
-        assert!(json.contains(r#""cost_usd":{"total":0.0060,"answer":0.0060,"models":["claude-opus-5-5"],"tokens":1100}"#), "{json}");
+        assert!(json.contains(r#""cost_usd":{"total":0.0060,"answer":0.0060,"models":["claude-opus-5-5"],"tokens":1100,"unpriced_calls":0}"#), "{json}");
     }
 
     #[test]
