@@ -74,6 +74,30 @@ ebira context --source-id <id> --byte-start <n> --byte-len <n> --before 5 --afte
 
 If it reports `source_changed_since_projection`, run `ebira sync` and search again.
 
+## A history from start to now
+
+For how a project, tool, or decision developed and where it stands:
+
+1. Map it with `ebira history --query <name>` for each spelling of the name: the
+   dates and sessions show when it was worked on, and the projects where.
+2. Ask, as above. The answer's list of what the records do not settle is the list
+   of what to check next.
+3. Read every message of the person's about it: one `said` pass with each
+   spelling as its own `--query` (the English name, its katakana, lowercase, a
+   former name). These are the backbone of the account; an agent's report is a
+   claim to check against them.
+4. When the work produced code, `ebira commits --repo <repository>` ties the
+   commits to the conversations, and Git dates the code itself, uncommitted
+   changes included.
+5. For where it stands now, search after the last decision with
+   `ebira search --query <name> --from <yyyy-mm-dd>`. Later records that only
+   look back, such as surveys and summaries, are not new work.
+6. Read the original of every record the account rests on, as above.
+
+The records hold what was said to Claude Code and Codex. Work done by hand or in
+other tools, and what images show, are not in them; say so where the account
+depends on it.
+
 ## Before calling something absent
 
 - `no_match_in_projection` covers the compact corpus only; check the original
