@@ -167,6 +167,104 @@ fn without_the_api_it_lists_the_records_an_answer_would_read() {
 }
 
 #[test]
+fn leaves_out_copies_imported_into_another_thread() {
+    // A Codex thread that imported the Claude conversation holds copies of its records, stamped
+    // at the import two days later; the originals carry the real times.
+    let root = std::env::temp_dir().join(format!("ebira-ask-imported-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let claude = root.join(".claude").join("projects").join("C--work-game");
+    let codex = root.join(".codex").join("sessions");
+    std::fs::create_dir_all(&claude).expect("create claude directories");
+    std::fs::create_dir_all(&codex).expect("create codex directories");
+    std::fs::write(
+        claude.join("s-main.jsonl"),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"keep the old colors on the map"},"sessionId":"s-main","timestamp":"2026-09-01T00:00:00Z","cwd":"C:/work/game"}"#, "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"kept the old colors on the map"}]},"sessionId":"s-main","timestamp":"2026-09-01T00:00:03Z","cwd":"C:/work/game"}"#, "\n",
+        ),
+    )
+    .expect("write the original conversation");
+    std::fs::write(
+        codex.join("rollout-2026-09-03T02-00-00-c-import.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-09-03T02:00:00Z","type":"session_meta","payload":{"id":"c-import","originator":"Codex Desktop","source":"vscode","cwd":"C:/work/game"}}"#, "\n",
+            // As Codex writes an import: each message twice, the reply after the turn closes.
+            r#"{"timestamp":"2026-09-03T02:00:00.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1"}}"#, "\n",
+            r#"{"timestamp":"2026-09-03T02:00:00.100Z","type":"event_msg","payload":{"type":"user_message","message":"keep the old colors on the map"}}"#, "\n",
+            r#"{"timestamp":"2026-09-03T02:00:00.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"keep the old colors on the map"}]}}"#, "\n",
+            r#"{"timestamp":"2026-09-03T02:00:00.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-1"}}"#, "\n",
+            r#"{"timestamp":"2026-09-03T02:00:00.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"kept the old colors on the map"}]}}"#, "\n",
+            r#"{"timestamp":"2026-09-03T02:05:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#, "\n",
+            r#"{"timestamp":"2026-09-03T02:05:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"now draw the legend"}]}}"#, "\n",
+        ),
+    )
+    .expect("write the thread that imported it");
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    let run = |args: &[&str]| {
+        let output = ebira(&root).args(args).output().expect("ebira runs");
+        assert!(
+            output.status.success(),
+            "ebira {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("ebira writes UTF-8")
+    };
+    let claude_logs = root.join(".claude").join("projects");
+    let codex_logs = codex.clone();
+    run(&[
+        "sync",
+        "--source",
+        claude_logs.to_str().expect("utf-8 path"),
+        "--source",
+        codex_logs.to_str().expect("utf-8 path"),
+        "--corpus",
+        corpus,
+    ]);
+
+    let said = run(&[
+        "said",
+        "--query",
+        "old colors",
+        "--corpus",
+        corpus,
+        "--format",
+        "text",
+    ]);
+    assert!(said.contains("1 of 1 messages"), "{said}");
+    assert!(
+        !said.contains("codex"),
+        "neither copy of the imported message is listed as said: {said}"
+    );
+
+    let json = run(&[
+        "ask",
+        "q",
+        "--corpus",
+        corpus,
+        "--term",
+        "old colors",
+        "--no-api",
+    ]);
+    assert!(json.contains("\"source_id\":\"claude-"), "{json}");
+    assert!(
+        !json.contains("\"source_id\":\"codex-"),
+        "the copies are left out, the agent's as well as the person's: {json}"
+    );
+
+    let text = run(&[
+        "ask", "q", "--corpus", corpus, "--term", "legend", "--no-api", "--format", "text",
+    ]);
+    assert!(text.contains("now draw the legend"), "{text}");
+    assert!(
+        !text.contains("old colors"),
+        "the imported copies before it are not shown as its neighbours: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn it_refuses_what_it_cannot_do_before_spending() {
     let logs = Logs::new("refusals");
     let corpus = logs.corpus();

@@ -53,6 +53,9 @@ pub struct SearchRequest {
     pub raw: bool,
     /// `--order desc`: the newest matches first. The default stays chronological.
     pub newest_first: bool,
+    /// Leave out the records of another agent's conversation imported into a Codex thread:
+    /// copies stamped when they were imported, whose originals carry the real times.
+    pub skip_imported: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2007,6 +2010,7 @@ fn request_has_filters(request: &SearchRequest) -> bool {
         || request.sender.is_some()
         || request.from.is_some()
         || request.to.is_some()
+        || request.skip_imported
 }
 
 struct Coverage {
@@ -2176,6 +2180,9 @@ fn parse_event_header_checked(path: &Path, line: &[u8]) -> io::Result<EventHeade
 }
 
 fn matches_filters(header: &EventHeader, request: &SearchRequest) -> bool {
+    if request.skip_imported && header.turn.starts_with(crate::core::IMPORTED_TURN_PREFIX) {
+        return false;
+    }
     if let Some(source_id) = request.source_id.as_deref() {
         if header.source_id != source_id {
             return false;

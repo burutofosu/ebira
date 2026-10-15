@@ -389,6 +389,10 @@ impl TurnReducer {
         let turn = match explicit {
             Some(explicit) => explicit,
             None => match known {
+                // A copy of another agent's conversation imported into a Codex thread lasts
+                // until a turn of the thread itself starts: Codex writes each imported message
+                // twice, and the replies after the imported turn closes.
+                Some(state) if state.turn.starts_with(IMPORTED_TURN_PREFIX) => state.turn.clone(),
                 Some(state) if !starts_turn && !opens_turn => state.turn.clone(),
                 _ => derived_turn_id(record_start),
             },
@@ -2307,6 +2311,62 @@ mod tests {
         assert_eq!(later.meta.cwd.as_deref(), Some("C:/projects/game"));
     }
 
+    /// Records of a Codex thread that imported another agent's conversation, as Codex writes
+    /// them: each imported message twice, the reply after the imported turn closes, then a turn
+    /// of the thread itself.
+    const CODEX_IMPORT: [&str; 7] = [
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"keep the colors"}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"keep the colors"}]}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-1"}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"kept them"}]}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"0199-thread-turn"}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"now the legend"}]}}"#,
+    ];
+
+    fn ingest_codex(records: &[&str]) -> Vec<CanonicalEvent> {
+        let mut machine = IngestStateMachine::new();
+        records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let fields = crate::jsonl::parse_record(record.as_bytes(), 0).unwrap();
+                let mut meta = record_meta(&fields);
+                super::classify_sender(super::SourceOrigin::CodexThread, &fields, &mut meta);
+                machine.apply("thread", meta, String::new(), index as u64 * 100)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_codex_import_lasts_until_a_turn_of_the_thread_starts() {
+        use super::Sender;
+        let events = ingest_codex(&CODEX_IMPORT);
+        let turn = |index: usize| events[index].meta.turn.clone().unwrap_or_default();
+        for index in 0..=4 {
+            assert!(
+                turn(index).starts_with(super::IMPORTED_TURN_PREFIX),
+                "record {index} is part of the copy: {}",
+                turn(index)
+            );
+        }
+        for index in [1, 2] {
+            assert_eq!(events[index].meta.sender, Sender::Human, "record {index}");
+            assert_eq!(
+                events[index].meta.via,
+                super::IMPORTED_VIA,
+                "record {index}"
+            );
+        }
+        assert_eq!(turn(6), "0199-thread-turn");
+        assert_eq!(events[6].meta.sender, Sender::Human);
+        assert_ne!(
+            events[6].meta.via,
+            super::IMPORTED_VIA,
+            "the thread's own words"
+        );
+    }
+
     fn recovery_event(index: u64, turn: &str, kind: EventKind) -> RecoveryEvent {
         RecoveryEvent {
             event_index: index,
@@ -2337,7 +2397,7 @@ mod tests {
     /// how representative records are classified and projected changes with any change to
     /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
     /// here: the next sync then rebuilds every corpus made under the old rules.
-    const RULES_FINGERPRINT: (&str, u64, &str) = ("8", 4, "35e1c7b504c45dd1");
+    const RULES_FINGERPRINT: (&str, u64, &str) = ("8", 5, "ed3fb3ee6ce4733a");
 
     #[test]
     fn reading_rules_are_versioned() {
@@ -2636,6 +2696,15 @@ mod tests {
                 ));
                 questions = crate::questions::QuestionTracker::decode(&questions.encode()).unwrap();
             }
+        }
+        // Turns tell the copy of an imported conversation from the thread's own records.
+        for event in ingest_codex(&CODEX_IMPORT) {
+            lines.push(format!(
+                "{}|{}|{}\n",
+                event.meta.sender.as_str(),
+                event.meta.via,
+                event.meta.turn.unwrap_or_default()
+            ));
         }
         // A sync also puts every record on a date for the timeline.
         for offset_minutes in [0, 9 * 60] {

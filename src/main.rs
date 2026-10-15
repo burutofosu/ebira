@@ -1031,6 +1031,8 @@ fn search_request(
         raw: has_flag(args, "--raw"),
         fold_ascii_case: has_flag(args, "--ignore-case"),
         newest_first: order_option(args, false)?,
+        // `search` lists every record that holds the text, imported copies included.
+        skip_imported: false,
     })
 }
 

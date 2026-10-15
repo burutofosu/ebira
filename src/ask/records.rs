@@ -4,7 +4,7 @@
 //! who wrote them.
 
 use super::text;
-use crate::core::{human_text_from_body, Sender};
+use crate::core::{human_text_from_body, Sender, IMPORTED_TURN_PREFIX};
 use crate::corpus;
 use crate::format::{self, EventHeader};
 use crate::said::{self, SaidRequest};
@@ -250,6 +250,9 @@ impl Corpus {
             offset_minutes: self.offset_minutes,
             fold_ascii_case: true,
             newest_first: true,
+            // As `said` leaves out the person's imported copies: stamped at the import, they
+            // would pass for the newest records and push the originals out.
+            skip_imported: true,
             ..SearchRequest::default()
         };
         let catalog = corpus::source_catalog(&self.root)?;
@@ -410,11 +413,16 @@ fn skip<R: Read>(reader: &mut R, length: u64) -> io::Result<()> {
 }
 
 /// The events as readable lines, the one at `hit_start` marked. Codex writes a message twice
-/// (as a response item and as an event): one of them is kept, the hit when it is one.
+/// (as a response item and as an event): one of them is kept, the hit when it is one. Copies of
+/// another agent's conversation imported into the thread are left out: they carry the time of
+/// the import, not of the words.
 fn readable_lines(events: &[(EventHeader, Vec<u8>)], hit_start: u64) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
     for (header, body) in events {
         let is_hit = header.byte_start == hit_start;
+        if !is_hit && header.turn.starts_with(IMPORTED_TURN_PREFIX) {
+            continue;
+        }
         let body = String::from_utf8_lossy(body);
         let (label, text) = match readable(header, &body) {
             Some(found) => found,
