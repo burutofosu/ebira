@@ -20,6 +20,25 @@ the same place.
 Run `ebira sync` first when the question includes recent events. If the storage
 format or reading rules changed, sync rebuilds the corpus from the logs.
 
+## Ask first
+
+When an Anthropic API key is set (`ANTHROPIC_API_KEY`, or one saved with
+`ebira ask-setup`), let Ebira do the first search and reading:
+
+```text
+ebira ask "<the question, in the person's words>" [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] --format text
+```
+
+It chooses search strings, screens what it finds, reads the records around the
+best of them, checks the person's later messages for changes to each decision it
+reports, and answers with quotes, each checked against the records and cited by
+source reference. It takes about two minutes and costs about $0.30 a question;
+`--quick` costs a tenth and makes more mistakes about what changed later. A quote
+marked `(not found in the records)` is not one. The answer is a lead: read the
+original of every claim you rely on (below) before you report it.
+
+Without a key, or to look further, search yourself.
+
 ## Find
 
 The person's own statements across Claude Code and Codex, newest first:
@@ -32,13 +51,17 @@ When a topic came up, and the records that mention it:
 
 ```text
 ebira history --query <text>
-ebira search --query <text> [--sender human] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] [--order desc]
+ebira search --query <text> [--sender human] [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] [--order desc]
 ebira timeline --date <yyyy-mm-dd>
 ```
 
 Queries are literal text; `--ignore-case` folds ASCII letters only. Narrow with
 `--session`, `--source-id`, `--sender`, and `--kind`; page with `--offset` and
 the returned `next_offset`.
+
+Several texts take one pass over the corpus instead of one each: repeat
+`--query` with `said` or `search`. Each text gets the list it would get alone,
+under `results`; keep `--limit` small so the output stays readable.
 
 For the commits a conversation produced, run `ebira commits --repo <repository>`
 and read them with Git.

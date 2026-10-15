@@ -105,6 +105,43 @@ pub fn parse_event_header(line: &[u8]) -> Result<EventHeader, String> {
     Ok(header)
 }
 
+/// The `body_len` of an event header line, read from the end of the line, where the field is,
+/// without parsing the other fields.
+pub fn header_body_len(line: &[u8]) -> Result<u64, String> {
+    let marker = b"\tbody_len=";
+    let start = line
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .map(|position| position + marker.len())
+        .ok_or_else(|| "header has no body_len".to_string())?;
+    let end = line[start..]
+        .iter()
+        .position(|byte| *byte == b'\t' || *byte == b'\r' || *byte == b'\n')
+        .map(|offset| start + offset)
+        .unwrap_or(line.len());
+    std::str::from_utf8(&line[start..end])
+        .map_err(|_| "body_len is not UTF-8".to_string())?
+        .parse()
+        .map_err(|_| "body_len is not an integer".to_string())
+}
+
+/// The sender of an event header line as written (an encoded token), read from the end of the
+/// line, where the field is, without parsing the other fields. A value cannot hold a tab, so
+/// the last `\tsender=` is the field.
+pub fn header_sender(line: &[u8]) -> Option<&[u8]> {
+    let marker = b"\tsender=";
+    let start = line
+        .windows(marker.len())
+        .rposition(|window| window == marker)?
+        + marker.len();
+    let end = line[start..]
+        .iter()
+        .position(|byte| *byte == b'\t' || *byte == b'\r' || *byte == b'\n')
+        .map(|offset| start + offset)
+        .unwrap_or(line.len());
+    Some(&line[start..end])
+}
+
 fn parse_u64(value: &str, key: &str) -> Result<u64, String> {
     value
         .parse()
@@ -225,7 +262,29 @@ fn hex(value: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_field_slices, body_fields, decode_token, encode_token, push_field};
+    use super::{
+        body_field_slices, body_fields, decode_token, encode_token, event_header_line,
+        header_body_len, header_sender, parse_event_header, push_field, EventHeader,
+    };
+
+    #[test]
+    fn a_header_tells_its_sender_and_body_length_unparsed() {
+        let header = EventHeader {
+            source_id: "claude-1".to_string(),
+            cwd: "C:/work\tsender=human\t".to_string(),
+            sender: "assistant".to_string(),
+            via: "typed".to_string(),
+            body_len: 1234,
+            ..EventHeader::default()
+        };
+        let line = event_header_line(&header);
+        assert_eq!(header_sender(line.as_bytes()), Some(&b"assistant"[..]));
+        assert_eq!(header_body_len(line.as_bytes()), Ok(1234));
+        let parsed = parse_event_header(line.as_bytes()).expect("header parses");
+        assert_eq!(parsed.cwd, header.cwd);
+        assert_eq!(header_sender(b"@ebira\tv=8\tbody_len=3\n"), None);
+        assert!(header_body_len(b"@ebira\tv=8\n").is_err());
+    }
 
     #[test]
     fn a_body_cut_inside_a_field_yields_the_fields_before_it() {

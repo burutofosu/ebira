@@ -37,6 +37,8 @@ pub struct SearchRequest {
     pub operation: String,
     pub source_id: Option<String>,
     pub session: Option<String>,
+    /// Case-insensitive substring of the working directory the record was written in.
+    pub cwd: Option<String>,
     pub role: Option<String>,
     pub kind: Option<String>,
     pub sender: Option<String>,
@@ -134,13 +136,13 @@ struct Facets {
 }
 
 #[derive(Clone, Debug)]
-struct SearchHit {
-    header: EventHeader,
-    source_path: String,
+pub(crate) struct SearchHit {
+    pub(crate) header: EventHeader,
+    pub(crate) source_path: String,
     /// The path of the field whose value holds the query; none for raw records and listings.
-    field: Option<String>,
+    pub(crate) field: Option<String>,
     /// The text quoted from the record; none when it has none, or was not read.
-    snippet: Option<String>,
+    pub(crate) snippet: Option<String>,
     /// The instant of `header.timestamp` at the corpus offset, for ordering.
     instant: Option<i128>,
 }
@@ -219,6 +221,90 @@ pub fn run(root: &Path, request: SearchRequest) -> io::Result<()> {
         search_json(root, &request, &scope, &files, &stats, duration_ms)?
     };
     output::write(&output)
+}
+
+/// Several literal texts, found in one pass over the corpus. Each query gets the matches,
+/// facets, and pages a search for it alone would give; the scan, its coverage, and the filters
+/// are shared. `request.query` is not read.
+pub fn run_many(root: &Path, request: SearchRequest, queries: &[String]) -> io::Result<()> {
+    let started = Instant::now();
+    let catalog = corpus::source_catalog(root)?;
+    let found = find_many(root, &catalog, &request, queries)?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    output::write(&many_json(root, &request, queries, &found, duration_ms)?)
+}
+
+/// What one pass over the corpus found for several queries.
+pub(crate) struct ManyFound<'a> {
+    scope: corpus::Scope<'a>,
+    files: Vec<std::path::PathBuf>,
+    /// One per query, in their order.
+    stats: Vec<SearchStats>,
+}
+
+impl ManyFound<'_> {
+    /// How many records hold the query at `index`.
+    pub(crate) fn total(&self, index: usize) -> u64 {
+        self.stats[index].matched_events
+    }
+
+    /// The page of records for the query at `index`, in the request's order.
+    pub(crate) fn hits(&self, index: usize) -> &[SearchHit] {
+        &self.stats[index].returned
+    }
+
+    /// The earliest time through which a source in scope was read into the corpus.
+    pub(crate) fn synced_through_ms(&self) -> Option<u64> {
+        self.scope
+            .sources
+            .iter()
+            .map(|entry| entry.synced_at_ms)
+            .min()
+    }
+}
+
+/// Scans the corpus once for every query: a search of the corpus, not of the original records,
+/// and not a history.
+pub(crate) fn find_many<'a>(
+    root: &Path,
+    catalog: &'a BTreeMap<String, SourceEntry>,
+    request: &SearchRequest,
+    queries: &[String],
+) -> io::Result<ManyFound<'a>> {
+    if request.limit == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--limit must be at least 1",
+        ));
+    }
+    if queries.is_empty() || queries.iter().any(String::is_empty) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query is empty",
+        ));
+    }
+    if request.raw || is_history_request(request) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "several --query work only with search, without --raw",
+        ));
+    }
+    let scope = corpus::scope(
+        catalog,
+        request.source_id.as_deref(),
+        request.session.as_deref(),
+    );
+    let files = scope.files(root)?;
+    let folded = queries
+        .iter()
+        .map(|query| fold_query(query, request.fold_ascii_case))
+        .collect::<Vec<_>>();
+    let stats = scan_many(&files, catalog, request, &folded)?;
+    Ok(ManyFound {
+        scope,
+        files,
+        stats,
+    })
 }
 
 pub fn timeline(root: &Path, request: TimelineRequest) -> io::Result<()> {
@@ -741,27 +827,24 @@ fn scan_timeline_run(
     Ok(())
 }
 
-fn query_bytes(request: &SearchRequest) -> Vec<u8> {
-    if request.fold_ascii_case {
-        request.query.to_ascii_lowercase().into_bytes()
+/// A query as the scan compares it: folded when the search folds ASCII case.
+fn fold_query(query: &str, fold_ascii_case: bool) -> String {
+    if fold_ascii_case {
+        query.to_ascii_lowercase()
     } else {
-        request.query.as_bytes().to_vec()
+        query.to_string()
     }
 }
 
+#[cfg(test)]
 fn scan_sequential(
     files: &[std::path::PathBuf],
     catalog: &BTreeMap<String, SourceEntry>,
     request: &SearchRequest,
 ) -> io::Result<SearchStats> {
-    let mut stats = SearchStats::default();
-    let mut sources = SourceReaders::default();
-    let query = query_bytes(request);
-    for path in files {
-        scan_file(path, catalog, request, &query, &mut stats, &mut sources)?;
-    }
-    stats.returned = search_page(stats.returned, request);
-    Ok(stats)
+    let query = fold_query(&request.query, request.fold_ascii_case);
+    let stats = scan_many_sequential(files, catalog, request, &[query])?;
+    Ok(stats.into_iter().next().unwrap_or_default())
 }
 
 fn scan_parallel(
@@ -769,8 +852,40 @@ fn scan_parallel(
     catalog: &BTreeMap<String, SourceEntry>,
     request: &SearchRequest,
 ) -> io::Result<SearchStats> {
+    let query = fold_query(&request.query, request.fold_ascii_case);
+    let stats = scan_many(files, catalog, request, &[query])?;
+    Ok(stats.into_iter().next().unwrap_or_default())
+}
+
+/// Every query's statistics from one scan of `files`, in the order of `queries` (folded already).
+fn scan_many_sequential(
+    files: &[std::path::PathBuf],
+    catalog: &BTreeMap<String, SourceEntry>,
+    request: &SearchRequest,
+    queries: &[String],
+) -> io::Result<Vec<SearchStats>> {
+    let mut stats = queries
+        .iter()
+        .map(|_| SearchStats::default())
+        .collect::<Vec<_>>();
+    let mut sources = SourceReaders::default();
+    for path in files {
+        scan_file(path, catalog, request, queries, &mut stats, &mut sources)?;
+    }
+    for query_stats in &mut stats {
+        query_stats.returned = search_page(std::mem::take(&mut query_stats.returned), request);
+    }
+    Ok(stats)
+}
+
+fn scan_many(
+    files: &[std::path::PathBuf],
+    catalog: &BTreeMap<String, SourceEntry>,
+    request: &SearchRequest,
+    queries: &[String],
+) -> io::Result<Vec<SearchStats>> {
     if files.len() < 2 || request.offset > 4096 {
-        return scan_sequential(files, catalog, request);
+        return scan_many_sequential(files, catalog, request, queries);
     }
 
     let worker_limit = request
@@ -784,7 +899,7 @@ fn scan_parallel(
         .min(files.len());
     let chunk_size = files.len().div_ceil(worker_count);
     let catalog = Arc::new(catalog.clone());
-    let query = Arc::new(query_bytes(request));
+    let queries = Arc::new(queries.to_vec());
     let mut worker_request = request.clone();
     worker_request.offset = 0;
     worker_request.limit = worker_limit;
@@ -795,18 +910,21 @@ fn scan_parallel(
     for (chunk_index, chunk) in files.chunks(chunk_size).enumerate() {
         let chunk = chunk.to_vec();
         let catalog = Arc::clone(&catalog);
-        let query = Arc::clone(&query);
+        let queries = Arc::clone(&queries);
         let worker_request = Arc::clone(&worker_request);
         let sender = sender.clone();
         handles.push(thread::spawn(move || {
-            let mut stats = SearchStats::default();
+            let mut stats = queries
+                .iter()
+                .map(|_| SearchStats::default())
+                .collect::<Vec<_>>();
             let mut sources = SourceReaders::default();
             let result = chunk.iter().try_for_each(|path| {
                 scan_file(
                     path,
                     &catalog,
                     &worker_request,
-                    &query,
+                    &queries,
                     &mut stats,
                     &mut sources,
                 )
@@ -818,7 +936,7 @@ fn scan_parallel(
 
     let mut parts = (0..handles.len())
         .map(|_| None)
-        .collect::<Vec<Option<SearchStats>>>();
+        .collect::<Vec<Option<Vec<SearchStats>>>>();
     for (chunk_index, result) in receiver {
         parts[chunk_index] = Some(result?);
     }
@@ -828,13 +946,22 @@ fn scan_parallel(
         }
     }
 
-    let mut merged = SearchStats::default();
-    let mut candidate_hits = Vec::new();
+    let mut merged = queries
+        .iter()
+        .map(|_| SearchStats::default())
+        .collect::<Vec<_>>();
+    let mut candidate_hits = queries.iter().map(|_| Vec::new()).collect::<Vec<_>>();
     for part in parts.into_iter().flatten() {
-        candidate_hits.extend(part.returned.iter().cloned());
-        merge_stats(&mut merged, part);
+        for ((target, candidates), source) in
+            merged.iter_mut().zip(candidate_hits.iter_mut()).zip(part)
+        {
+            candidates.extend(source.returned.iter().cloned());
+            merge_stats(target, source);
+        }
     }
-    merged.returned = search_page(candidate_hits, request);
+    for (target, candidates) in merged.iter_mut().zip(candidate_hits) {
+        target.returned = search_page(candidates, request);
+    }
     Ok(merged)
 }
 
@@ -932,15 +1059,7 @@ fn search_json(
     let page_end = request.offset.saturating_add(stats.returned.len() as u64);
     let has_more = stats.matched_events > page_end;
     let coverage = coverage_stats(root, scope, files, request, stats)?;
-    let disposition = if stats.matched_events == 0 {
-        coverage.empty_disposition()
-    } else if stats.returned.is_empty() && request.offset > 0 {
-        "result_page_empty"
-    } else if has_more {
-        "result_page_truncated"
-    } else {
-        "ready"
-    };
+    let disposition = page_disposition(&coverage, stats, request.offset, has_more);
     let mut output = json::Object::new();
     output
         .name("disposition", disposition)
@@ -974,6 +1093,108 @@ fn search_json(
                 stats.matched_events,
             ),
         );
+    let mut text = output.finish();
+    text.push('\n');
+    Ok(text)
+}
+
+fn page_disposition(
+    coverage: &Coverage,
+    stats: &SearchStats,
+    offset: u64,
+    has_more: bool,
+) -> &'static str {
+    if stats.matched_events == 0 {
+        coverage.empty_disposition()
+    } else if stats.returned.is_empty() && offset > 0 {
+        "result_page_empty"
+    } else if has_more {
+        "result_page_truncated"
+    } else {
+        "ready"
+    }
+}
+
+/// The result of several queries: what they share once, then one entry per query with what a
+/// search for it alone would report about its matches.
+fn many_json(
+    root: &Path,
+    request: &SearchRequest,
+    queries: &[String],
+    found: &ManyFound,
+    duration_ms: u64,
+) -> io::Result<String> {
+    let first = found
+        .stats
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no query was given"))?;
+    let coverage = coverage_stats(root, &found.scope, &found.files, request, first)?;
+    let mut matched = false;
+    let mut truncated = false;
+    let results = queries
+        .iter()
+        .zip(&found.stats)
+        .map(|(query, stats)| {
+            let mut single = request.clone();
+            single.query = query.clone();
+            let page_end = request.offset.saturating_add(stats.returned.len() as u64);
+            let has_more = stats.matched_events > page_end;
+            matched |= stats.matched_events > 0;
+            truncated |= has_more;
+            json::Object::new()
+                .text("query", query)
+                .name(
+                    "disposition",
+                    page_disposition(&coverage, stats, request.offset, has_more),
+                )
+                .number("total_candidates", stats.matched_events)
+                .number("returned", stats.returned.len() as u64)
+                .number("offset", request.offset)
+                .boolean("truncated", has_more)
+                .optional_number("next_offset", has_more.then_some(page_end))
+                .raw("facets", &facets_json(&stats.facets))
+                .raw("matches", &hits_json(&stats.returned))
+                .raw(
+                    "next_actions",
+                    &search_next_actions(
+                        root,
+                        &single,
+                        page_end,
+                        has_more,
+                        &coverage,
+                        stats.matched_events,
+                    ),
+                )
+                .finish()
+        })
+        .collect::<Vec<_>>();
+    let disposition = if !matched {
+        coverage.empty_disposition()
+    } else if truncated {
+        "result_page_truncated"
+    } else {
+        "ready"
+    };
+    let mut output = json::Object::new();
+    output
+        .name("disposition", disposition)
+        .name("mode", "literal_scan")
+        .name("operation", "search")
+        .name("search_scope", search_scope(request))
+        .name("order", match_order(request))
+        .raw(
+            "queries",
+            &json::strings(queries.iter().map(String::as_str)),
+        )
+        .name("normalization", normalization(request))
+        .number("scanned_files", first.scanned_files)
+        .number("scanned_bytes", first.scanned_bytes)
+        .number("duration_ms", duration_ms)
+        .number("offset", request.offset);
+    coverage.write_fields(&mut output);
+    output
+        .raw("applied_filters", &applied_filters_json(request))
+        .raw("results", &json::array(results));
     let mut text = output.finish();
     text.push('\n');
     Ok(text)
@@ -1196,6 +1417,7 @@ fn applied_filters_json(request: &SearchRequest) -> String {
     json::Object::new()
         .optional("session", request.session.as_deref())
         .optional("source_id", request.source_id.as_deref())
+        .optional("cwd", request.cwd.as_deref())
         .optional("role", request.role.as_deref())
         .optional("kind", request.kind.as_deref())
         .optional("sender", request.sender.as_deref())
@@ -1327,6 +1549,7 @@ fn search_request_json(
         .number("offset", offset)
         .optional("source_id", request.source_id.as_deref())
         .optional("session", request.session.as_deref())
+        .optional("cwd", request.cwd.as_deref())
         .optional("role", request.role.as_deref())
         .optional("kind", request.kind.as_deref())
         .optional("sender", request.sender.as_deref())
@@ -1585,117 +1808,108 @@ fn read_range(
     Ok(bytes)
 }
 
+/// What a record holds of one query: the field and the quoted text, either of which a raw
+/// scan may not name.
+type BodyMatch = Option<(Option<String>, Option<String>)>;
+
+/// Scans one segment file for every query in `queries` (folded already), adding each query's
+/// matches to its entry in `stats`. A raw scan takes one query.
 fn scan_file(
     path: &Path,
     catalog: &BTreeMap<String, SourceEntry>,
     request: &SearchRequest,
-    query: &[u8],
-    stats: &mut SearchStats,
+    queries: &[String],
+    stats: &mut [SearchStats],
     sources: &mut SourceReaders,
 ) -> io::Result<()> {
     let metadata = path.metadata()?;
-    stats.scanned_files += 1;
-    stats.scanned_bytes = stats.scanned_bytes.saturating_add(metadata.len());
+    for query_stats in stats.iter_mut() {
+        query_stats.scanned_files += 1;
+        query_stats.scanned_bytes = query_stats.scanned_bytes.saturating_add(metadata.len());
+    }
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(SEARCH_BUFFER_SIZE, file);
     let mut header_line = Vec::new();
-    let mut workspace = ScanWorkspace::new(query.len(), request.fold_ascii_case);
+    let longest = queries.iter().map(String::len).max().unwrap_or(0);
+    let mut workspace = ScanWorkspace::new(longest, request.fold_ascii_case);
+    let mut matches: Vec<BodyMatch> = Vec::with_capacity(queries.len());
     let has_filters = request_has_filters(request) || request.raw;
+    let sender = request.sender.as_deref().map(format::encode_token);
     loop {
         header_line.clear();
         let read = reader.read_until(b'\n', &mut header_line)?;
         if read == 0 {
             break;
         }
-        let parsed_header = if has_filters {
+        // Most events are another sender's: they are passed over without parsing the header.
+        let sender_matches = sender
+            .as_deref()
+            .is_none_or(|sender| format::header_sender(&header_line) == Some(sender.as_bytes()));
+        let parsed_header = if has_filters && sender_matches {
             Some(parse_event_header_checked(path, &header_line)?)
         } else {
             None
         };
         let body_len = match parsed_header.as_ref() {
             Some(header) => header.body_len,
-            None => parse_body_len(&header_line).map_err(|error| {
+            None => format::header_body_len(&header_line).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("{}: {}", path.display(), error),
                 )
             })?,
         };
-        let eligible = parsed_header
-            .as_ref()
-            .map(|header| matches_filters(header, request))
-            .unwrap_or(true);
-        let body_match = if !eligible {
+        let eligible = sender_matches
+            && parsed_header
+                .as_ref()
+                .map(|header| matches_filters(header, request))
+                .unwrap_or(true);
+        matches.clear();
+        if !eligible {
             workspace.overlap.clear();
             skip_body(&mut reader, body_len)?;
-            None
         } else if request.raw {
             workspace.overlap.clear();
             skip_body(&mut reader, body_len)?;
             let header = parsed_header
                 .as_ref()
                 .expect("a raw scan parses every header");
-            scan_source_record(header, catalog, query, &mut workspace, stats, sources)?
-                .map(|snippet| (None, Some(snippet)))
+            let snippet = scan_source_record(
+                header,
+                catalog,
+                queries[0].as_bytes(),
+                &mut workspace,
+                &mut stats[0],
+                sources,
+            )?;
+            matches.push(snippet.map(|snippet| (None, Some(snippet))));
         } else {
-            scan_values(&mut reader, body_len, query, &mut workspace)?
-                .map(|(field, snippet)| (Some(field), Some(snippet)))
-        };
-        if let Some((field, snippet)) = body_match {
+            scan_values(&mut reader, body_len, queries, &mut workspace, &mut matches)?;
+        }
+        if matches.iter().any(Option::is_some) {
             let header = match parsed_header {
                 Some(header) => header,
                 None => parse_event_header_checked(path, &header_line)?,
             };
-            stats.matched_events += 1;
             let source_path = catalog
                 .get(&header.source_id)
                 .map(|entry| entry.path.clone())
                 .unwrap_or_default();
-            *stats
-                .facets
-                .source
-                .entry(header.source_id.clone())
-                .or_default() += 1;
-            *stats
-                .facets
-                .session
-                .entry(header.session.clone())
-                .or_default() += 1;
-            *stats.facets.kind.entry(header.kind.clone()).or_default() += 1;
-            *stats
-                .facets
-                .sender
-                .entry(header.sender.clone())
-                .or_default() += 1;
+            let instant = time::instant(&header.timestamp, request.offset_minutes);
             let date = time::date_bucket(&header.timestamp, request.offset_minutes);
-            *stats.facets.date.entry(date.clone()).or_default() += 1;
-            let hit = SearchHit {
-                instant: time::instant(&header.timestamp, request.offset_minutes),
-                header,
-                source_path,
-                field,
-                snippet,
-            };
-            if is_history_request(request) {
-                let bucket = stats.timeline.entry(date).or_default();
-                bucket.matched_events += 1;
-                *bucket
-                    .source
-                    .entry(hit.header.source_id.clone())
-                    .or_default() += 1;
-                *bucket
-                    .session
-                    .entry(hit.header.session.clone())
-                    .or_default() += 1;
-                *bucket.kind.entry(hit.header.kind.clone()).or_default() += 1;
-                let new_kind = bucket.sample_kinds.insert(hit.header.kind.clone());
-                if bucket.samples.len() < HISTORY_SAMPLES_PER_DATE
-                    || (new_kind && bucket.samples.len() < HISTORY_SAMPLES_PER_DATE * 2)
-                {
-                    bucket.samples.push(hit.clone());
-                }
+            for (query_stats, found) in stats.iter_mut().zip(matches.drain(..)) {
+                let Some((field, snippet)) = found else {
+                    continue;
+                };
+                let hit = SearchHit {
+                    instant,
+                    header: header.clone(),
+                    source_path: source_path.clone(),
+                    field,
+                    snippet,
+                };
+                add_match(query_stats, request, hit, &date);
             }
-            add_search_candidate(stats, hit, candidate_limit(request), request.newest_first);
         }
         let mut separator = [0u8; 1];
         reader.read_exact(&mut separator)?;
@@ -1707,6 +1921,49 @@ fn scan_file(
         }
     }
     Ok(())
+}
+
+/// Counts a matched record in one query's statistics and keeps it if it is on the page.
+fn add_match(stats: &mut SearchStats, request: &SearchRequest, hit: SearchHit, date: &str) {
+    stats.matched_events += 1;
+    let header = &hit.header;
+    *stats
+        .facets
+        .source
+        .entry(header.source_id.clone())
+        .or_default() += 1;
+    *stats
+        .facets
+        .session
+        .entry(header.session.clone())
+        .or_default() += 1;
+    *stats.facets.kind.entry(header.kind.clone()).or_default() += 1;
+    *stats
+        .facets
+        .sender
+        .entry(header.sender.clone())
+        .or_default() += 1;
+    *stats.facets.date.entry(date.to_string()).or_default() += 1;
+    if is_history_request(request) {
+        let bucket = stats.timeline.entry(date.to_string()).or_default();
+        bucket.matched_events += 1;
+        *bucket
+            .source
+            .entry(hit.header.source_id.clone())
+            .or_default() += 1;
+        *bucket
+            .session
+            .entry(hit.header.session.clone())
+            .or_default() += 1;
+        *bucket.kind.entry(hit.header.kind.clone()).or_default() += 1;
+        let new_kind = bucket.sample_kinds.insert(hit.header.kind.clone());
+        if bucket.samples.len() < HISTORY_SAMPLES_PER_DATE
+            || (new_kind && bucket.samples.len() < HISTORY_SAMPLES_PER_DATE * 2)
+        {
+            bucket.samples.push(hit.clone());
+        }
+    }
+    add_search_candidate(stats, hit, candidate_limit(request), request.newest_first);
 }
 
 fn scan_source_record(
@@ -1744,6 +2001,7 @@ fn scan_source_record(
 fn request_has_filters(request: &SearchRequest) -> bool {
     request.source_id.is_some()
         || request.session.is_some()
+        || request.cwd.is_some()
         || request.role.is_some()
         || request.kind.is_some()
         || request.sender.is_some()
@@ -1917,24 +2175,6 @@ fn parse_event_header_checked(path: &Path, line: &[u8]) -> io::Result<EventHeade
     })
 }
 
-fn parse_body_len(line: &[u8]) -> Result<u64, String> {
-    let marker = b"\tbody_len=";
-    let start = line
-        .windows(marker.len())
-        .position(|window| window == marker)
-        .map(|position| position + marker.len())
-        .ok_or_else(|| "header has no body_len".to_string())?;
-    let end = line[start..]
-        .iter()
-        .position(|byte| *byte == b'\t' || *byte == b'\r' || *byte == b'\n')
-        .map(|offset| start + offset)
-        .unwrap_or(line.len());
-    std::str::from_utf8(&line[start..end])
-        .map_err(|_| "body_len is not UTF-8".to_string())?
-        .parse()
-        .map_err(|_| "body_len is not an integer".to_string())
-}
-
 fn matches_filters(header: &EventHeader, request: &SearchRequest) -> bool {
     if let Some(source_id) = request.source_id.as_deref() {
         if header.source_id != source_id {
@@ -1943,6 +2183,15 @@ fn matches_filters(header: &EventHeader, request: &SearchRequest) -> bool {
     }
     if let Some(session) = request.session.as_deref() {
         if header.session != session {
+            return false;
+        }
+    }
+    if let Some(cwd) = request.cwd.as_deref() {
+        if !header
+            .cwd
+            .to_ascii_lowercase()
+            .contains(&cwd.to_ascii_lowercase())
+        {
             return false;
         }
     }
@@ -1966,15 +2215,16 @@ fn matches_filters(header: &EventHeader, request: &SearchRequest) -> bool {
         .contains(&header.timestamp, request.offset_minutes)
 }
 
-/// Reads a corpus body and finds `query` in the values of its fields, never in the paths and
-/// lengths that frame them. Returns the path of the first field that holds it and the text of
-/// that value around it.
+/// Reads a corpus body and finds each query in the values of its fields, never in the paths and
+/// lengths that frame them. For each query, `matches` gets the path of the first field that
+/// holds it and the text of that value around it, in the order of `queries`.
 fn scan_values<R: Read>(
     reader: &mut R,
     body_len: u64,
-    query: &[u8],
+    queries: &[String],
     workspace: &mut ScanWorkspace,
-) -> io::Result<Option<(String, String)>> {
+    matches: &mut Vec<BodyMatch>,
+) -> io::Result<()> {
     let ScanWorkspace {
         body,
         folded,
@@ -1982,22 +2232,48 @@ fn scan_values<R: Read>(
         ..
     } = workspace;
     read_whole(reader, body_len, body)?;
-    for (path, value) in format::body_field_slices(body) {
-        let haystack = if *fold_ascii_case {
-            folded.clear();
-            folded.extend(value.iter().map(u8::to_ascii_lowercase));
-            folded.as_slice()
-        } else {
-            value
-        };
-        if let Some(position) = find_bytes(haystack, query) {
-            return Ok(Some((
-                String::from_utf8_lossy(path).into_owned(),
-                text_around(value, position, query.len()),
-            )));
+    matches.clear();
+    matches.resize(queries.len(), None);
+    // Folding ASCII letters moves no byte, so the folded body frames the same fields.
+    let searched: &[u8] = if *fold_ascii_case {
+        folded.clear();
+        folded.extend(body.iter().map(u8::to_ascii_lowercase));
+        folded
+    } else {
+        body
+    };
+    let mut missing = queries.len();
+    let fields = format::body_field_slices(body).zip(format::body_field_slices(searched));
+    for ((path, value), (_, haystack)) in fields {
+        let text = std::str::from_utf8(haystack).ok();
+        for (query, found) in queries.iter().zip(matches.iter_mut()) {
+            if found.is_some() {
+                continue;
+            }
+            if let Some(position) = find_text(haystack, text, query) {
+                *found = Some((
+                    Some(String::from_utf8_lossy(path).into_owned()),
+                    Some(text_around(value, position, query.len())),
+                ));
+                missing -= 1;
+            }
+        }
+        if missing == 0 {
+            break;
         }
     }
-    Ok(None)
+    Ok(())
+}
+
+/// Where `query` first occurs in a value. A corpus value is UTF-8, and the standard string
+/// search skips through text that cannot hold the query much faster than a byte-by-byte
+/// comparison; other bytes are compared one position at a time.
+fn find_text(value: &[u8], text: Option<&str>, query: &str) -> Option<usize> {
+    match text {
+        Some(text) if text.contains(query) => text.find(query),
+        Some(_) => None,
+        None => find_bytes(value, query.as_bytes()),
+    }
 }
 
 /// Up to `SNIPPET_CONTEXT_BYTES` on each side of a match, on character boundaries.

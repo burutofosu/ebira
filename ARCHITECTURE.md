@@ -1,7 +1,8 @@
 # Architecture
 
 Ebira indexes JSONL records into a compact corpus and retains byte locations for
-source retrieval. All commands run locally.
+source retrieval. All commands run locally; `ask` also calls the Anthropic API
+(see [Ask](#ask)).
 
 ## Modules
 
@@ -22,6 +23,14 @@ source retrieval. All commands run locally.
 | `said.rs` | The person's own messages, by session, project, agent, or topic |
 | `follow.rs` | Waiting for the next message in another agent's transcript, by sender |
 | `commits.rs` | Commit-name extraction and Git resolution |
+| `ask.rs` | `ask`: search strings, screening, the reading, the reversal check, and the answer |
+| `ask/records.rs` | The records `ask` reads, through `said`, `search`, and the corpus |
+| `ask/api.rs` | The Messages API through curl, and the price of a call |
+| `ask/keys.rs` | Where the API key is found and saved |
+| `ask/prompts.rs` | What each model is asked, and the shape of its reply |
+| `ask/setup.rs` | `ask-setup`: the page that checks, saves, and removes the key |
+| `ask/usage.rs` | The spending ledger and `ask-usage` |
+| `ask/text.rs`, `ask/value.rs` | Clipping and quote checks; a JSON value for the API |
 
 The core module receives parsed values and returns state. Filesystem access,
 process execution, JSON parsing, and output formatting remain in the surrounding
@@ -240,8 +249,15 @@ the original JSONL bytes. The result reports unavailable sources, unreadable
 records, source growth, and the observed time boundary.
 
 Matches are chronological, or newest first with `--order desc`. Filters are
-applied to source, session, role, event kind, sender, and time range. ASCII case
-folding is optional.
+applied to source, session, working directory, role, event kind, sender, and
+time range. ASCII case folding is optional.
+
+Several queries share one pass over the corpus (`--query` given more than once to
+`search` or `said`): each record is read once and compared with every query, and
+each query gets the matches, counts, facets, and page a search for it alone
+would give. A sender filter is checked on the header's `sender` field, read from
+the end of the header line, before the rest is parsed; most events are another
+sender's.
 
 The person's messages have one definition, in `core.rs`, which `said`,
 `resume`, and `follow` share: records whose sender is the person, listed once
@@ -302,6 +318,26 @@ its refs and reflogs reach once, and a name resolves when it starts exactly one
 of them; asking Git about each name took minutes for a large corpus when the
 repository was on a slow file system. The result lists each commit with the
 earliest records that mention it.
+
+## Ask
+
+`ask` reads the corpus as the other commands do and gives the models only what
+it read. A round's search strings go through one pass of `said` and one of
+`search`; the records around a hit are the corpus events of its log, named by
+their sender and kind; the answer's quotes are checked against the text the
+model was given, and each finding names the record it came from. The corpus lock
+is held for each read, not while a model is answering, so a sync can run between.
+
+Ebira keeps no summary of the records. The corpus holds the records' own fields
+and where each record is in its log, and an index would hold where text occurs,
+never what it means. Every answer is derived from the records again, and no
+model's reading enters the corpus.
+
+The API key comes from `ANTHROPIC_API_KEY`, else from the Windows user
+environment through `reg.exe`, which works from WSL too; curl receives it on its
+standard input, never on a command line. Each call is appended to
+`<data>/ask/usage.tsv` with its tokens, an estimated price, and the run it
+belongs to.
 
 ## Output
 

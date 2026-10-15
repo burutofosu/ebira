@@ -1,3 +1,4 @@
+mod ask;
 mod commits;
 mod core;
 mod corpus;
@@ -26,8 +27,39 @@ struct CommandSpec {
     summary: &'static str,
     details: &'static [&'static str],
     values: &'static [&'static str],
+    /// The one argument given without an option name, if the command takes one.
+    positional: Option<&'static str>,
     flags: &'static [&'static str],
 }
+
+const ASK_DETAILS: &[&str] = &[
+    "  <question>                   what to find out, in your own words",
+    "  --quick                      Claude Haiku 5.5 throughout, without the check for later",
+    "                               changes: about a tenth of the cost, with more mistakes",
+    "  --cwd <text>                 conversations whose working directory contains the text",
+    "  --from <time>, --to <time>   a yyyy-mm-dd date or an RFC 3339 time",
+    "  --term <text>                a search string; repeat it to name several (otherwise the",
+    "                               plan model chooses them)",
+    "  --no-api                     search only, and list the records the answer would read",
+    "                               (needs --term; nothing is sent or spent)",
+    "  --format json|text           the result as one JSON object (default) or as text",
+    "",
+    "Models and breadth:",
+    "  --plan-model <id>            chooses search strings (default claude-opus-5-5)",
+    "  --screen-model <id>          screens the records found (default claude-haiku-5-5)",
+    "  --draft-model <id>           writes the draft that feeds the second round",
+    "                               (default claude-haiku-5-5)",
+    "  --answer-model <id>          writes the answer (default claude-opus-5-5)",
+    "  --effort <level>             low | medium | high | xhigh | max for the answer (default medium)",
+    "  --keep <n>                   records the answer reads (default 40)",
+    "  --person-per-term <n>        the person's messages per search string (default 60)",
+    "  --agent-per-term <n>         the agents' replies per search string (default 40; 0 for none)",
+    "  --candidates <n>             records screened per round (default 600)",
+    "",
+    "The question and the text of the records read go to the Anthropic API under your key",
+    "(ANTHROPIC_API_KEY, or the one `ebira ask-setup` saved); nothing else leaves the computer.",
+    "Every call is written to a ledger that `ebira ask-usage` sums.",
+];
 
 const FILTERS: &[&str] = &[
     "",
@@ -42,8 +74,11 @@ const FILTERS: &[&str] = &[
 ];
 
 const SEARCH_DETAILS: &[&str] = &[
+    "  --query <text>               search: repeat it to find several texts in one pass over the",
+    "                               corpus, each with the matches a search for it alone gives",
     "  --raw                        compare the query with the original JSONL records",
     "  --ignore-case                fold ASCII letters",
+    "  --cwd <text>                 records whose working directory contains the text",
     "  --date-limit <n>             dates per page of the date map (default 12)",
     "  --date-offset <n>            the first date of that page",
 ];
@@ -55,6 +90,7 @@ const SEARCH_VALUES: &[&str] = &[
     "--offset",
     "--session",
     "--source-id",
+    "--cwd",
     "--role",
     "--kind",
     "--sender",
@@ -79,6 +115,7 @@ const COMMANDS: &[CommandSpec] = &[
             "  --tool-output-chars <n>      characters kept from each tool output (default 300)",
         ],
         values: &["--corpus", "--source", "--rebuild-source", "--tool-output-chars"],
+        positional: None,
         flags: &["--rebuild"],
     },
     CommandSpec {
@@ -87,13 +124,16 @@ const COMMANDS: &[CommandSpec] = &[
         summary: "Show the corpus, its sources and imports, and what is not yet indexed",
         details: &[],
         values: &["--corpus"],
+        positional: None,
         flags: &[],
     },
     CommandSpec {
         name: "said",
-        synopsis: "[--session <id>] [--source-id <id>] [--cwd <text>] [--app claude|codex|other] [--query <text>] [--ignore-case] [--from <time>] [--to <time>] [--order desc|asc] [--limit <n>] [--offset <n>] [--max-chars <n>] [--format json|text] [--include-imported]",
+        synopsis: "[--session <id>] [--source-id <id>] [--cwd <text>] [--app claude|codex|other] [--query <text>]... [--ignore-case] [--from <time>] [--to <time>] [--order desc|asc] [--limit <n>] [--offset <n>] [--max-chars <n>] [--format json|text] [--include-imported]",
         summary: "List the person's own messages, newest first",
         details: &[
+            "  --query <text>               messages that hold the text; repeat it to look for",
+            "                               several texts in one pass, each listed apart",
             "  --cwd <text>                 messages whose working directory contains the text",
             "  --limit <n>, --max-chars <n> messages and characters per page (default 30 and 15000)",
             "  --include-imported           also list copies of the person's messages imported",
@@ -114,6 +154,7 @@ const COMMANDS: &[CommandSpec] = &[
             "--max-chars",
             "--format",
         ],
+        positional: None,
         flags: &["--ignore-case", "--include-imported"],
     },
     CommandSpec {
@@ -125,22 +166,25 @@ const COMMANDS: &[CommandSpec] = &[
             "                               and tool calls, and the compactions",
         ],
         values: &["--corpus", "--source-id", "--session"],
+        positional: None,
         flags: &["--brief"],
     },
     CommandSpec {
         name: "search",
-        synopsis: "--query <text> [--raw] [--ignore-case] [--order asc|desc] [filters]",
+        synopsis: "--query <text> [--query <text>]... [--raw] [--ignore-case] [--cwd <text>] [--order asc|desc] [filters]",
         summary: "Find the records that contain a literal text, oldest first",
         details: SEARCH_DETAILS,
         values: SEARCH_VALUES,
+        positional: None,
         flags: &["--raw", "--ignore-case"],
     },
     CommandSpec {
         name: "history",
-        synopsis: "--query <text> [--raw] [--ignore-case] [--order asc|desc] [filters]",
+        synopsis: "--query <text> [--raw] [--ignore-case] [--cwd <text>] [--order asc|desc] [filters]",
         summary: "Show on which dates a literal text appears",
         details: SEARCH_DETAILS,
         values: SEARCH_VALUES,
+        positional: None,
         flags: &["--raw", "--ignore-case"],
     },
     CommandSpec {
@@ -162,6 +206,7 @@ const COMMANDS: &[CommandSpec] = &[
             "--limit",
             "--offset",
         ],
+        positional: None,
         flags: &["--rebuild"],
     },
     CommandSpec {
@@ -177,6 +222,7 @@ const COMMANDS: &[CommandSpec] = &[
             "--before",
             "--after",
         ],
+        positional: None,
         flags: &[],
     },
     CommandSpec {
@@ -199,6 +245,7 @@ const COMMANDS: &[CommandSpec] = &[
             "--prefix",
             "--limit",
         ],
+        positional: None,
         flags: &[],
     },
     CommandSpec {
@@ -207,6 +254,7 @@ const COMMANDS: &[CommandSpec] = &[
         summary: "Find the commit ids mentioned in the records and resolve them with Git",
         details: &[],
         values: &["--corpus", "--repo", "--from", "--to", "--limit", "--offset"],
+        positional: None,
         flags: &[],
     },
     CommandSpec {
@@ -221,6 +269,59 @@ const COMMANDS: &[CommandSpec] = &[
             "--label",
             "--source-computer",
         ],
+        positional: None,
+        flags: &[],
+    },
+    CommandSpec {
+        name: "ask",
+        synopsis: "<question> [--quick] [--cwd <text>] [--from <time>] [--to <time>] [--term <text>]... [--no-api] [--format json|text]",
+        summary: "Answer a question about past work from the records, with quotes (uses the Anthropic API)",
+        details: ASK_DETAILS,
+        values: &[
+            "--corpus",
+            "--cwd",
+            "--from",
+            "--to",
+            "--term",
+            "--format",
+            "--plan-model",
+            "--screen-model",
+            "--draft-model",
+            "--answer-model",
+            "--effort",
+            "--keep",
+            "--person-per-term",
+            "--agent-per-term",
+            "--candidates",
+        ],
+        positional: Some("<question>"),
+        flags: &["--quick", "--no-api"],
+    },
+    CommandSpec {
+        name: "ask-setup",
+        synopsis: "[--no-open]",
+        summary: "Open a page on this computer to check, save, or remove the API key `ask` uses",
+        details: &[
+            "  --no-open                    print the page's address without opening a browser",
+            "",
+            "The page saves the key as the Windows user environment variable ANTHROPIC_API_KEY,",
+            "from Windows or from WSL; elsewhere, set ANTHROPIC_API_KEY yourself.",
+        ],
+        values: &[],
+        positional: None,
+        flags: &["--no-open"],
+    },
+    CommandSpec {
+        name: "ask-usage",
+        synopsis: "[--format json|text]",
+        summary: "Show what `ask` has spent, from its ledger",
+        details: &[
+            "  --format json|text           one JSON object (default) or text",
+            "",
+            "Set EBIRA_ASK_BUDGET_USD to see what is left of a credit.",
+        ],
+        values: &["--format"],
+        positional: None,
         flags: &[],
     },
 ];
@@ -239,8 +340,9 @@ fn usage() -> String {
         text.push_str(&format!("  {:<10}{}\n", spec.name, spec.summary));
     }
     text.push_str(
-        "\nEvery command reads --corpus <dir> (default: $EBIRA_CORPUS, else the platform data\n\
-         directory) and writes one JSON object. `ebira help <command>` lists its options.",
+        "\nThe commands that read a corpus take --corpus <dir> (default: $EBIRA_CORPUS, else the\n\
+         platform data directory). Every command writes one JSON object. `ebira help <command>`\n\
+         lists its options.",
     );
     text
 }
@@ -259,7 +361,9 @@ fn command_usage(spec: &CommandSpec) -> String {
         text.push_str(&lines.join("\n"));
         text.push('\n');
     }
-    text.push_str("\n  --corpus <dir>               the corpus (default: $EBIRA_CORPUS)");
+    if spec.values.contains(&"--corpus") {
+        text.push_str("\n  --corpus <dir>               the corpus (default: $EBIRA_CORPUS)");
+    }
     text
 }
 
@@ -316,40 +420,153 @@ fn default_corpus_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("EBIRA_CORPUS").filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path));
     }
+    data_dir().map(|path| path.join("corpus")).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            if cfg!(windows) {
+                "neither EBIRA_CORPUS nor LOCALAPPDATA names a corpus location"
+            } else {
+                "neither EBIRA_CORPUS, XDG_DATA_HOME, nor HOME names a corpus location"
+            },
+        )
+    })
+}
+
+/// The platform data directory: `%LOCALAPPDATA%\ebira` on Windows, else `$XDG_DATA_HOME/ebira`
+/// or `~/.local/share/ebira`.
+fn data_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var_os("LOCALAPPDATA")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .map(|path| path.join("ebira").join("corpus"))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "neither EBIRA_CORPUS nor LOCALAPPDATA names a corpus location",
-                )
-            })
+            .map(|path| path.join("ebira"))
     }
     #[cfg(not(windows))]
     {
         if let Some(path) = std::env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
-            return Ok(PathBuf::from(path).join("ebira").join("corpus"));
+            return Some(PathBuf::from(path).join("ebira"));
         }
         std::env::var_os("HOME")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .map(|path| {
-                path.join(".local")
-                    .join("share")
-                    .join("ebira")
-                    .join("corpus")
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "neither EBIRA_CORPUS, XDG_DATA_HOME, nor HOME names a corpus location",
-                )
-            })
+            .map(|path| path.join(".local").join("share").join("ebira"))
     }
+}
+
+/// Where `ask` keeps its spending ledger (`usage.tsv`) and each request's files while it runs
+/// (`tmp`): `ask` in the data directory, apart from any corpus.
+fn ask_dir() -> io::Result<PathBuf> {
+    data_dir().map(|path| path.join("ask")).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no data directory for the ask ledger: LOCALAPPDATA (Windows) or HOME is not set",
+        )
+    })
+}
+
+/// `EBIRA_ASK_BUDGET_USD`, the credit `ask-usage` counts the spending against, if set.
+fn ask_budget() -> io::Result<Option<f64>> {
+    let Some(value) = std::env::var("EBIRA_ASK_BUDGET_USD")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    value.trim().parse::<f64>().map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("EBIRA_ASK_BUDGET_USD must be a number of dollars, got {value}"),
+        )
+    })
+}
+
+/// `--format json` (the default) or `--format text`: whether the result is text.
+fn text_format(args: &[String]) -> io::Result<bool> {
+    match option_values(args, "--format")
+        .into_iter()
+        .next()
+        .as_deref()
+    {
+        None | Some("json") => Ok(false),
+        Some("text") => Ok(true),
+        Some(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--format must be json or text, got {}", value),
+        )),
+    }
+}
+
+/// A number option bounded to `low..=high`.
+fn bounded_number(
+    args: &[String],
+    name: &str,
+    default: usize,
+    low: usize,
+    high: usize,
+) -> io::Result<usize> {
+    let value = number_option(args, name, default)?;
+    if (low..=high).contains(&value) {
+        Ok(value)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} must be from {} to {}, got {}", name, low, high, value),
+        ))
+    }
+}
+
+fn ask_options(args: &[String], question: String) -> io::Result<ask::Options> {
+    let mut options = if has_flag(args, "--quick") {
+        ask::Options::quick(question)
+    } else {
+        ask::Options::thorough(question)
+    };
+    let from = option_values(args, "--from").into_iter().next();
+    let to = option_values(args, "--to").into_iter().next();
+    // Read now, so that a bad date fails before anything is spent.
+    time::Range::parse(from.as_deref(), to.as_deref(), 0)?;
+    options.filters = ask::Filters {
+        cwd: option_values(args, "--cwd").into_iter().next(),
+        from,
+        to,
+    };
+    options.terms = option_values(args, "--term");
+    options.no_api = has_flag(args, "--no-api");
+    options.text_format = text_format(args)?;
+    for (name, model) in [
+        ("--plan-model", &mut options.plan_model),
+        ("--screen-model", &mut options.screen_model),
+        ("--answer-model", &mut options.answer_model),
+    ] {
+        if let Some(value) = option_values(args, name).into_iter().next() {
+            *model = value;
+        }
+    }
+    if let Some(model) = option_values(args, "--draft-model").into_iter().next() {
+        options.draft_model = Some(model);
+    }
+    if let Some(effort) = option_values(args, "--effort").into_iter().next() {
+        check_name(
+            "--effort",
+            &effort,
+            &["low", "medium", "high", "xhigh", "max"],
+        )?;
+        options.effort = effort;
+    }
+    options.keep = bounded_number(args, "--keep", options.keep, 1, 120)?;
+    options.person_per_term =
+        bounded_number(args, "--person-per-term", options.person_per_term, 1, 400)?;
+    options.agent_per_term =
+        bounded_number(args, "--agent-per-term", options.agent_per_term, 0, 400)?;
+    options.candidates = bounded_number(args, "--candidates", options.candidates, 1, 2000)?;
+    if options.no_api && options.terms.iter().all(|term| term.trim().is_empty()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--no-api needs --term: choosing search strings takes the API",
+        ));
+    }
+    Ok(options)
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {
@@ -380,11 +597,35 @@ fn optional_number_option(args: &[String], name: &str) -> io::Result<Option<usiz
     })
 }
 
-fn validate_options(spec: &CommandSpec, args: &[String]) -> io::Result<()> {
+/// The argument given without an option name, for a command that takes one.
+fn positional_value(spec: &CommandSpec, args: &[String]) -> Option<String> {
+    spec.positional?;
     let mut index = 1;
     while index < args.len() {
         let argument = &args[index];
+        if spec.values.contains(&argument.as_str()) {
+            index += 2;
+            continue;
+        }
+        if !argument.starts_with("--") {
+            return Some(argument.clone());
+        }
+        index += 1;
+    }
+    None
+}
+
+fn validate_options(spec: &CommandSpec, args: &[String]) -> io::Result<()> {
+    let mut index = 1;
+    let mut positional_seen = false;
+    while index < args.len() {
+        let argument = &args[index];
         if spec.flags.contains(&argument.as_str()) {
+            index += 1;
+            continue;
+        }
+        if spec.positional.is_some() && !positional_seen && !argument.starts_with("--") {
+            positional_seen = true;
             index += 1;
             continue;
         }
@@ -468,12 +709,29 @@ fn run(args: &[String]) -> io::Result<()> {
         }
         "search" | "history" => {
             let root = corpus_path(args)?;
+            let queries = option_values(args, "--query");
+            if queries.len() > 1 && (command == "history" || has_flag(args, "--raw")) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} takes one --query; several work with search of the corpus",
+                        if command == "history" {
+                            "history"
+                        } else {
+                            "--raw"
+                        }
+                    ),
+                ));
+            }
             let _lock = corpus::read_lock(&root)?;
             let request = search_request(
                 args,
                 if command == "history" { "history" } else { "" },
                 corpus::corpus_offset_minutes(&root)?,
             )?;
+            if queries.len() > 1 {
+                return search::run_many(&root, request, &queries);
+            }
             search::run(&root, request)
         }
         "timeline" => {
@@ -528,7 +786,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 source_id: option_values(args, "--source-id").into_iter().next(),
                 cwd: option_values(args, "--cwd").into_iter().next(),
                 app: option_values(args, "--app").into_iter().next(),
-                query: option_values(args, "--query").into_iter().next(),
+                queries: option_values(args, "--query"),
                 fold_ascii_case: has_flag(args, "--ignore-case"),
                 from,
                 to,
@@ -614,6 +872,41 @@ fn run(args: &[String]) -> io::Result<()> {
             let root = corpus_path(args)?;
             let _lock = corpus::read_lock(&root)?;
             corpus::status(&root)
+        }
+        "ask" => {
+            let root = corpus_path(args)?;
+            let question = positional_value(spec, args)
+                .map(|question| question.trim().to_string())
+                .filter(|question| !question.is_empty())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ask needs a question: ebira ask \"<question>\"",
+                    )
+                })?;
+            let options = ask_options(args, question)?;
+            let directory = ask_dir()?;
+            let ledger = ask::usage::Ledger::new(directory.join("usage.tsv"));
+            ask::run(&root, &options, &ledger, directory.join("tmp"))
+        }
+        "ask-setup" => {
+            let directory = ask_dir()?;
+            let ledger = ask::usage::Ledger::new(directory.join("usage.tsv"));
+            ask::setup::run(
+                directory.join("tmp"),
+                &ledger,
+                ask_budget()?,
+                !has_flag(args, "--no-open"),
+            )
+        }
+        "ask-usage" => {
+            let ledger = ask::usage::Ledger::new(ask_dir()?.join("usage.tsv"));
+            let spending = ledger.spending();
+            if text_format(args)? {
+                output::write(&spending.text(ledger.path(), ask_budget()?))
+            } else {
+                output::write_line(&spending.json(ledger.path(), ask_budget()?))
+            }
         }
         _ => Err(unknown_command(command)),
     }
@@ -726,6 +1019,7 @@ fn search_request(
         operation: operation.to_string(),
         source_id: option_values(args, "--source-id").into_iter().next(),
         session: option_values(args, "--session").into_iter().next(),
+        cwd: option_values(args, "--cwd").into_iter().next(),
         role: option_values(args, "--role").into_iter().next(),
         kind: kind_option(args)?,
         sender: sender_option(args)?,
