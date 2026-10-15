@@ -32,7 +32,7 @@ ebira ask "<the question, in the person's words>" [--cwd <project-path-part>] [-
 It chooses search strings, screens what it finds, reads the records around the
 best of them, checks the person's later messages for changes to each decision it
 reports, and answers with quotes, each checked against the records and cited by
-source reference. It takes about two minutes and costs about $0.30 a question;
+source reference. It takes about two minutes and costs about 30 US cents a question;
 `--quick` costs a tenth and makes more mistakes about what changed later. A quote
 marked `(not found in the records)` is not one. The answer is a lead: read the
 original of every claim you rely on (below) before you report it.
