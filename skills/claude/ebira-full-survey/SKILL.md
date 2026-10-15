@@ -80,8 +80,9 @@ For how a project, tool, or decision developed and where it stands:
 
 1. Map it with `ebira history --query <name>` for each spelling of the name: the
    dates and sessions show when it was worked on, and the projects where.
-2. Ask, as above. The answer's list of what the records do not settle is the list
-   of what to check next.
+2. With an API key, ask as above: the answer's list of what the records do not
+   settle is the list of what to check next. Without a key, go on to step 3; the
+   other steps do not use the API.
 3. Read every message of the person's about it: one `said` pass with each
    spelling as its own `--query` (the English name, its katakana, lowercase, a
    former name). These are the backbone of the account; an agent's report is a
