@@ -726,9 +726,21 @@ impl Scope<'_> {
         if self.whole {
             return corpus_files(root);
         }
+        if self.sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A session can include many child sources. Index the directory once instead of
+        // listing and stat-ing every unrelated segment again for each source.
+        let mut by_source = corpus_file_map(&segment_dir(root))?;
         let mut files = Vec::new();
         for entry in &self.sources {
-            files.extend(source_files(root, &entry.source_id)?);
+            if let Some(source_files) = by_source.remove(&entry.source_id) {
+                files.extend(
+                    source_files
+                        .into_iter()
+                        .filter(|path| is_complete_corpus_file(path)),
+                );
+            }
         }
         Ok(files)
     }
@@ -2851,7 +2863,7 @@ fn corpus_source_files(root: &Path, source_id: &str) -> io::Result<Vec<PathBuf>>
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("");
-        if path.is_file() && is_source_corpus_name(name, source_id) {
+        if is_source_corpus_name(name, source_id) && path.is_file() {
             files.push(path);
         }
     }
@@ -3281,6 +3293,49 @@ mod tests {
     use std::fs::{self, File, OpenOptions};
     use std::io::{BufReader, Cursor, Write};
     use std::path::PathBuf;
+
+    #[test]
+    fn scoped_files_keep_source_and_segment_order_without_partial_or_unrelated_files() {
+        let root = std::env::temp_dir().join(format!("ebira-scoped-files-{}", std::process::id()));
+        let segments = root.join("segments");
+        fs::create_dir_all(&segments).unwrap();
+        for name in [
+            "a.corpus",
+            "a--20-30.corpus",
+            "a--10-20.corpus",
+            "b.corpus",
+            "b.corpus.partial",
+            "a--30-40.corpus.partial",
+            "unrelated.corpus",
+            "a-extra.corpus",
+        ] {
+            fs::write(segments.join(name), "").unwrap();
+        }
+        fs::create_dir_all(segments.join("b--90-100.corpus")).unwrap();
+        let a = SourceEntry {
+            source_id: "a".into(),
+            ..SourceEntry::default()
+        };
+        let b = SourceEntry {
+            source_id: "b".into(),
+            ..SourceEntry::default()
+        };
+        let scope = super::Scope {
+            sources: vec![&b, &a],
+            whole: false,
+        };
+        assert_eq!(
+            scope.files(&root).unwrap(),
+            ["b.corpus", "a.corpus", "a--10-20.corpus", "a--20-30.corpus"]
+                .map(|name| segments.join(name))
+        );
+        let empty = super::Scope {
+            sources: Vec::new(),
+            whole: false,
+        };
+        assert!(empty.files(&root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn freshness_is_the_test_a_sync_makes() {
