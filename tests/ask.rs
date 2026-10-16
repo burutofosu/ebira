@@ -265,6 +265,70 @@ fn leaves_out_copies_imported_into_another_thread() {
 }
 
 #[test]
+fn later_decisions_without_the_search_words_are_read_with_bounded_coverage() {
+    let logs = Logs::new("recent-decisions");
+    let source = logs.root.join(".claude/projects/C--work-game/s-main.jsonl");
+    let mut transcript = String::from(concat!(
+        r#"{"type":"user","message":{"role":"user","content":"keep the remote entry for now"},"sessionId":"s-main","timestamp":"2026-09-01T00:00:00Z","cwd":"C:/work/game"}"#,
+        "\n"
+    ));
+    // The new decision is outside the old match's neighbourhood and shares no search word.
+    for n in 0..20 {
+        transcript.push_str(&format!("{{\"type\":\"assistant\",\"sessionId\":\"s-main\",\"timestamp\":\"2026-09-01T01:00:{n:02}Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"working\"}}]}}}}\n"));
+    }
+    for n in 0..10 {
+        transcript.push_str(&format!("{{\"type\":\"user\",\"sessionId\":\"s-main\",\"timestamp\":\"2026-09-02T00:00:{n:02}Z\",\"message\":{{\"role\":\"user\",\"content\":\"other question {n}\"}}}}\n"));
+    }
+    transcript.push_str(concat!(r#"{"type":"attachment","sessionId":"s-main","timestamp":"2026-09-02T01:00:00Z","attachment":{"type":"queued_command","prompt":"全部やめます。画面の改善に集中してください。","origin":{"kind":"human"},"humanTurn":true},"cwd":"C:/work/game"}"#, "\n"));
+    std::fs::write(&source, transcript).unwrap();
+    logs.run(&["sync", "--corpus", &logs.corpus()]);
+    let result = logs.run(&[
+        "ask",
+        "what is the decision?",
+        "--term",
+        "remote",
+        "--keep",
+        "1",
+        "--no-api",
+        "--corpus",
+        &logs.corpus(),
+    ]);
+    assert!(
+        result.contains("keep the remote entry for now"),
+        "the earlier evidence is retained"
+    );
+    assert!(
+        result.contains("全部やめます。画面の改善に集中してください。"),
+        "later human intent is not gated by literal terms: {result}"
+    );
+    assert!(
+        result.contains("\"recent_messages\":[{\"session\":\"s-main\",\"total\":12,\"read\":8"),
+        "{result}"
+    );
+    assert!(
+        result.contains("\"truncated\":true"),
+        "bounded coverage must be disclosed: {result}"
+    );
+    let historical = logs.run(&[
+        "ask",
+        "what was the decision then?",
+        "--term",
+        "remote",
+        "--keep",
+        "1",
+        "--no-api",
+        "--to",
+        "2026-09-01",
+        "--corpus",
+        &logs.corpus(),
+    ]);
+    assert!(
+        !historical.contains("全部やめます"),
+        "explicit historical bounds are respected: {historical}"
+    );
+}
+
+#[test]
 fn it_refuses_what_it_cannot_do_before_spending() {
     let logs = Logs::new("refusals");
     let corpus = logs.corpus();

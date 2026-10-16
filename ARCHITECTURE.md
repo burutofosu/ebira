@@ -19,6 +19,7 @@ source retrieval. All commands run locally; `ask` also calls the Anthropic API
 | `imports.rs` | Managed JSONL imports and provenance records |
 | `private_fs.rs` | Private creation modes for corpus directories, files, and managed copies |
 | `search.rs` | Literal search, timeline reads, raw scans, and context reads |
+| `context_text.rs` | Readable original records, using the corpus's sender and native-answer classification |
 | `resume.rs` | Current-turn recovery and the brief recovery view |
 | `said.rs` | The person's own messages, by session, project, agent, or topic |
 | `follow.rs` | Waiting for the next message in another agent's transcript, by sender |

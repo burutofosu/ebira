@@ -25,6 +25,7 @@ pub struct Client {
     scratch: PathBuf,
 }
 
+#[derive(Clone, Copy)]
 pub struct Request<'a> {
     pub model: &'a str,
     pub effort: &'a str,
@@ -58,7 +59,9 @@ pub enum ApiError {
         usage: Usage,
         category: String,
     },
-    /// Cut at max_tokens, or not the JSON asked for. Billed.
+    /// Generation reached the requested output limit. Billed, even without usable JSON.
+    Truncated { model: String, usage: Usage },
+    /// Not the JSON asked for. Billed.
     Unusable {
         model: String,
         usage: Usage,
@@ -78,9 +81,9 @@ impl ApiError {
     /// The model and tokens billed for a failed call, if any.
     pub fn billed(&self) -> Option<(&str, Usage)> {
         match self {
-            ApiError::Refused { model, usage, .. } | ApiError::Unusable { model, usage, .. } => {
-                Some((model, *usage))
-            }
+            ApiError::Refused { model, usage, .. }
+            | ApiError::Unusable { model, usage, .. }
+            | ApiError::Truncated { model, usage } => Some((model, *usage)),
             _ => None,
         }
     }
@@ -103,6 +106,7 @@ impl fmt::Display for ApiError {
             ApiError::Unusable { model, reason, .. } => {
                 write!(formatter, "the reply from {model} could not be used: {reason}")
             }
+            ApiError::Truncated { model, .. } => write!(formatter, "the reply from {model} could not be used: the output was cut at max_tokens"),
             ApiError::Status {
                 status,
                 message,
@@ -428,13 +432,7 @@ fn read_reply(body: &str) -> Result<Reply, ApiError> {
                 category: category.to_string(),
             });
         }
-        "max_tokens" => {
-            return Err(ApiError::Unusable {
-                model,
-                usage,
-                reason: "the output was cut at max_tokens".to_string(),
-            })
-        }
+        "max_tokens" => return Err(ApiError::Truncated { model, usage }),
         _ => {}
     }
     let text: String = reply
@@ -597,7 +595,7 @@ mod tests {
             _ => panic!("expected a refusal"),
         }
         let cut = r#"{"model":"claude-haiku-5-5","stop_reason":"max_tokens","content":[{"type":"text","text":"{\"sc"}],"usage":{"input_tokens":5,"output_tokens":6000}}"#;
-        assert!(matches!(read_reply(cut), Err(ApiError::Unusable { .. })));
+        assert!(matches!(read_reply(cut), Err(ApiError::Truncated { .. })));
     }
 
     #[test]

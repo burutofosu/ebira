@@ -34,8 +34,12 @@ best of them, checks the person's later messages for changes to each decision it
 reports, and answers with quotes, each checked against the records and cited by
 source reference. It takes about two minutes and costs about 30 US cents a question;
 `--quick` costs a tenth and makes more mistakes about what changed later. A quote
-marked `(not found in the records)` is not one. The answer is a lead: read the
-original of every claim you rely on (below) before you report it.
+marked `(not found in the records)` is not one.
+
+The answer also includes a bounded tail of recent human messages from related
+sessions, even without matching search words; its coverage is reported. A
+verified quote does not prove the conclusion is current or complete. The answer
+is a lead: read the original of every claim you rely on (below) before you report it.
 
 Without a key, or to look further, search yourself.
 
@@ -60,7 +64,7 @@ Queries are literal text; `--ignore-case` folds ASCII letters only. Narrow with
 the returned `next_offset`.
 
 Several texts take one pass over the corpus instead of one each: repeat
-`--query` with `said` or `search`. Each text gets the list it would get alone,
+`--query` with `said`, `search`, or `history`. Each text gets the list it would get alone,
 under `results`; keep `--limit` small so the output stays readable.
 
 For the commits a conversation produced, run `ebira commits --repo <repository>`
@@ -69,8 +73,11 @@ and read them with Git.
 ## Read the original
 
 ```text
-ebira context --source-id <id> --byte-start <n> --byte-len <n> --before 5 --after 5
+ebira context --source-id <id> --byte-start <n> --byte-len <n> --before 5 --after 5 --format text
 ```
+
+The text view omits reasoning and metadata but keeps original source references.
+Use `--format json` when you need the complete raw record.
 
 If it reports `source_changed_since_projection`, run `ebira sync` and search again.
 

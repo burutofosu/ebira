@@ -45,6 +45,9 @@ ebira search --query "retry budget"
 
 # Several phrases in one pass over the corpus, each listed apart
 ebira said --query "retry budget" --query "backoff" --format text
+
+# Several date maps in one scan
+ebira history --query "terminal disappeared" --query "terminal not found"
 ```
 
 Copy a session ID from `said` or a search result. Inside a running session,
@@ -63,11 +66,18 @@ To read a result's original record and its neighbours, copy the values from
 its `source_ref`:
 
 ```sh
-ebira context --source-id <source_id> --byte-start <byte_start> --byte-len <byte_len> --before 3 --after 3
+ebira context --source-id <source_id> --byte-start <byte_start> --byte-len <byte_len> --before 3 --after 3 --format text
 ```
 
+The text view keeps the sender, timestamp and original byte reference for each
+record, omits reasoning and non-message metadata, and reads full tool output from
+the original rather than its shortened corpus preview. It needs complete indexed
+records. Omit `--format text` (or use `--format json`) for the original raw JSONL,
+including metadata or an arbitrary byte range.
+
 If the log has been replaced or rewritten, sync and search again.
-Results are JSON by default; `said --format text` gives a plain-text view.
+Results are JSON by default. Multiple queries work with `said`, `search`, and
+`history`; `--raw` takes one query.
 
 Run `ebira help` for all commands and `ebira help <command>` for options.
 
@@ -82,8 +92,17 @@ ebira ask "What did I decide about retries, and did I change it later?" --format
 Claude models choose search strings, screen what Ebira finds, and read the
 records around the best of it. A draft answer feeds a second round of searching
 and a check of your later messages for changes to each decision it reports.
+It also reads the last eight human messages in up to four of the newest related
+sessions, without requiring those messages to repeat a search word. Date and
+directory bounds still apply. This adds at most 32 records to the ranked search
+results; `search.recent_messages` reports how many were read, the time range and
+stale sources, and `recent_sessions_omitted` names the remaining count.
+This is bounded evidence, not proof that every later decision was found.
+
 Every quote is checked against the records before it is shown, and each finding
-cites its `source_ref`.
+cites its `source_ref`. A verified quote confirms the quoted words, not the
+answer's interpretation or completeness. Check important conclusions against the
+original records.
 
 It needs an Anthropic API key: set `ANTHROPIC_API_KEY`, or run `ebira ask-setup`
 to check and save one from a page on this computer (on Windows and in WSL, it is
@@ -92,7 +111,10 @@ records read, not images, go to the Anthropic API; nothing else leaves the
 computer. With the defaults, Claude Opus 5.5 and Claude Haiku 5.5, a question
 costs about $0.30 and takes about two minutes. `--quick` uses Claude Haiku 5.5
 throughout for about a tenth of that, with more mistakes about what changed
-later. `ebira ask-usage` sums what has been spent, from a ledger in the data
+later. A reply cut at `max_tokens` is retried once with twice the output allowance,
+up to 64,000 tokens, using the same model and evidence. Both billed attempts are
+recorded, including failures; an invalid response or refusal is not retried by
+this output-limit handling. `ebira ask-usage` sums what has been spent, from a ledger in the data
 directory. `--no-api` with `--term` searches only and lists the records an
 answer would read.
 

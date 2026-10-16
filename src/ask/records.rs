@@ -65,6 +65,15 @@ pub struct Found {
     pub total: u64,
 }
 
+/// A bounded tail of a related session's own human messages, independent of search terms.
+pub struct Recent {
+    pub session: String,
+    pub total: usize,
+    pub stale_sources: u64,
+    pub unscanned_bytes: u64,
+    pub hits: Vec<Hit>,
+}
+
 /// Who wrote a line around a record, as the log marks it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Label {
@@ -296,6 +305,52 @@ impl Corpus {
             })
             .collect();
         Ok((lists, synced_through))
+    }
+
+    pub fn recent_person(
+        &self,
+        session: &str,
+        filters: &Filters,
+        limit: usize,
+    ) -> io::Result<Recent> {
+        let _lock = corpus::read_lock(&self.root)?;
+        let found = said::find(
+            &self.root,
+            &SaidRequest {
+                session: Some(session.to_string()),
+                cwd: filters.cwd.clone(),
+                from: filters.from.clone(),
+                to: filters.to.clone(),
+                range: self.range(filters)?,
+                limit,
+                newest_first: true,
+                offset_minutes: self.offset_minutes,
+                ..SaidRequest::default()
+            },
+        )?;
+        let mut recent = Recent {
+            session: session.to_string(),
+            total: found.lists[0].messages.len(),
+            stale_sources: found.stale_sources,
+            unscanned_bytes: found.unscanned_bytes,
+            hits: Vec::new(),
+        };
+        recent.hits = found.lists.into_iter().next().unwrap().messages.into_iter().take(limit)
+            .map(|said| Hit {
+                source_ref: SourceRef { source_id: said.header.source_id.clone(), byte_start: said.header.byte_start, byte_len: said.header.byte_len },
+                source_path: said.source_path,
+                line: said.header.line,
+                session: said.header.session.clone(),
+                project: text::project_from_cwd(&said.header.cwd),
+                timestamp: said.header.timestamp,
+                who: Who::Person,
+                app: said.app,
+                text: said.text,
+                images: said.images,
+                terms: Vec::new(),
+                note: "Recent human message from a related session, included without a keyword match; check for later decisions and changes, and distinguish unrelated topics.".to_string(),
+            }).collect();
+        Ok(recent)
     }
 
     /// The readable records around one: up to `before` records of its log before it and

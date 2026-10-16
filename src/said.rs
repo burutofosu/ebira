@@ -91,8 +91,8 @@ pub(crate) struct SaidFound {
     scanned_files: u64,
     scanned_bytes: u64,
     sources_in_scope: u64,
-    stale_sources: u64,
-    unscanned_bytes: u64,
+    pub(crate) stale_sources: u64,
+    pub(crate) unscanned_bytes: u64,
 }
 
 pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {

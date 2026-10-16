@@ -95,11 +95,12 @@ fn value_len(text: &str) -> usize {
 fn elements(array: &str) -> Vec<&str> {
     let inner = &array[1..array.len() - 1];
     let mut items = Vec::new();
-    let mut rest = inner;
+    let mut rest = inner.trim_start();
     while !rest.is_empty() {
         let length = value_len(rest);
         items.push(&rest[..length]);
-        rest = rest[length..].strip_prefix(',').unwrap_or(&rest[length..]);
+        rest = rest[length..].trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
     }
     items
 }
@@ -304,13 +305,60 @@ fn said_gives_each_query_what_it_gets_alone() {
 }
 
 #[test]
-fn history_and_raw_search_take_one_query() {
+fn history_gives_each_query_its_dates_and_executable_next_pages() {
+    let logs = Logs::new("history");
+    let corpus = logs.corpus();
+    for filters in [
+        vec!["--ignore-case"],
+        vec!["--sender", "assistant", "--order", "desc", "--limit", "1"],
+        vec!["--date-limit", "1", "--date-offset", "1"],
+    ] {
+        let mut args = vec!["history", "--corpus", &corpus];
+        args.extend(&filters);
+        for query in QUERIES {
+            args.extend(["--query", query]);
+        }
+        let many = run(&args);
+        assert_eq!(value_of(&many, "operation"), "\"history\"");
+        let results = elements(value_of(&many, "results"));
+        assert_eq!(results.len(), QUERIES.len());
+        for (query, result) in QUERIES.into_iter().zip(results) {
+            let mut single_args = vec!["history", "--corpus", &corpus, "--query", query];
+            single_args.extend(&filters);
+            let single = run(&single_args);
+            for key in [
+                "disposition",
+                "total_candidates",
+                "map",
+                "matches",
+                "facets",
+                "truncated",
+                "next_offset",
+                "next_actions",
+            ] {
+                assert_eq!(
+                    value_of(result, key),
+                    value_of(&single, key),
+                    "{key}: {query}"
+                );
+            }
+            assert_eq!(
+                value_of(&many, "scanned_bytes"),
+                value_of(&single, "scanned_bytes"),
+                "one shared scan"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_search_and_history_take_one_query() {
     let logs = Logs::new("one");
     let corpus = logs.corpus();
     let history = run_failure(&[
-        "history", "--corpus", &corpus, "--query", "map", "--query", "colors",
+        "history", "--corpus", &corpus, "--query", "map", "--query", "colors", "--raw",
     ]);
-    assert!(history.contains("history takes one --query"), "{history}");
+    assert!(history.contains("--raw takes one --query"), "{history}");
     let raw = run_failure(&[
         "search", "--corpus", &corpus, "--query", "map", "--query", "colors", "--raw",
     ]);

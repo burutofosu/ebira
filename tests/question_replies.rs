@@ -216,6 +216,25 @@ fn native_question_answers_are_persons_words_and_keep_the_original_reference() {
             original.contains(&quoted(&record)),
             "the source reference remains the full original record: {original}"
         );
+        let readable = fixture.run(&[
+            "context",
+            "--source-id",
+            source_id,
+            "--byte-start",
+            &offset.to_string(),
+            "--byte-len",
+            &record.len().to_string(),
+            "--format",
+            "text",
+        ]);
+        assert!(
+            readable.contains(&answer) && readable.contains("human (user, via: question_reply)"),
+            "{readable}"
+        );
+        assert!(
+            !readable.contains("AUTOMATIC_RENDERER_TEXT") && !readable.contains("AGENT_QUESTION"),
+            "answers keep their established author: {readable}"
+        );
         let brief = fixture.run(&["resume", "--brief"]);
         assert!(
             brief.contains(&quoted(&answer)) && brief.contains("\"via\":\"question_reply\""),

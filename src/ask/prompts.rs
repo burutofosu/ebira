@@ -63,7 +63,9 @@ What the person needs from you:
 what they praised, what they reported as wrong, and what agents tried or found. Agents often turn a person's passing \
 examples into fixed specifications and then refuse to change them; do not do that. A remark is a decision only when \
 the person stated it as one.
-- A later statement on the same point supersedes an earlier one. Say which, with dates.
+- A later statement on the same point supersedes an earlier one. Say which, with dates. Blocks marked as recent \
+human messages were included without keyword matching: check them before calling a decision current or unresolved. \
+They can concern unrelated topics, and a bounded tail does not establish that every later message was read.
 - What the person praised is a lead for reuse (dig it up instead of reinventing it): name the session, file or commit \
 when the records show it.
 - The person's words carry their intent. An agent's report is a claim about what it did or found, not the person's view.

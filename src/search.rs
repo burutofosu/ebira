@@ -266,8 +266,7 @@ impl ManyFound<'_> {
     }
 }
 
-/// Scans the corpus once for every query: a search of the corpus, not of the original records,
-/// and not a history.
+/// Scans the corpus once for every query, also collecting date maps for history requests.
 pub(crate) fn find_many<'a>(
     root: &Path,
     catalog: &'a BTreeMap<String, SourceEntry>,
@@ -286,10 +285,10 @@ pub(crate) fn find_many<'a>(
             "query is empty",
         ));
     }
-    if request.raw || is_history_request(request) {
+    if request.raw {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "several --query work only with search, without --raw",
+            "several --query work with search and history, without --raw",
         ));
     }
     let scope = corpus::scope(
@@ -1144,7 +1143,18 @@ fn many_json(
             let has_more = stats.matched_events > page_end;
             matched |= stats.matched_events > 0;
             truncated |= has_more;
-            json::Object::new()
+            if is_history_request(request) {
+                return history_json(
+                    root,
+                    &single,
+                    &found.scope,
+                    &found.files,
+                    stats,
+                    duration_ms,
+                )
+                .map(|json| json.trim_end().to_string());
+            }
+            Ok(json::Object::new()
                 .text("query", query)
                 .name(
                     "disposition",
@@ -1168,11 +1178,17 @@ fn many_json(
                         stats.matched_events,
                     ),
                 )
-                .finish()
+                .finish())
         })
-        .collect::<Vec<_>>();
+        .collect::<io::Result<Vec<_>>>()?;
     let disposition = if !matched {
         coverage.empty_disposition()
+    } else if is_history_request(request) {
+        if coverage.incomplete_sources == 0 && coverage.unavailable_source_paths == 0 {
+            "history_map_ready"
+        } else {
+            "history_map_partial"
+        }
     } else if truncated {
         "result_page_truncated"
     } else {
@@ -1181,8 +1197,15 @@ fn many_json(
     let mut output = json::Object::new();
     output
         .name("disposition", disposition)
-        .name("mode", "literal_scan")
-        .name("operation", "search")
+        .name(
+            "mode",
+            if is_history_request(request) {
+                "literal_history_map"
+            } else {
+                "literal_scan"
+            },
+        )
+        .name("operation", operation(request, "search"))
         .name("search_scope", search_scope(request))
         .name("order", match_order(request))
         .raw(
@@ -1674,6 +1697,7 @@ pub fn context(
     byte_len: u64,
     before: usize,
     after: usize,
+    text_format: bool,
 ) -> io::Result<()> {
     let catalog = corpus::source_catalog(root)?;
     let entry = catalog.get(source_id).ok_or_else(|| {
@@ -1714,6 +1738,17 @@ pub fn context(
         Some(file) => Some(read_range(file, byte_start, byte_len, observed_size)?),
         None => None,
     };
+    if text_format {
+        let mut text = format!(
+            "# ebira context: {source_id} @{byte_start}+{byte_len}\n# source_freshness: {}\n",
+            freshness.as_str()
+        );
+        match &read {
+            Some(bytes) => text.push_str(&crate::context_text::render(root, source_id, byte_start, bytes)?),
+            None => text.push_str("# source_changed_since_projection: sync and find a new source_ref before reading this record\n"),
+        }
+        return output::write(&text);
+    }
     let next_actions = if read.is_some() {
         Vec::new()
     } else {

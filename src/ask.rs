@@ -108,6 +108,8 @@ const REVERSAL_PER_TERM: usize = 40;
 const MAX_LATER: usize = 12;
 const SCREEN_CHUNK: usize = 40;
 const WORKERS: usize = 4;
+const RECENT_SESSIONS: usize = 4;
+const RECENT_MESSAGES: usize = 8;
 
 /// Answers the question and writes the result.
 pub fn run(root: &Path, options: &Options, ledger: &Ledger, scratch: PathBuf) -> io::Result<()> {
@@ -171,6 +173,8 @@ struct Notes {
     period: Option<(String, String)>,
     issues: Vec<String>,
     checks: Vec<ReversalCheck>,
+    recent: Vec<records::Recent>,
+    recent_sessions_omitted: usize,
 }
 
 struct ReversalCheck {
@@ -209,29 +213,47 @@ impl<'a> Caller<'a> {
     }
 
     fn call(&self, step: &'static str, request: &Request) -> Result<Value, ApiError> {
-        let result = self.client.send(request);
-        let billed = match &result {
-            Ok(reply) => Some((reply.model.clone(), reply.usage)),
-            Err(error) => error
-                .billed()
-                .map(|(model, usage)| (model.to_string(), usage)),
-        };
-        if let Some((model, usage)) = billed {
-            let usd = api::cost(&model, &usage);
-            if let Err(error) = self.ledger.record(step, &model, &usage, usd, self.question) {
-                crate::output::diagnostic(format_args!(
-                    "ebira ask: cannot write to the ledger {}: {error}",
-                    self.ledger.path().display()
-                ));
+        let mut request = *request;
+        let mut retried = false;
+        loop {
+            let result = self.client.send(&request);
+            let billed = match &result {
+                Ok(reply) => Some((reply.model.clone(), reply.usage)),
+                Err(error) => error
+                    .billed()
+                    .map(|(model, usage)| (model.to_string(), usage)),
+            };
+            if let Some((model, usage)) = billed {
+                let usd = api::cost(&model, &usage);
+                if let Err(error) = self.ledger.record(step, &model, &usage, usd, self.question) {
+                    crate::output::diagnostic(format_args!(
+                        "ebira ask: cannot write to the ledger {}: {error}",
+                        self.ledger.path().display()
+                    ));
+                }
+                self.spent.lock().unwrap().push(Spend {
+                    step,
+                    model,
+                    usage,
+                    usd,
+                });
             }
-            self.spent.lock().unwrap().push(Spend {
-                step,
-                model,
-                usage,
-                usd,
-            });
+            // A truncated JSON reply cannot be safely completed by string concatenation.
+            // Repeat the same request once with more room; every billed attempt is recorded.
+            if !retried
+                && request.max_tokens < 64000
+                && matches!(&result, Err(ApiError::Truncated { .. }))
+            {
+                request.max_tokens = request.max_tokens.saturating_mul(2).min(64000);
+                retried = true;
+                progress(&format!(
+                    "{step} reached its output limit; retrying once with max_tokens={} ({})",
+                    request.max_tokens, request.model
+                ));
+                continue;
+            }
+            return result.map(|reply| reply.output);
         }
-        result.map(|reply| reply.output)
     }
 }
 
@@ -346,7 +368,10 @@ fn ask(
     )?;
 
     // 4. Read the records around the best ones.
-    let mut evidence = read_evidence(corpus, pool.best(options.keep));
+    let mut evidence = read_evidence(
+        corpus,
+        with_recent(corpus, &filters, pool.best(options.keep), &mut notes),
+    );
 
     // 5. Answer.
     let Some(caller) = caller else {
@@ -418,7 +443,7 @@ fn ask(
                 None => hits.push(found),
             }
         }
-        evidence = read_evidence(corpus, hits);
+        evidence = read_evidence(corpus, with_recent(corpus, &filters, hits, &mut notes));
         answer = answer_with(&caller, options, corpus, &evidence, &options.answer_model)?;
     } else if draft_model != options.answer_model {
         // The first answer was only a draft from another model.
@@ -433,6 +458,52 @@ fn ask(
         &Summary::of(&pool, evidence.len(), &notes),
         &spent,
     ))
+}
+
+/// Add a bounded tail from the newest related sessions even when ranking or literal search
+/// missed a later decision. Search remains global; no existing search hits are excluded.
+fn with_recent(
+    corpus: &Corpus,
+    filters: &Filters,
+    mut hits: Vec<Hit>,
+    notes: &mut Notes,
+) -> Vec<Hit> {
+    let mut sessions: HashMap<String, Option<i128>> = HashMap::new();
+    for hit in &hits {
+        if !hit.session.is_empty() {
+            let instant = corpus.instant(&hit.timestamp);
+            let latest = sessions.entry(hit.session.clone()).or_default();
+            *latest = (*latest).max(instant);
+        }
+    }
+    let mut sessions = sessions.into_iter().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    notes.recent_sessions_omitted = sessions.len().saturating_sub(RECENT_SESSIONS);
+    notes.recent.clear();
+    for (session, _) in sessions.into_iter().take(RECENT_SESSIONS) {
+        match corpus.recent_person(&session, filters, RECENT_MESSAGES) {
+            Ok(recent) => {
+                for latest in &recent.hits {
+                    if let Some(hit) = hits
+                        .iter_mut()
+                        .find(|hit| hit.source_ref == latest.source_ref)
+                    {
+                        if !hit.note.is_empty() {
+                            hit.note.push(' ');
+                        }
+                        hit.note.push_str(&latest.note);
+                    } else {
+                        hits.push(latest.clone());
+                    }
+                }
+                notes.recent.push(recent);
+            }
+            Err(error) => notes.issues.push(format!(
+                "Could not read recent human messages in session {session}: {error}"
+            )),
+        }
+    }
+    hits
 }
 
 /// Something the first answer says was decided, set as a rule, reversed, or found out, dated.
@@ -1363,6 +1434,15 @@ impl<'a> Summary<'a> {
                 check.changes
             ));
         }
+        for recent in &self.notes.recent {
+            lines.push(format!("Recent human messages in {}: last {} of {} within the search's date and directory bounds; newest {}; stale sources {}, unscanned bytes {}",
+                recent.session, recent.hits.len(), recent.total,
+                recent.hits.first().map(|hit| hit.timestamp.as_str()).unwrap_or("unknown"),
+                recent.stale_sources, recent.unscanned_bytes));
+        }
+        if self.notes.recent_sessions_omitted > 0 {
+            lines.push(format!("Recent-message check omitted {} other related sessions; this is not an exhaustive decision history", self.notes.recent_sessions_omitted));
+        }
         lines.extend(self.notes.issues.iter().cloned());
         lines
     }
@@ -1428,6 +1508,31 @@ impl<'a> Summary<'a> {
             .number("read", self.kept as u64)
             .optional("synced_through", self.synced_through)
             .raw("reversal_checks", &crate::json::array(checks))
+            .raw(
+                "recent_messages",
+                &crate::json::array(self.notes.recent.iter().map(|recent| {
+                    crate::json::Object::new()
+                        .name("session", &recent.session)
+                        .number("total", recent.total as u64)
+                        .number("read", recent.hits.len() as u64)
+                        .optional(
+                            "newest",
+                            recent.hits.first().map(|hit| hit.timestamp.as_str()),
+                        )
+                        .optional(
+                            "oldest_read",
+                            recent.hits.last().map(|hit| hit.timestamp.as_str()),
+                        )
+                        .boolean("truncated", recent.total > recent.hits.len())
+                        .number("stale_sources", recent.stale_sources)
+                        .number("unscanned_source_bytes", recent.unscanned_bytes)
+                        .finish()
+                })),
+            )
+            .number(
+                "recent_sessions_omitted",
+                self.notes.recent_sessions_omitted as u64,
+            )
             .raw(
                 "issues",
                 &crate::json::strings(self.notes.issues.iter().map(String::as_str)),

@@ -58,7 +58,7 @@ PowerShell).
 4. Before acting on an earlier decision, read its original record:
 
    ```text
-   ebira context --source-id <id> --byte-start <n> --byte-len <n> --before 3 --after 3
+   ebira context --source-id <id> --byte-start <n> --byte-len <n> --before 3 --after 3 --format text
    ```
 
 5. Continue from the person's latest instruction. Where a summary and the

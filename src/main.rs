@@ -1,5 +1,6 @@
 mod ask;
 mod commits;
+mod context_text;
 mod core;
 mod corpus;
 mod follow;
@@ -51,10 +52,15 @@ const ASK_DETAILS: &[&str] = &[
     "                               (default claude-haiku-5-5)",
     "  --answer-model <id>          writes the answer (default claude-opus-5-5)",
     "  --effort <level>             low | medium | high | xhigh | max for the answer (default medium)",
-    "  --keep <n>                   records the answer reads (default 40)",
+    "  --keep <n>                   ranked search records to read (default 40; later messages may add records)",
     "  --person-per-term <n>        the person's messages per search string (default 60)",
     "  --agent-per-term <n>         the agents' replies per search string (default 40; 0 for none)",
     "  --candidates <n>             records screened per round (default 600)",
+    "",
+    "Also reads up to 8 recent human messages from each of the 4 newest related sessions,",
+    "within the date/directory bounds. The result reports the coverage and any unread tail.",
+    "A reply cut at max_tokens is retried once with twice the output allowance (up to 64000).",
+    "Both billed attempts are recorded, including a failed attempt.",
     "",
     "The question and the text of the records read go to the Anthropic API under your key",
     "(ANTHROPIC_API_KEY, or the one `ebira ask-setup` saved); nothing else leaves the computer.",
@@ -76,7 +82,7 @@ const FILTERS: &[&str] = &[
 const SEARCH_DETAILS: &[&str] = &[
     "  --query <text>               search: repeat it to find several texts in one pass over the",
     "                               corpus, each with the matches a search for it alone gives",
-    "  --raw                        compare the query with the original JSONL records",
+    "  --raw                        compare one query with the original JSONL records",
     "  --ignore-case                fold ASCII letters",
     "  --cwd <text>                 records whose working directory contains the text",
     "  --date-limit <n>             dates per page of the date map (default 12)",
@@ -180,7 +186,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "history",
-        synopsis: "--query <text> [--raw] [--ignore-case] [--cwd <text>] [--order asc|desc] [filters]",
+        synopsis: "--query <text> [--query <text>]... [--raw] [--ignore-case] [--cwd <text>] [--order asc|desc] [filters]",
         summary: "Show on which dates a literal text appears",
         details: SEARCH_DETAILS,
         values: SEARCH_VALUES,
@@ -211,9 +217,9 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "context",
-        synopsis: "--source-id <id> --byte-start <n> --byte-len <n> [--before <n>] [--after <n>]",
+        synopsis: "--source-id <id> --byte-start <n> --byte-len <n> [--before <n>] [--after <n>] [--format json|text]",
         summary: "Read an original record, and its neighbours, from a source reference",
-        details: &[],
+        details: &["  --format json|text           raw original JSONL (default), or readable records with source references"],
         values: &[
             "--corpus",
             "--source-id",
@@ -221,6 +227,7 @@ const COMMANDS: &[CommandSpec] = &[
             "--byte-len",
             "--before",
             "--after",
+            "--format",
         ],
         positional: None,
         flags: &[],
@@ -710,17 +717,10 @@ fn run(args: &[String]) -> io::Result<()> {
         "search" | "history" => {
             let root = corpus_path(args)?;
             let queries = option_values(args, "--query");
-            if queries.len() > 1 && (command == "history" || has_flag(args, "--raw")) {
+            if queries.len() > 1 && has_flag(args, "--raw") {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "{} takes one --query; several work with search of the corpus",
-                        if command == "history" {
-                            "history"
-                        } else {
-                            "--raw"
-                        }
-                    ),
+                    "--raw takes one --query; several work with search and history of the corpus",
                 ));
             }
             let _lock = corpus::read_lock(&root)?;
@@ -836,6 +836,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 byte_len,
                 number_option(args, "--before", 0)?,
                 number_option(args, "--after", 0)?,
+                text_format(args)?,
             )
         }
         "follow" => {
