@@ -83,6 +83,11 @@ If the log has been replaced or rewritten, sync and search again.
 Results are JSON by default. Multiple queries work with `said`, `search`, and
 `history`; `--raw` takes one query.
 
+`said`, `search`, and `context` also take `--format text`, which gives times in
+the corpus's zone and names it: the offset in `EBIRA_TZ_OFFSET` when the corpus
+was built, else UTC. JSON results keep each record's `timestamp` as its log wrote
+it, and the lists of records add `local_time` in the corpus's zone.
+
 Run `ebira help` for all commands and `ebira help <command>` for options.
 
 ## Ask a question
@@ -110,7 +115,9 @@ original records.
 
 It needs an Anthropic API key: set `ANTHROPIC_API_KEY`, or run `ebira ask-setup`
 to check and save one from a page on this computer (on Windows and in WSL, it is
-saved as a Windows user environment variable). The question and the text of the
+saved as a Windows user environment variable, and Ebira reads it from there
+itself, so a program started before it was saved need not pass it). Answers give
+times in the corpus's zone. The question and the text of the
 records read, not images, go to the Anthropic API; nothing else leaves the
 computer. With the defaults, Claude Opus 5.5 and Claude Haiku 5.5, a question
 costs about $0.30 and takes about two minutes. `--quick` uses Claude Haiku 5.5

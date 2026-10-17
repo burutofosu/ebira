@@ -140,10 +140,7 @@ impl Client {
     /// request's files while it runs.
     pub fn from_env(scratch: PathBuf) -> Result<Client, String> {
         let Some((key, _)) = super::keys::find() else {
-            return Err(format!(
-                "no API key: set {}, or save one with `ebira ask-setup`",
-                super::keys::VARIABLE
-            ));
+            return Err(super::keys::missing());
         };
         Client::with_key(key, scratch)
     }

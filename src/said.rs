@@ -343,13 +343,14 @@ fn many_json(request: &SaidRequest, found: &SaidFound, duration_ms: u64) -> Stri
 
 fn many_text(request: &SaidRequest, found: &SaidFound) -> String {
     let mut output = format!(
-        "# ebira said: {} queries, {} (stale sources: {})\n",
+        "# ebira said: {} queries, {}, times in {} (stale sources: {})\n",
         request.queries.len(),
         if request.newest_first {
             "newest first"
         } else {
             "oldest first"
         },
+        crate::time::zone(request.offset_minutes),
         found.stale_sources,
     );
     for (query, list) in request.queries.iter().zip(&found.lists) {
@@ -487,8 +488,7 @@ fn fold(value: &str, fold_ascii_case: bool) -> String {
 }
 
 fn local_time(timestamp: &str, offset_minutes: i64) -> String {
-    crate::time::local_minute(timestamp, offset_minutes)
-        .unwrap_or_else(|| timestamp.chars().take(16).collect())
+    crate::time::shown_minute(timestamp, offset_minutes)
 }
 
 fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> String {
@@ -519,7 +519,7 @@ fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> Stri
 
 fn text_header(request: &SaidRequest, page: &Page, skipped: u64, stale_sources: u64) -> String {
     format!(
-        "# ebira said: {} of {} messages from the person, {} (copies and imports skipped: {}, stale sources: {})\n",
+        "# ebira said: {} of {} messages from the person, {}, times in {} (copies and imports skipped: {}, stale sources: {})\n",
         page.entries.len(),
         page.total,
         if request.newest_first {
@@ -527,6 +527,7 @@ fn text_header(request: &SaidRequest, page: &Page, skipped: u64, stale_sources: 
         } else {
             "oldest first"
         },
+        crate::time::zone(request.offset_minutes),
         skipped,
         stale_sources,
     )

@@ -109,6 +109,38 @@ const SEARCH_VALUES: &[&str] = &[
     "--date-offset",
 ];
 
+/// `search` takes what `history` takes, and `--format`.
+const SEARCH_COMMAND_DETAILS: &[&str] = &[
+    "  --query <text>               search: repeat it to find several texts in one pass over the",
+    "                               corpus, each with the matches a search for it alone gives",
+    "  --raw                        compare one query with the original JSONL records",
+    "  --ignore-case                fold ASCII letters",
+    "  --cwd <text>                 records whose working directory contains the text",
+    "  --date-limit <n>             dates per page of the date map (default 12)",
+    "  --date-offset <n>            the first date of that page",
+    "  --format json|text           one JSON object (default), or the matches as text, with times",
+    "                               in the corpus's zone",
+];
+
+const SEARCH_COMMAND_VALUES: &[&str] = &[
+    "--corpus",
+    "--query",
+    "--limit",
+    "--offset",
+    "--session",
+    "--source-id",
+    "--cwd",
+    "--role",
+    "--kind",
+    "--sender",
+    "--from",
+    "--to",
+    "--order",
+    "--date-limit",
+    "--date-offset",
+    "--format",
+];
+
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "sync",
@@ -180,10 +212,10 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "search",
-        synopsis: "--query <text> [--query <text>]... [--raw] [--ignore-case] [--cwd <text>] [--order asc|desc] [filters]",
+        synopsis: "--query <text> [--query <text>]... [--raw] [--ignore-case] [--cwd <text>] [--order asc|desc] [--format json|text] [filters]",
         summary: "Find the records that contain a literal text, oldest first",
-        details: SEARCH_DETAILS,
-        values: SEARCH_VALUES,
+        details: SEARCH_COMMAND_DETAILS,
+        values: SEARCH_COMMAND_VALUES,
         positional: None,
         flags: &["--raw", "--ignore-case"],
     },
@@ -315,7 +347,8 @@ const COMMANDS: &[CommandSpec] = &[
             "  --no-open                    print the page's address without opening a browser",
             "",
             "The page saves the key as the Windows user environment variable ANTHROPIC_API_KEY,",
-            "from Windows or from WSL; elsewhere, set ANTHROPIC_API_KEY yourself.",
+            "from Windows or from WSL; elsewhere, set ANTHROPIC_API_KEY yourself. `ask` reads the",
+            "saved key there itself, also in a program started before it was saved.",
         ],
         values: &[],
         positional: None,
@@ -1037,6 +1070,7 @@ fn search_request(
         newest_first: order_option(args, false)?,
         // `search` lists every record that holds the text, imported copies included.
         skip_imported: false,
+        text_format: text_format(args)?,
     })
 }
 

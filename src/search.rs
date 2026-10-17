@@ -57,6 +57,8 @@ pub struct SearchRequest {
     /// Leave out the records of another agent's conversation imported into a Codex thread:
     /// copies stamped when they were imported, whose originals carry the real times.
     pub skip_imported: bool,
+    /// `--format text`: the matches as text to read, instead of one JSON object.
+    pub text_format: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -221,6 +223,11 @@ pub fn run(root: &Path, request: SearchRequest) -> io::Result<()> {
     let duration_ms = started.elapsed().as_millis() as u64;
     let output = if is_history_request(&request) {
         history_json(root, &request, &scope, &files, &stats, duration_ms)?
+    } else if request.text_format {
+        let coverage = coverage_stats(root, &scope, &files, &request, &stats)?;
+        let mut text = text_header(&request, &coverage, None);
+        text.push_str(&text_matches(&request, &stats, &coverage));
+        text
     } else {
         search_json(root, &request, &scope, &files, &stats, duration_ms)?
     };
@@ -235,7 +242,95 @@ pub fn run_many(root: &Path, request: SearchRequest, queries: &[String]) -> io::
     let catalog = corpus::source_catalog(root)?;
     let found = find_many(root, &catalog, &request, queries)?;
     let duration_ms = started.elapsed().as_millis() as u64;
+    if request.text_format && !is_history_request(&request) {
+        let first = found
+            .stats
+            .first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no query was given"))?;
+        let coverage = coverage_stats(root, &found.scope, &found.files, &request, first)?;
+        let mut text = text_header(&request, &coverage, Some(queries.len()));
+        for (query, stats) in queries.iter().zip(&found.stats) {
+            text.push_str(&format!(
+                "\n## {}: {} of {} records\n",
+                json::string(query),
+                stats.returned.len(),
+                stats.matched_events
+            ));
+            text.push_str(&text_matches(&request, stats, &coverage));
+        }
+        return output::write(&text);
+    }
     output::write(&many_json(root, &request, queries, &found, duration_ms)?)
+}
+
+/// The first line of `search --format text`: what was searched, in which order and zone, and
+/// what the corpus does not hold yet.
+fn text_header(request: &SearchRequest, coverage: &Coverage, queries: Option<usize>) -> String {
+    let what = match queries {
+        Some(count) => format!("{count} queries"),
+        None => format!("records holding {}", json::string(&request.query)),
+    };
+    format!(
+        "# ebira search: {what}{}, {}, times in {} (stale sources: {}, unreachable sources: {}, incomplete sources: {})\n",
+        if request.raw {
+            " in the original records"
+        } else {
+            ""
+        },
+        if request.newest_first {
+            "newest first"
+        } else {
+            "oldest first"
+        },
+        time::zone(request.offset_minutes),
+        coverage.stale_sources,
+        coverage.unreachable_sources,
+        coverage.incomplete_sources,
+    )
+}
+
+/// One query's page of matches as text: each record's local time, sender, and the reference
+/// `ebira context` takes, then the field and the quoted text.
+fn text_matches(request: &SearchRequest, stats: &SearchStats, coverage: &Coverage) -> String {
+    let mut text = String::new();
+    if stats.matched_events == 0 {
+        // What the JSON view's disposition says, so that no match is not taken for absence.
+        text.push_str(&format!("\n# no match: {}", coverage.empty_disposition()));
+        text.push_str(if request.raw {
+            "\n"
+        } else {
+            "; the corpus keeps selected fields and shortened tool output, so search the \
+             original records with --raw before calling it absent\n"
+        });
+    }
+    for hit in &stats.returned {
+        let header = &hit.header;
+        text.push_str(&format!(
+            "\n[{}] {} ({}, via: {}) session={} source-id={} byte={}+{}\n",
+            time::shown_minute(&header.timestamp, request.offset_minutes),
+            header.sender,
+            header.kind,
+            if header.via.is_empty() {
+                "unspecified"
+            } else {
+                &header.via
+            },
+            header.session,
+            header.source_id,
+            header.byte_start,
+            header.byte_len,
+        ));
+        match (&hit.field, &hit.snippet) {
+            (Some(field), Some(snippet)) => text.push_str(&format!("{field}: {snippet}\n")),
+            (None, Some(snippet)) => text.push_str(&format!("{snippet}\n")),
+            _ => {}
+        }
+    }
+    let page_end = request.offset.saturating_add(stats.returned.len() as u64);
+    if stats.matched_events > page_end {
+        text.push_str(&format!("\n# more: --offset {page_end}\n"));
+    }
+    text
 }
 
 /// What one pass over the corpus found for several queries.
@@ -618,11 +713,21 @@ fn print_timeline_map(
             .raw("kind_counts", &facet_json(&bucket.kind_counts, FACET_LIMIT))
             .raw(
                 "first",
-                &json::or_null(bucket.first.as_ref().map(timeline_map_hit_json)),
+                &json::or_null(
+                    bucket
+                        .first
+                        .as_ref()
+                        .map(|hit| timeline_map_hit_json(hit, request.offset_minutes)),
+                ),
             )
             .raw(
                 "last",
-                &json::or_null(bucket.last.as_ref().map(timeline_map_hit_json)),
+                &json::or_null(
+                    bucket
+                        .last
+                        .as_ref()
+                        .map(|hit| timeline_map_hit_json(hit, request.offset_minutes)),
+                ),
             )
             .finish()
     });
@@ -744,7 +849,7 @@ fn timeline_events(
             .number("duration_ms", started.elapsed().as_millis() as u64)
             .boolean("truncated", has_more)
             .optional_number("next_offset", has_more.then_some(page_end))
-            .raw("events", &hits_json(&page_hits))
+            .raw("events", &hits_json(&page_hits, request.offset_minutes))
             .finish(),
     )
 }
@@ -1084,7 +1189,10 @@ fn search_json(
         .boolean("truncated", has_more)
         .optional_number("next_offset", has_more.then_some(page_end))
         .raw("facets", &facets_json(&stats.facets))
-        .raw("matches", &hits_json(&stats.returned))
+        .raw(
+            "matches",
+            &hits_json(&stats.returned, request.offset_minutes),
+        )
         .raw(
             "next_actions",
             &search_next_actions(
@@ -1167,7 +1275,10 @@ fn many_json(
                 .boolean("truncated", has_more)
                 .optional_number("next_offset", has_more.then_some(page_end))
                 .raw("facets", &facets_json(&stats.facets))
-                .raw("matches", &hits_json(&stats.returned))
+                .raw(
+                    "matches",
+                    &hits_json(&stats.returned, request.offset_minutes),
+                )
                 .raw(
                     "next_actions",
                     &search_next_actions(
@@ -1284,7 +1395,10 @@ fn history_json(
             &history_map_json(stats, request.date_offset, date_limit),
         )
         .raw("facets", &facets_json(&stats.facets))
-        .raw("matches", &hits_json(&stats.returned))
+        .raw(
+            "matches",
+            &hits_json(&stats.returned, request.offset_minutes),
+        )
         .raw(
             "next_actions",
             &history_next_actions(
@@ -1624,8 +1738,8 @@ fn timeline_request_json(
         .finish()
 }
 
-fn hits_json(hits: &[SearchHit]) -> String {
-    json::array(hits.iter().map(hit_json))
+fn hits_json(hits: &[SearchHit], offset_minutes: i64) -> String {
+    json::array(hits.iter().map(|hit| hit_json(hit, offset_minutes)))
 }
 
 fn neighbouring_span(
@@ -2442,15 +2556,19 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn hit_json(hit: &SearchHit) -> String {
-    hit_json_with_snippet_state(hit, None)
+fn hit_json(hit: &SearchHit, offset_minutes: i64) -> String {
+    hit_json_with_snippet_state(hit, None, offset_minutes)
 }
 
-fn timeline_map_hit_json(hit: &SearchHit) -> String {
-    hit_json_with_snippet_state(hit, Some("not_loaded_in_map"))
+fn timeline_map_hit_json(hit: &SearchHit, offset_minutes: i64) -> String {
+    hit_json_with_snippet_state(hit, Some("not_loaded_in_map"), offset_minutes)
 }
 
-fn hit_json_with_snippet_state(hit: &SearchHit, snippet_state: Option<&str>) -> String {
+fn hit_json_with_snippet_state(
+    hit: &SearchHit,
+    snippet_state: Option<&str>,
+    offset_minutes: i64,
+) -> String {
     let header = &hit.header;
     let mut output = json::Object::new();
     output
@@ -2475,6 +2593,10 @@ fn hit_json_with_snippet_state(hit: &SearchHit, snippet_state: Option<&str>) -> 
         .name("sender", &header.sender)
         .name("via", &header.via)
         .name("timestamp", &header.timestamp)
+        .name(
+            "local_time",
+            &time::shown_minute(&header.timestamp, offset_minutes),
+        )
         .optional("field", hit.field.as_deref());
     match (&hit.snippet, snippet_state) {
         (_, Some(state)) => output.raw("snippet", "null").name("snippet_state", state),

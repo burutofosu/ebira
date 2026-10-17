@@ -51,7 +51,14 @@ impl Drop for Logs {
     }
 }
 
-fn run_case(name: &str, first_stop: &str, retry_succeeds: bool, expected_answers: usize) {
+/// `offset` is the corpus's `EBIRA_TZ_OFFSET`, UTC when none.
+fn run_case(
+    name: &str,
+    first_stop: &str,
+    retry_succeeds: bool,
+    expected_answers: usize,
+    offset: Option<&str>,
+) {
     let logs =
         Logs(std::env::temp_dir().join(format!("ebira-ask-api-{name}-{}", std::process::id())));
     let source = logs.0.join(".claude/projects/example/session.jsonl");
@@ -61,7 +68,11 @@ fn run_case(name: &str, first_stop: &str, retry_succeeds: bool, expected_answers
         r#"{"type":"user","sessionId":"s","timestamp":"2026-09-02T00:00:00Z","message":{"role":"user","content":"LATEST_DECISION: remove it entirely"}}"#, "\n",
     )).unwrap();
     let corpus = logs.0.join("corpus");
-    let sync = ebira(&logs.0)
+    let mut sync = ebira(&logs.0);
+    if let Some(offset) = offset {
+        sync.env("EBIRA_TZ_OFFSET", offset);
+    }
+    let sync = sync
         .args([
             "sync",
             "--source",
@@ -174,6 +185,18 @@ fn run_case(name: &str, first_stop: &str, retry_succeeds: bool, expected_answers
         requests[0].contains("LATEST_DECISION"),
         "latest evidence reaches the answer model"
     );
+    let zone = format!("UTC{}", offset.unwrap_or("+00:00"));
+    assert!(
+        requests[0].contains(&format!("Times: every time below is local time, {zone}")),
+        "the answer model is told the zone of the times: {}",
+        requests[0]
+    );
+    if offset == Some("+09:00") {
+        assert!(
+            requests[0].contains("2026-09-02 09:00"),
+            "the records' times are at the corpus offset"
+        );
+    }
     assert!(requests[0].contains("\"max_tokens\":32000"));
     if expected_answers == 2 {
         assert!(requests[1].contains("\"max_tokens\":64000"));
@@ -189,6 +212,13 @@ fn run_case(name: &str, first_stop: &str, retry_succeeds: bool, expected_answers
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+    if retry_succeeds {
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("\"local_time_zone\":\"{zone}\"")),
+            "the result names the zone of its local times"
+        );
+    }
     let ledger = if cfg!(windows) {
         logs.0.join("local/ebira/ask/usage.tsv")
     } else {
@@ -208,16 +238,16 @@ fn run_case(name: &str, first_stop: &str, retry_succeeds: bool, expected_answers
 
 #[test]
 fn truncated_answer_is_retried_once_and_both_attempts_are_billed() {
-    run_case("retry", "max_tokens", true, 2);
+    run_case("retry", "max_tokens", true, 2, Some("+09:00"));
 }
 
 #[test]
 fn repeated_truncation_is_a_failure_after_two_attempts() {
-    run_case("bounded", "max_tokens", false, 2);
+    run_case("bounded", "max_tokens", false, 2, None);
 }
 
 #[test]
 fn other_unusable_replies_and_refusals_are_not_output_limit_retries() {
-    run_case("invalid", "end_turn", false, 1);
-    run_case("refused", "refusal", false, 1);
+    run_case("invalid", "end_turn", false, 1, None);
+    run_case("refused", "refusal", false, 1, None);
 }

@@ -34,6 +34,25 @@ pub fn find() -> Option<(String, Source)> {
     read_user_variable(VARIABLE).map(|key| (key, Source::WindowsUser))
 }
 
+/// Why `find` found no key: where it looked, and what to do.
+pub fn missing() -> String {
+    missing_message(query_user_variable(VARIABLE).is_some())
+}
+
+fn missing_message(windows_readable: bool) -> String {
+    if windows_readable {
+        format!(
+            "no API key: {VARIABLE} is not set in this process, and none is saved in the Windows \
+             user environment; save one with `ebira ask-setup`"
+        )
+    } else {
+        format!(
+            "no API key: {VARIABLE} is not set in this process, and the Windows user environment, \
+             where `ebira ask-setup` saves a key, cannot be read here; set {VARIABLE}"
+        )
+    }
+}
+
 /// A Windows user environment variable, read with reg.exe (from WSL through its Windows
 /// interop); none when it is unset or Windows cannot be reached.
 pub fn read_user_variable(name: &str) -> Option<String> {
@@ -193,6 +212,17 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_key_names_both_places_looked_in() {
+        let unsaved = missing_message(true);
+        assert!(unsaved.starts_with("no API key: ANTHROPIC_API_KEY is not set in this process"));
+        assert!(unsaved.contains("none is saved in the Windows user environment"));
+        assert!(unsaved.ends_with("save one with `ebira ask-setup`"));
+        let unreadable = missing_message(false);
+        assert!(unreadable.contains("cannot be read here"));
+        assert!(unreadable.ends_with("set ANTHROPIC_API_KEY"));
+    }
 
     #[test]
     fn encodes_base64() {

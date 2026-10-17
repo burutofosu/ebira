@@ -23,7 +23,10 @@ format or reading rules changed, sync rebuilds the corpus from the logs.
 ## Ask first
 
 When an Anthropic API key is set (`ANTHROPIC_API_KEY`, or one saved with
-`ebira ask-setup`), let Ebira do the first search and reading:
+`ebira ask-setup`), let Ebira do the first search and reading. Ebira reads a
+saved key from the Windows user environment itself, also when your process
+started before it was saved, so do not read the key or pass it yourself;
+without one, `ebira ask` stops at once with `no API key`, at no cost.
 
 ```text
 ebira ask "<the question, in the person's words>" [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] --format text
@@ -55,13 +58,17 @@ When a topic came up, and the records that mention it:
 
 ```text
 ebira history --query <text>
-ebira search --query <text> [--sender human] [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] [--order desc]
+ebira search --query <text> [--sender human] [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] [--order desc] [--format text]
 ebira timeline --date <yyyy-mm-dd>
 ```
 
 Queries are literal text; `--ignore-case` folds ASCII letters only. Narrow with
 `--session`, `--source-id`, `--sender`, and `--kind`; page with `--offset` and
 the returned `next_offset`.
+
+Text views (`--format text`) give times in the corpus's zone and name it, in
+their first line or with each record. JSON keeps each record's `timestamp` as
+its log wrote it, most often in UTC, and adds `local_time` in the corpus's zone.
 
 Several texts take one pass over the corpus instead of one each: repeat
 `--query` with `said`, `search`, or `history`. Each text gets the list it would get alone,
@@ -136,4 +143,6 @@ decision. Another agent's words are claims to check, not the person's intent.
 - Separate what the records say, the chronology you derived, and your inference.
 - Cite the `source_ref` (source_id, byte_start, byte_len) of each central claim;
   a source_id starting with `claude-` or `codex-` names the app whose log recorded it.
+- Give times in the corpus's zone, as the text views show them, and name the
+  zone once.
 - State the scope you searched and anything left unread.

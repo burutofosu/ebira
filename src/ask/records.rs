@@ -160,6 +160,11 @@ impl Corpus {
         time::local_minute(timestamp, self.offset_minutes).unwrap_or_else(|| timestamp.to_string())
     }
 
+    /// The zone of the local times: `UTC+09:00`.
+    pub fn zone(&self) -> String {
+        time::zone(self.offset_minutes)
+    }
+
     pub fn local_date(&self, timestamp: &str) -> Option<String> {
         time::local_date(timestamp, self.offset_minutes)
     }

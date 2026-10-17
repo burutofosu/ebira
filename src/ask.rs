@@ -322,7 +322,12 @@ fn ask(
             .as_ref()
             .ok_or("without the API, name the search strings with --term")?;
         progress(&format!("choosing search strings ({})", options.plan_model));
-        let user = format!("Today: {}\nQuestion: {}", corpus.today(), options.question);
+        let user = format!(
+            "Today: {} ({})\nQuestion: {}",
+            corpus.today(),
+            corpus.zone(),
+            options.question
+        );
         let schema = prompts::plan_schema();
         let plan = caller
             .call(
@@ -945,10 +950,11 @@ fn answer_with(
     ));
     let blocks: Vec<&str> = evidence.iter().map(|item| item.block.as_str()).collect();
     let user = format!(
-        "Question: {}\nToday: {}\n\nRecords ({} of them, by E number; ▶ marks the record the search \
-         found, the lines around it are its context):\n\n{}",
+        "Question: {}\nToday: {}\nTimes: every time below is local time, {}\n\nRecords ({} of them, \
+         by E number; ▶ marks the record the search found, the lines around it are its context):\n\n{}",
         options.question,
         corpus.today(),
+        corpus.zone(),
         evidence.len(),
         blocks.join("\n")
     );
@@ -1419,7 +1425,7 @@ impl<'a> Summary<'a> {
         lines.push(format!(
             "The corpus has read the logs through {} (run `ebira sync` first to include the latest)",
             self.synced_through
-                .map(|time| corpus.local(time))
+                .map(|time| format!("{} {}", corpus.local(time), corpus.zone()))
                 .unwrap_or_else(|| "an unknown time".to_string())
         ));
         for check in &self.notes.checks {
@@ -1690,6 +1696,7 @@ fn records_report(
         .name("mode", "ask")
         .text("question", &options.question)
         .raw("records", &crate::json::array(records))
+        .name("local_time_zone", &corpus.zone())
         .raw("search", &summary.json())
         .finish();
     out.push('\n');
@@ -1842,6 +1849,7 @@ fn answer_report(
             .raw("timeline", &list_of("timeline"))
             .raw("gaps", &list_of("gaps"))
             .raw("more_terms", &list_of("more_terms"))
+            .name("local_time_zone", &corpus.zone())
             .raw("search", &summary.json())
             .raw("cost_usd", &cost_json(spent))
             .finish();
@@ -1857,7 +1865,10 @@ fn answer_report(
         Some(answer) => {
             out.push_str(&format!("Answer\n{}\n\n", answer.str_at("answer").trim()));
             if !list.is_empty() {
-                out.push_str("Evidence, oldest first\n");
+                out.push_str(&format!(
+                    "Evidence, oldest first, times in {}\n",
+                    corpus.zone()
+                ));
                 for finding in &list {
                     match (finding.origin(), finding.item) {
                         (Some((author, when, _)), Some(item)) => out.push_str(&format!(

@@ -76,6 +76,8 @@ Rules:
 if needed.
 - Write in the language of the question, plainly, for the person to read. answer: the conclusion first, then what \
 supports it, in a few sentences.
+- Times: the request names the zone the records' times are in. Write every time in the answer, the notes and the \
+timeline as the records show it, in that zone, without converting it, and name the zone once.
 - findings: the records that carry the answer, each with its evidence id and its kind: decision (the person decided \
 it), reversal (they withdrew or changed an earlier decision), example (an example or an image, not a specification), \
 praise, problem (something they reported as wrong), cause (a cause found, or what an investigation showed), attempt \

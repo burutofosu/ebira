@@ -156,6 +156,25 @@ pub fn local_minute(timestamp: &str, offset_minutes: i64) -> Option<String> {
     ))
 }
 
+/// `local_minute`, or the timestamp as written when it cannot be read.
+pub fn shown_minute(timestamp: &str, offset_minutes: i64) -> String {
+    local_minute(timestamp, offset_minutes).unwrap_or_else(|| timestamp.to_string())
+}
+
+/// `yyyy-mm-dd hh:mm:ss` local time, for records read one by one.
+pub fn local_second(timestamp: &str, offset_minutes: i64) -> Option<String> {
+    let (year, month, day, hour, minute, second) = local_civil(timestamp, offset_minutes)?;
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hour, minute, second
+    ))
+}
+
+/// The zone local times are given in, as text read by people and models: `UTC+09:00`.
+pub fn zone(offset_minutes: i64) -> String {
+    format!("UTC{}", format_offset(offset_minutes))
+}
+
 fn local_civil(timestamp: &str, offset_minutes: i64) -> Option<(i64, u32, u32, u32, u32, u32)> {
     let nanos = instant(timestamp, offset_minutes)?;
     let unix_ms = (nanos.div_euclid(1_000_000)).clamp(i128::from(i64::MIN), i128::from(i64::MAX));

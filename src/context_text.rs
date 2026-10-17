@@ -3,7 +3,7 @@
 //! no tool-output preview limit. The JSON view remains the lossless raw-record interface.
 
 use crate::core::{self, EventKind, Sender};
-use crate::{corpus, format, jsonl};
+use crate::{corpus, format, jsonl, time};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -11,6 +11,8 @@ use std::path::Path;
 
 pub fn render(root: &Path, source_id: &str, start: u64, bytes: &[u8]) -> io::Result<String> {
     let end = start + bytes.len() as u64;
+    // Times are shown at the corpus offset, with it, as `said` and `search` show them.
+    let offset_minutes = corpus::corpus_offset_minutes(root)?;
     let mut text = String::new();
     let mut covered = start;
     let mut records = 0;
@@ -88,7 +90,9 @@ pub fn render(root: &Path, source_id: &str, start: u64, bytes: &[u8]) -> io::Res
             writeln!(
                 text,
                 "\n[{}] {} ({}, via: {})",
-                header.timestamp,
+                time::local_second(&header.timestamp, offset_minutes)
+                    .map(|local| format!("{local} {}", time::zone(offset_minutes)))
+                    .unwrap_or_else(|| header.timestamp.clone()),
                 header.sender,
                 header.kind,
                 if header.via.is_empty() {

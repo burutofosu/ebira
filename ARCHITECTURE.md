@@ -319,6 +319,11 @@ date and every bounded range, and it sorts after the dated records. A `--from` o
 instant. A bound that cannot be read is an error, and so is an `EBIRA_TZ_OFFSET`
 that is not an offset.
 
+Times are shown at the corpus offset, and say so: the text views name the zone
+(`UTC+09:00`) in their first line or with each record, and `ask` tells its models
+the zone and names it in its result. JSON keeps each record's `timestamp` as its
+log wrote it; the lists of records add `local_time` at the corpus offset.
+
 ## Turn recovery
 
 Turn state is tracked per session because records from multiple sessions can be
@@ -366,7 +371,8 @@ belongs to.
 ## Output
 
 Commands write one JSON object to standard output, through one writer
-(`json.rs`); `help`, `--version`, and `said --format text` write plain text.
+(`json.rs`); `help`, `--version`, and `--format text` (`said`, `search`, `context`,
+`ask`, `ask-usage`) write plain text.
 `disposition` identifies the command result. Errors use `disposition: "error"`
 with a `reason` field and exit with status 1; a request that cannot be served,
 such as a date-map filter that needs `--date`, is an error too. A
