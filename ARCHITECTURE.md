@@ -24,6 +24,7 @@ source retrieval. All commands run locally; `ask` also calls the Anthropic API
 | `context_text.rs` | Readable original records, using the corpus's sender and native-answer classification |
 | `resume.rs` | Current-turn recovery and the brief recovery view |
 | `said.rs` | The person's own messages, by session, project, agent, or topic |
+| `sessions.rs` | The conversations: each session's span, places, counts, and first and last messages |
 | `follow.rs` | Waiting for the next message in another agent's transcript, by sender |
 | `commits.rs` | Commit-name extraction and Git resolution |
 | `ask.rs` | `ask`: search strings, screening, the reading, the reversal check, and the answer |
@@ -129,6 +130,22 @@ compressed log is read as the JSONL it holds, by `logfile.rs` and `zstd.rs`:
 
 A compressed log is read from its start: reaching a later offset decompresses
 everything before it.
+
+A log an app moves keeps its source id too (Claude Code's desktop app moves a
+session's transcript when the session moves to a folder). A log gone from its
+path, and not only unreadable, is the same log as a new one when both were written
+by the same agent, have the same file name, and the new file holds, at the bytes
+where the corpus read the old one's first and last eight records, complete records
+of the same length and time. The new file is then read in full under the old id,
+with the disposition `source_moved`. A copy beside its original, or a different
+log with the same name, is a log of its own.
+
+So a source id is the one the catalog gives a log's path, and a log new to the
+corpus gets its path's, unless another log holds that one: a moved log keeps the
+id of the path it left, so a log that later turns up at that path is another log,
+and it gets an id no log holds. A rebuild reads every log again but keeps the ids
+of the catalog it replaces; a catalog in a storage format the build cannot read
+leaves each log its path's id.
 
 Pending native question calls are also checkpointed, so an answer appended after
 a sync can still be matched to its question. Replaying a file reconstructs these
@@ -303,6 +320,19 @@ parent's session), and its main transcript is the one source outside
 `resume` and `follow` read the main transcript. `follow` looks for a file named by
 the session under the registered source roots only when the corpus has not read
 the session yet.
+
+## Sessions
+
+`sessions` lists the conversations, one entry for each session id the records
+carry, so a subagent's transcript counts in its parent's session and a log that
+moved stays in its session. Each entry gives the span of the session's records,
+the places it worked (its working directories as paths, without those inside
+another one listed), the person's messages counted as `said` counts them, the
+agent's records, compactions, logs, and the first and last of the person's
+messages with their references. A session in which the person wrote nothing, such
+as a thread `codex exec` started, is left out unless `--all` is given, and the
+result says how many were left out. The segments are read on several threads and
+joined in file order, so the counts are those of a reading in order.
 
 ## Timeline and dates
 

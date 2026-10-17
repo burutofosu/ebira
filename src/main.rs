@@ -15,6 +15,7 @@ mod questions;
 mod resume;
 mod said;
 mod search;
+mod sessions;
 mod time;
 mod zstd;
 
@@ -167,6 +168,39 @@ const COMMANDS: &[CommandSpec] = &[
         values: &["--corpus"],
         positional: None,
         flags: &[],
+    },
+    CommandSpec {
+        name: "sessions",
+        synopsis: "[--app claude|codex|other] [--cwd <text>] [--query <text>] [--ignore-case] [--from <time>] [--to <time>] [--order desc|asc] [--all] [--limit <n>] [--offset <n>] [--format json|text]",
+        summary: "List the conversations: when each ran, where, how much the person said, and how it began",
+        details: &[
+            "  --cwd <text>                 sessions with a working directory that contains the text",
+            "  --query <text>               sessions in which the person wrote the text",
+            "  --from <time>, --to <time>   count only the records in that time; a session with none",
+            "                               is left out",
+            "  --order desc|asc             by when the session began (default desc, newest first)",
+            "  --all                        also the sessions in which the person wrote nothing,",
+            "                               such as threads another program started",
+            "  --format json|text           one JSON object (default), or text with times in the",
+            "                               corpus's zone",
+            "",
+            "A subagent's transcript and a Codex child thread count in their parent's session. The",
+            "person's messages are counted as `said` lists them.",
+        ],
+        values: &[
+            "--corpus",
+            "--app",
+            "--cwd",
+            "--query",
+            "--from",
+            "--to",
+            "--order",
+            "--limit",
+            "--offset",
+            "--format",
+        ],
+        positional: None,
+        flags: &["--ignore-case", "--all"],
     },
     CommandSpec {
         name: "said",
@@ -811,6 +845,37 @@ fn run(args: &[String]) -> io::Result<()> {
                 session.as_deref(),
                 has_flag(args, "--brief"),
             )
+        }
+        "sessions" => {
+            let root = corpus_path(args)?;
+            let _lock = corpus::read_lock(&root)?;
+            let offset_minutes = corpus::corpus_offset_minutes(&root)?;
+            let (from, to, range) = range_options(args, offset_minutes)?;
+            let app = option_values(args, "--app").into_iter().next();
+            if let Some(app) = app.as_deref() {
+                if !matches!(app, "claude" | "codex" | "other") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--app must be claude, codex, or other, got {}", app),
+                    ));
+                }
+            }
+            let request = sessions::SessionsRequest {
+                app,
+                cwd: option_values(args, "--cwd").into_iter().next(),
+                query: option_values(args, "--query").into_iter().next(),
+                fold_ascii_case: has_flag(args, "--ignore-case"),
+                from,
+                to,
+                range,
+                newest_first: order_option(args, true)?,
+                all: has_flag(args, "--all"),
+                limit: number_option(args, "--limit", 30)?,
+                offset: number_option_u64_optional(args, "--offset")?,
+                text_format: text_format(args)?,
+                offset_minutes,
+            };
+            sessions::run(&root, &request)
         }
         "said" => {
             let root = corpus_path(args)?;

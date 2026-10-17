@@ -236,7 +236,7 @@ fn a_log_compressed_after_a_sync_keeps_its_source_id_and_references() {
     let sync = run(&["sync", "--corpus", corpus]);
     assert_eq!(value(&sync, "disposition"), "complete", "{sync}");
     assert_eq!(value(&sync, "sources_seen"), "1", "{sync}");
-    assert!(sync.contains("\"source_rewritten\""), "read again: {sync}");
+    assert!(sync.contains("\"source_moved\""), "read again: {sync}");
 
     let after = first_match(&run(&[
         "search",

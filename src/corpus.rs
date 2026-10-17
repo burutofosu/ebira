@@ -13,7 +13,7 @@ use crate::questions::QuestionTracker;
 use crate::{json, output};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -207,6 +207,15 @@ pub fn build_with_preview(
     } else {
         BTreeMap::new()
     };
+    // The logs the corpus has read, by source id. A rebuild reads every log again but keeps
+    // their ids, so a reference made before it still names its log; a catalog this build
+    // cannot read leaves each log its path's id.
+    let rebuilt = if incremental {
+        None
+    } else {
+        load_source_catalog(corpus).ok()
+    };
+    let known = rebuilt.as_ref().unwrap_or(&previous);
     let previous_paths = previous
         .values()
         .map(|entry| (entry.path.as_str(), entry))
@@ -217,11 +226,15 @@ pub fn build_with_preview(
         SourceAvailabilitySnapshot::default()
     };
     let mut collection = collect_sources(sources);
-    attach_source_ids(
-        &mut collection.availability,
-        &collection.paths,
-        &previous_paths,
-    )?;
+    let mut snapshot = collection
+        .paths
+        .iter()
+        .filter_map(|path| {
+            source_entry_for_preview(path, requested_preview, &previous_paths).transpose()
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    settle_source_ids(&mut snapshot, known);
+    attach_source_ids(&mut collection.availability, &snapshot, known);
     let availability = merge_source_availability(
         previous_availability,
         collection.availability,
@@ -235,8 +248,7 @@ pub fn build_with_preview(
     let unreadable_source_paths = availability_entries_for_inputs(&availability, sources)
         .filter(|entry| source_path_is_unavailable(entry))
         .count();
-    let source_paths = collection.paths;
-    if source_paths.is_empty() {
+    if collection.paths.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "no JSONL source files found",
@@ -249,12 +261,6 @@ pub fn build_with_preview(
         BTreeMap::new()
     };
 
-    let snapshot = source_paths
-        .iter()
-        .filter_map(|path| {
-            source_entry_for_preview(path, requested_preview, &previous_paths).transpose()
-        })
-        .collect::<io::Result<Vec<_>>>()?;
     let segment_dir = segment_dir(corpus);
     private_fs::create_dir_all(corpus)?;
     private_fs::create_dir_all(&segment_dir)?;
@@ -263,6 +269,12 @@ pub fn build_with_preview(
     for files in existing_files.values_mut() {
         discard_partial_corpus_files(files)?;
     }
+    link_moved_logs(
+        &mut snapshot,
+        known,
+        &existing_files,
+        incremental && requested_preview.is_none(),
+    );
     let forced_ids = forced_source_ids(force_paths, &snapshot)?;
     // The date offset is fixed when the corpus is built: an incremental sync keeps the one in
     // the catalog, so every segment of one corpus puts records on the same dates.
@@ -393,6 +405,8 @@ pub fn build_with_preview(
         } else {
             let operation_disposition = if force_rebuild {
                 "source_rebuilt"
+            } else if old.is_some_and(|old| old.path != entry.path) {
+                "source_moved"
             } else if old.is_some() || !active_files.is_empty() {
                 "source_rewritten"
             } else {
@@ -543,6 +557,7 @@ fn collect_changed_sources(
                     || old.event_count != entry.event_count
                     || old.disposition != entry.disposition
                     || old.output_preview != entry.output_preview
+                    || old.path != entry.path
             })
             .unwrap_or(true)
             || !source_is_complete(entry);
@@ -905,7 +920,7 @@ pub fn source_is_complete(entry: &SourceEntry) -> bool {
         && entry.committed_byte_end >= entry.size
         && matches!(
             entry.disposition.as_str(),
-            "complete" | "source_appended" | "source_rebuilt" | "source_rewritten"
+            "complete" | "source_appended" | "source_rebuilt" | "source_rewritten" | "source_moved"
         )
 }
 
@@ -1371,9 +1386,12 @@ pub fn log_reader_at(
         .values()
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
-    let Some(entry) = source_entry_for_preview(path, None, &known_paths)? else {
+    let Some(mut entry) = source_entry_for_preview(path, None, &known_paths)? else {
         return Ok(None);
     };
+    // A log the corpus has not read is read under the id a sync would give it, never under
+    // that of a log that moved away from its path.
+    settle_source_ids(std::slice::from_mut(&mut entry), catalog);
     let (mut log, from, mut lines) = match catalog.get(&entry.source_id) {
         Some(known)
             if known.checkpoint_valid
@@ -2237,29 +2255,81 @@ fn merge_source_availability(
     }
 }
 
+/// The source id of each observed path that is a log: the one this sync gives it, else the
+/// one the corpus knew it by.
 fn attach_source_ids(
     availability: &mut [SourceAvailability],
-    paths: &[PathBuf],
-    previous_paths: &BTreeMap<&str, &SourceEntry>,
-) -> io::Result<()> {
-    let mut current = BTreeMap::new();
-    for path in paths {
-        if let Some(entry) = source_entry_for_preview(path, None, previous_paths)? {
-            current.insert(entry.path, entry.source_id);
-        }
-    }
+    snapshot: &[SourceEntry],
+    known: &BTreeMap<String, SourceEntry>,
+) {
+    let ids = known
+        .values()
+        .chain(snapshot)
+        .map(|entry| (entry.path.as_str(), entry.source_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
     for entry in availability {
-        entry.source_id = current
-            .get(&entry.observed_path)
-            .or_else(|| {
-                previous_paths
-                    .get(entry.observed_path.as_str())
-                    .map(|known| &known.source_id)
-            })
-            .cloned()
+        entry.source_id = ids
+            .get(entry.observed_path.as_str())
+            .map(|id| id.to_string())
             .unwrap_or_default();
     }
-    Ok(())
+}
+
+/// Gives each log the source id the corpus knows it by, and a log new to the corpus its
+/// path's, unless another log holds that one: a log that moved keeps the id of the path it
+/// left, so a log that turns up at that path later is another log. That one gets the first
+/// id no log holds.
+fn settle_source_ids(snapshot: &mut [SourceEntry], known: &BTreeMap<String, SourceEntry>) {
+    let known_paths = known
+        .values()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut assigned = BTreeSet::new();
+    let mut new_logs = Vec::new();
+    for (index, entry) in snapshot.iter_mut().enumerate() {
+        match known_paths
+            .get(entry.path.as_str())
+            .filter(|old| old.app == entry.app)
+        {
+            Some(old) => {
+                entry.source_id = old.source_id.clone();
+                assigned.insert(entry.source_id.clone());
+            }
+            None => new_logs.push(index),
+        }
+    }
+    for index in new_logs {
+        let entry = &mut snapshot[index];
+        entry.source_id = unheld_source_id(entry, known, &assigned);
+        assigned.insert(entry.source_id.clone());
+    }
+}
+
+/// `entry`'s source id when no other log holds it, else the first one no log holds. The log's
+/// compressed or uncompressed form, at the same path but for `.zst`, is not another log.
+fn unheld_source_id(
+    entry: &SourceEntry,
+    known: &BTreeMap<String, SourceEntry>,
+    assigned: &BTreeSet<String>,
+) -> String {
+    let place = logfile::jsonl_path(&entry.path);
+    let held = |id: &str| {
+        assigned.contains(id)
+            || known
+                .get(id)
+                .is_some_and(|holder| logfile::jsonl_path(&holder.path) != place)
+    };
+    let mut id = entry.source_id.clone();
+    let mut salt = 0u64;
+    while held(&id) {
+        salt += 1;
+        id = format!(
+            "{}-{:016x}",
+            entry.app,
+            fnv64(format!("{place}\n{salt}").as_bytes())
+        );
+    }
+    id
 }
 
 pub fn timeline_catalog(path: &Path) -> io::Result<BTreeMap<String, Vec<TimelineRun>>> {
@@ -2825,6 +2895,163 @@ fn can_append(old: &SourceEntry, new: &SourceEntry) -> bool {
         && same_file_identity(old, new)
         && new.size >= old.committed_byte_end
         && (new.size > old.committed_byte_end || old.committed_byte_end < old.size)
+}
+
+/// Records checked at each end of a log that may have moved.
+const MOVE_CHECK_RECORDS: usize = 8;
+
+/// A log gone from its path and found at another keeps its source id, so the references to
+/// it still read: apps move logs (a session moved to a folder takes its transcript along).
+/// The new file must be the same log: the same agent, the same file name, and, at the bytes
+/// where the corpus read the old one's first and last records, records of the same length
+/// and time. A log that may only be unreadable is not taken for gone.
+fn link_moved_logs(
+    snapshot: &mut [SourceEntry],
+    previous: &BTreeMap<String, SourceEntry>,
+    segments: &BTreeMap<String, Vec<PathBuf>>,
+    keep_preview: bool,
+) {
+    let present = snapshot
+        .iter()
+        .map(|entry| entry.source_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut gone = previous
+        .values()
+        .filter(|old| {
+            !present.contains(&old.source_id)
+                && old.event_count > 0
+                && matches!(
+                    fs::symlink_metadata(&old.path),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound
+                )
+        })
+        .collect::<Vec<_>>();
+    for entry in snapshot.iter_mut() {
+        if gone.is_empty() {
+            break;
+        }
+        if previous.contains_key(&entry.source_id) {
+            continue;
+        }
+        let found = gone.iter().position(|old| {
+            old.app == entry.app
+                && log_name(&old.path) == log_name(&entry.path)
+                && same_records(old, segments.get(&old.source_id), Path::new(&entry.path))
+        });
+        if let Some(index) = found {
+            let old = gone.swap_remove(index);
+            entry.source_id = old.source_id.clone();
+            if keep_preview {
+                entry.output_preview = old.output_preview;
+            }
+        }
+    }
+}
+
+/// A log's file name, compressed or not, without case.
+fn log_name(path: &str) -> Option<String> {
+    Path::new(logfile::jsonl_path(path))
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+}
+
+/// Whether the log at `path` holds, where the corpus read `old`'s first and last records,
+/// complete records of the same length and time.
+fn same_records(old: &SourceEntry, segments: Option<&Vec<PathBuf>>, path: &Path) -> bool {
+    let Some(records) = segments.and_then(|files| projected_ends(old, files).ok()) else {
+        return false;
+    };
+    let Ok(mut log) = LogFile::open(path) else {
+        return false;
+    };
+    !records.is_empty()
+        && records.iter().all(|record| {
+            record_at(&mut log, record.byte_start, record.byte_len).is_some_and(|line| {
+                record.kind == EventKind::Invalid.as_str()
+                    || parse_record(trim_newline(&line), record.byte_start)
+                        .ok()
+                        .and_then(|fields| record_meta(&fields).timestamp)
+                        .unwrap_or_default()
+                        == record.timestamp
+            })
+        })
+}
+
+/// The headers of the first and last records the corpus holds for `old`, in log order.
+fn projected_ends(old: &SourceEntry, files: &[PathBuf]) -> io::Result<Vec<EventHeader>> {
+    let mut files = files
+        .iter()
+        .filter(|path| is_complete_corpus_file(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_corpus_files(&mut files);
+    let mut first = Vec::new();
+    let mut last = std::collections::VecDeque::new();
+    let mut header_line = Vec::new();
+    for path in files {
+        let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(&path)?);
+        loop {
+            header_line.clear();
+            if reader.read_until(b'\n', &mut header_line)? == 0 {
+                break;
+            }
+            let header = parse_event_header(&header_line)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            skip_corpus_body(&mut reader, header.body_len + 1)?;
+            if header.source_id != old.source_id {
+                continue;
+            }
+            if first.len() < MOVE_CHECK_RECORDS {
+                first.push(header);
+            } else {
+                if last.len() == MOVE_CHECK_RECORDS {
+                    last.pop_front();
+                }
+                last.push_back(header);
+            }
+        }
+    }
+    first.extend(last);
+    first.sort_by_key(|header| header.byte_start);
+    Ok(first)
+}
+
+/// The complete line at `byte_start`, `byte_len` bytes, when a line ends just before it; a
+/// line longer than a record can be is checked at its ends only.
+fn record_at(log: &mut LogFile, byte_start: u64, byte_len: u64) -> Option<Vec<u8>> {
+    let before = u64::from(byte_start > 0);
+    if byte_len == 0 {
+        return None;
+    }
+    if byte_len > MAX_RECORD_BYTES as u64 {
+        log.seek(SeekFrom::Start(byte_start - before)).ok()?;
+        let mut boundary = [0u8; 1];
+        if before == 1 {
+            log.read_exact(&mut boundary).ok()?;
+            if boundary[0] != b'\n' {
+                return None;
+            }
+        }
+        log.seek(SeekFrom::Start(byte_start + byte_len - 1)).ok()?;
+        log.read_exact(&mut boundary).ok()?;
+        return (boundary[0] == b'\n').then(Vec::new);
+    }
+    log.seek(SeekFrom::Start(byte_start - before)).ok()?;
+    let mut bytes = vec![0u8; (byte_len + before) as usize];
+    log.read_exact(&mut bytes).ok()?;
+    if before == 1 && bytes[0] != b'\n' {
+        return None;
+    }
+    let line = bytes.split_off(before as usize);
+    (line.last() == Some(&b'\n')).then_some(line)
+}
+
+fn trim_newline(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && matches!(line[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 fn same_file_identity(old: &SourceEntry, new: &SourceEntry) -> bool {
@@ -3431,6 +3658,41 @@ mod tests {
         };
         assert!(empty.files(&root).unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_log_new_to_the_corpus_never_takes_the_id_another_log_holds() {
+        // A log that moved from `first` to `second` and kept the id of the path it left.
+        let moved = SourceEntry {
+            source_id: "claude-00000000000000aa".into(),
+            app: "claude".into(),
+            path: "/logs/second/s.jsonl".into(),
+            ..SourceEntry::default()
+        };
+        let known = std::collections::BTreeMap::from([(moved.source_id.clone(), moved.clone())]);
+        let mut snapshot = vec![
+            SourceEntry {
+                source_id: "claude-00000000000000bb".into(),
+                ..moved.clone()
+            },
+            // A log at the path it left, whose path gives it the moved log's id.
+            SourceEntry {
+                path: "/logs/first/s.jsonl".into(),
+                ..moved.clone()
+            },
+        ];
+        super::settle_source_ids(&mut snapshot, &known);
+        assert_eq!(snapshot[0].source_id, moved.source_id);
+        assert_ne!(snapshot[1].source_id, moved.source_id);
+        assert!(snapshot[1].source_id.starts_with("claude-"));
+
+        // Its compressed form, at the same path but for `.zst`, is the same log.
+        let mut compressed = vec![SourceEntry {
+            path: "/logs/second/s.jsonl.zst".into(),
+            ..moved.clone()
+        }];
+        super::settle_source_ids(&mut compressed, &known);
+        assert_eq!(compressed[0].source_id, moved.source_id);
     }
 
     #[test]

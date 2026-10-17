@@ -26,17 +26,24 @@ ebira sync
 The first sync finds transcripts in `~/.claude/projects`, `~/.codex/sessions`,
 and `~/.codex/archived_sessions`, respecting `CLAUDE_CONFIG_DIR` and `CODEX_HOME`.
 Run `ebira sync` again to pick up recent work. Changes to Ebira's storage
-format or reading rules trigger a rebuild from the logs.
+format or reading rules trigger a rebuild from the logs; a rebuild under new
+reading rules keeps each log's source id, so references made before it still
+read.
 
 Codex compresses the logs of older threads with Zstandard (`.jsonl.zst`). Ebira
 reads them as the JSONL they hold, under the same source ids and byte offsets, so
-a reference made before a log was compressed still reads its record.
+a reference made before a log was compressed still reads its record. A log an app
+moves to another folder keeps its source id the same way, once Ebira has checked
+that it holds the records it held before.
 
 ## Use
 
 ```sh
 # Your messages, newest first
 ebira said --format text
+
+# The conversations in a project: when each ran, how much you said, how it began
+ebira sessions --cwd <project-path-part> --format text
 
 # Recover a session's latest messages, replies, and tool calls
 ebira resume --session <session-id> --brief

@@ -54,6 +54,13 @@ The person's own statements across Claude Code and Codex, newest first:
 ebira said --query <text> [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] --format text
 ```
 
+The conversations in a scope, each with its span, places, and first and last
+request from the person:
+
+```text
+ebira sessions [--cwd <project-path-part>] [--query <text>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] --format text
+```
+
 When a topic came up, and the records that mention it:
 
 ```text
