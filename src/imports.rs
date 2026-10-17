@@ -347,11 +347,9 @@ fn import_file(source: PathBuf, relative: PathBuf) -> io::Result<ImportFile> {
     })
 }
 
+/// A JSONL log, compressed or not: a compressed one is copied as it is.
 fn is_jsonl(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        .unwrap_or(false)
+    crate::logfile::is_log(path)
 }
 
 fn unused_import_id(root: &Path, imported_at_ms: u64) -> String {

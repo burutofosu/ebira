@@ -7,12 +7,13 @@ use crate::format::{
     decode_token, encode_token, event_header_line, parse_event_header, push_field, EventHeader,
 };
 use crate::jsonl::{parse_record, Field};
+use crate::logfile::{self, LogFile};
 use crate::private_fs;
 use crate::questions::QuestionTracker;
 use crate::{json, output};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -327,6 +328,7 @@ pub fn build_with_preview(
         let preview_matches = old
             .map(|old| old.output_preview == entry.output_preview)
             .unwrap_or(false);
+        // An unchanged compressed log has nothing more to read, even after an incomplete line.
         let reuse_candidate = incremental
             && !force_rebuild
             && old
@@ -334,7 +336,8 @@ pub fn build_with_preview(
                     old.checkpoint_valid
                         && preview_matches
                         && same_snapshot(old, entry)
-                        && old.committed_byte_end == entry.size
+                        && (old.committed_byte_end == entry.size
+                            || logfile::is_compressed(Path::new(&entry.path)))
                         && !active_files.is_empty()
                 })
                 .is_some();
@@ -781,6 +784,16 @@ impl Freshness {
     pub fn is_stale(self) -> bool {
         matches!(self, Self::Behind(_) | Self::Rewritten(_))
     }
+
+    /// The size of the source's JSONL as this test observed it.
+    pub fn observed_size(self, entry: &SourceEntry) -> u64 {
+        match self {
+            Self::Current => entry.size,
+            Self::Behind(bytes) => entry.committed_byte_end.saturating_add(bytes),
+            Self::Rewritten(bytes) => bytes,
+            Self::Unreachable => 0,
+        }
+    }
 }
 
 pub fn freshness(entry: &SourceEntry) -> Freshness {
@@ -793,16 +806,16 @@ pub fn freshness(entry: &SourceEntry) -> Freshness {
 
 /// Opens a source's log for reading its records, with its freshness. A log that was replaced
 /// or rewritten is not returned: the bytes at the corpus's references are another record now.
-pub fn open_log(entry: &SourceEntry) -> (Option<File>, Freshness) {
-    let Ok(file) = File::open(&entry.path) else {
+pub fn open_log(entry: &SourceEntry) -> (Option<LogFile>, Freshness) {
+    let Ok(log) = LogFile::open(Path::new(&entry.path)) else {
         return (None, Freshness::Unreachable);
     };
-    let freshness = match file.metadata() {
+    let freshness = match log.metadata() {
         Ok(metadata) => freshness_of(entry, &metadata),
         Err(_) => Freshness::Unreachable,
     };
     match freshness {
-        Freshness::Current | Freshness::Behind(_) => (Some(file), freshness),
+        Freshness::Current | Freshness::Behind(_) => (Some(log), freshness),
         Freshness::Rewritten(_) | Freshness::Unreachable => (None, freshness),
     }
 }
@@ -818,6 +831,17 @@ fn freshness_of(entry: &SourceEntry, metadata: &fs::Metadata) -> Freshness {
         file_id,
         ..SourceEntry::default()
     };
+    if logfile::is_compressed(path) {
+        // A compressed log is replaced, never appended to, and the size the catalog holds for
+        // it is the size of its JSONL, which only reading it tells: it is the log the corpus
+        // read while it is the same file, modified at the same time.
+        return if same_file_identity(entry, &observed) && entry.modified_ms == observed.modified_ms
+        {
+            Freshness::Current
+        } else {
+            Freshness::Rewritten(logfile::declared_size(path).unwrap_or(observed.size))
+        };
+    }
     if same_snapshot(entry, &observed) && entry.committed_byte_end >= observed.size {
         Freshness::Current
     } else if can_append(entry, &observed) {
@@ -1372,8 +1396,7 @@ pub fn log_reader_at(
             0,
         ),
     };
-    let mut input = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(path)?);
-    input.seek(SeekFrom::Start(from))?;
+    let input = BufReader::with_capacity(IO_BUFFER_SIZE, LogFile::open_at(path, from)?);
     let mut bounded = input.take(cursor.saturating_sub(from));
     let mut line = Vec::new();
     let mut position = from;
@@ -1399,6 +1422,8 @@ fn process_source(
     let append = old.is_some();
     let start_offset = old.map(|old| old.committed_byte_end).unwrap_or(0);
     let start_offset = start_offset.min(entry.size);
+    // A compressed log is read whole, never appended to, and its size is known once it is read.
+    let compressed = logfile::is_compressed(Path::new(&entry.path));
 
     let output_name = if append {
         format!(
@@ -1406,14 +1431,18 @@ fn process_source(
             entry.source_id, start_offset, entry.size
         )
     } else {
-        rebuild_output_name(segment_dir, entry)
+        rebuild_output_name(segment_dir, &entry.source_id, entry.modified_ms, entry.size)
     };
     let output_path = segment_dir.join(&output_name);
     let partial_path = output_path.with_extension("corpus.partial");
-    let input = File::open(&entry.path)?;
-    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, input);
-    reader.seek(SeekFrom::Start(start_offset))?;
-    let mut bounded = reader.take(entry.size.saturating_sub(start_offset));
+    let input = LogFile::open_at(Path::new(&entry.path), start_offset)?;
+    let stored_size = input.metadata()?.len();
+    let reader = BufReader::with_capacity(IO_BUFFER_SIZE, input);
+    let mut bounded = reader.take(if compressed {
+        u64::MAX
+    } else {
+        entry.size.saturating_sub(start_offset)
+    });
     let segment = private_fs::create(&partial_path)?;
     let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, segment);
     let mut line = Vec::new();
@@ -1432,11 +1461,24 @@ fn process_source(
             .unwrap_or_default(),
     );
 
-    while let Some(line_read) = read_bounded_line(&mut bounded, &mut line)? {
+    let mut tail_len = 0u64;
+    let mut undecodable = false;
+    loop {
+        let line_read = match read_bounded_line(&mut bounded, &mut line) {
+            Ok(Some(line_read)) => line_read,
+            Ok(None) => break,
+            // A compressed log is projected up to bytes that cannot be decompressed.
+            Err(error) if compressed && error.kind() == io::ErrorKind::InvalidData => {
+                undecodable = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         let record_start = committed_byte_end;
         let record_end = record_start.saturating_add(line_read.total_len);
         if !line_read.complete {
             partial_records += 1;
+            tail_len = line_read.total_len;
             break;
         }
         line_number += 1;
@@ -1491,6 +1533,15 @@ fn process_source(
             "{}--{}-{}.corpus",
             entry.source_id, start_offset, committed_byte_end
         )
+    } else if compressed && committed_byte_end != entry.size {
+        // A segment's name carries the bytes it covers, which for a compressed log are known
+        // only now.
+        rebuild_output_name(
+            segment_dir,
+            &entry.source_id,
+            entry.modified_ms,
+            committed_byte_end,
+        )
     } else {
         output_name
     };
@@ -1509,7 +1560,29 @@ fn process_source(
     }
 
     let after = fs::metadata(&entry.path)?;
-    let disposition = if after.len() > entry.size {
+    let disposition = if compressed {
+        let (volume_serial_number, file_id) = identity_of(Path::new(&entry.path), &after);
+        let same_file = same_file_identity(
+            entry,
+            &SourceEntry {
+                volume_serial_number,
+                file_id,
+                ..SourceEntry::default()
+            },
+        );
+        if undecodable {
+            "source_undecodable"
+        } else if !same_file
+            || after.len() != stored_size
+            || modified_ms(&after) != entry.modified_ms
+        {
+            "source_changed_during_sync"
+        } else if partial_records > 0 {
+            "tail_incomplete"
+        } else {
+            operation_disposition
+        }
+    } else if after.len() > entry.size {
         "source_grew_during_sync"
     } else if after.len() < entry.size {
         "source_truncated_during_sync"
@@ -1522,6 +1595,9 @@ fn process_source(
     };
     let checkpoint = log.checkpoint();
     let mut updated = entry.clone();
+    if compressed {
+        updated.size = committed_byte_end + tail_len;
+    }
     updated.pending_questions = log.questions.clone();
     updated.committed_byte_end = committed_byte_end;
     updated.event_count = checkpoint.next_event_index;
@@ -1731,9 +1807,7 @@ pub fn session_sources<'a>(
 /// Whether a transcript is named by the session: its file name carries the session id and it
 /// lies outside `subagents/`.
 pub fn file_names_session(path: &Path, session: &str) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.contains(session))
+    logfile::stem(path).is_some_and(|stem| stem.contains(session))
         && !path
             .to_string_lossy()
             .replace('\\', "/")
@@ -1792,18 +1866,28 @@ fn source_entry(path: &Path, output_preview: u64) -> io::Result<Option<SourceEnt
     let Some(app) = source_app(&canonical) else {
         return Ok(None);
     };
-    let fallback_session = canonical
-        .file_stem()
-        .and_then(|stem| stem.to_str())
+    let fallback_session = logfile::stem(&canonical)
         .filter(|stem| !stem.is_empty())
         .unwrap_or("source")
         .to_string();
+    // A log keeps its source id when it is compressed, so its references still name it.
+    let source_id = format!(
+        "{}-{:016x}",
+        app,
+        fnv64(logfile::jsonl_path(&canonical_string).as_bytes())
+    );
+    // A compressed log's size is the size of its JSONL, known once it is read.
+    let size = if logfile::is_compressed(&canonical) {
+        0
+    } else {
+        metadata.len()
+    };
     Ok(Some(SourceEntry {
-        source_id: format!("{}-{:016x}", app, fnv64(canonical_string.as_bytes())),
+        source_id,
         app: app.to_string(),
         path: canonical_string,
         fallback_session,
-        size: metadata.len(),
+        size,
         modified_ms: modified_ms(&metadata),
         output_preview,
         volume_serial_number,
@@ -1828,6 +1912,13 @@ fn source_entry_for_preview(
         entry.source_id = previous.source_id.clone();
         if requested_preview.is_none() {
             entry.output_preview = previous.output_preview;
+        }
+        // An unchanged compressed log holds the JSONL the corpus read.
+        if logfile::is_compressed(Path::new(&entry.path))
+            && same_file_identity(previous, &entry)
+            && previous.modified_ms == entry.modified_ms
+        {
+            entry.size = previous.size;
         }
     }
     Ok(Some(entry))
@@ -2712,10 +2803,9 @@ fn committed_end_is_record_boundary(path: &str, committed_byte_end: u64) -> io::
     if committed_byte_end == 0 {
         return Ok(true);
     }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(committed_byte_end - 1))?;
+    let mut log = LogFile::open_at(Path::new(path), committed_byte_end - 1)?;
     let mut byte = [0u8; 1];
-    match file.read_exact(&mut byte) {
+    match log.read_exact(&mut byte) {
         Ok(()) => Ok(byte[0] == b'\n'),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(error) => Err(error),
@@ -2731,6 +2821,7 @@ fn same_snapshot(old: &SourceEntry, new: &SourceEntry) -> bool {
 
 fn can_append(old: &SourceEntry, new: &SourceEntry) -> bool {
     old.path == new.path
+        && !logfile::is_compressed(Path::new(&new.path))
         && same_file_identity(old, new)
         && new.size >= old.committed_byte_end
         && (new.size > old.committed_byte_end || old.committed_byte_end < old.size)
@@ -2833,11 +2924,8 @@ fn identity_of(path: &Path, _metadata: &fs::Metadata) -> (u64, u64) {
     file_identity(path)
 }
 
-fn rebuild_output_name(segment_dir: &Path, entry: &SourceEntry) -> String {
-    let prefix = format!(
-        "{}--rewrite-{}-{}",
-        entry.source_id, entry.modified_ms, entry.size
-    );
+fn rebuild_output_name(segment_dir: &Path, source_id: &str, modified_ms: u64, end: u64) -> String {
+    let prefix = format!("{}--rewrite-{}-{}", source_id, modified_ms, end);
     let mut suffix = String::new();
     let mut attempt = 0u64;
     loop {
@@ -3056,10 +3144,10 @@ fn origin_of(app: &str, path: &Path) -> SourceOrigin {
 }
 
 fn codex_origin(path: &Path) -> SourceOrigin {
-    let Ok(file) = File::open(path) else {
+    let Ok(log) = LogFile::open(path) else {
         return SourceOrigin::CodexThread;
     };
-    let mut reader = BufReader::new(file.take(MAX_RECORD_BYTES as u64));
+    let mut reader = BufReader::new(log.take(MAX_RECORD_BYTES as u64));
     let mut line = Vec::new();
     if reader.read_until(b'\n', &mut line).is_err() {
         return SourceOrigin::CodexThread;
@@ -3123,10 +3211,10 @@ fn source_app(path: &Path) -> Option<&'static str> {
 /// Whether a log holds at least one complete record. A first line longer than any record can
 /// be is complete too: it is projected as an invalid record.
 pub fn first_line_complete(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else {
+    let Ok(log) = LogFile::open(path) else {
         return false;
     };
-    let mut reader = BufReader::new(file.take(MAX_RECORD_BYTES as u64 + 1));
+    let mut reader = BufReader::new(log.take(MAX_RECORD_BYTES as u64 + 1));
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line).is_ok()
         && (line.last() == Some(&b'\n') || line.len() > MAX_RECORD_BYTES)
@@ -3136,8 +3224,8 @@ const SNIFF_LINES: usize = 16;
 const SNIFF_BYTES: u64 = 1024 * 1024;
 
 fn sniff_kind(path: &Path) -> Option<&'static str> {
-    let file = File::open(path).ok()?;
-    let mut reader = BufReader::new(file.take(SNIFF_BYTES));
+    let log = LogFile::open(path).ok()?;
+    let mut reader = BufReader::new(log.take(SNIFF_BYTES));
     let mut line = Vec::new();
     for _ in 0..SNIFF_LINES {
         line.clear();
@@ -3181,6 +3269,19 @@ fn collect_sources(inputs: &[String]) -> SourceCollection {
     }
     collection.paths.sort();
     collection.paths.dedup();
+    // While a log and its compressed copy are both there, the log is read: the copy may still
+    // be being written, and both have one source id.
+    let plain = collection
+        .paths
+        .iter()
+        .filter(|path| !logfile::is_compressed(path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    collection.paths.retain(|path| {
+        let path = path.to_string_lossy();
+        !logfile::is_compressed(Path::new(path.as_ref()))
+            || !plain.contains(logfile::jsonl_path(&path))
+    });
     collection.availability.sort_by(|left, right| {
         left.input_path
             .cmp(&right.input_path)
@@ -3214,12 +3315,7 @@ fn collect_source_path(
         }
     };
     if metadata.is_file() {
-        let is_jsonl = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.eq_ignore_ascii_case("jsonl"))
-            .unwrap_or(false);
-        if is_jsonl {
+        if logfile::is_log(path) {
             collection.paths.push(path.to_path_buf());
             if is_input {
                 push_source_availability(collection, input_path, path, "present");

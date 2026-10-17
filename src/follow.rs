@@ -13,8 +13,8 @@
 //! source roots, for a session the corpus has not read yet), or by a path.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::fs;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use crate::core::{human_text_from_body, persons_message, PersonsMessage, SeenMessages};
 use crate::corpus::{self, LogReader, ReadRecord, SourceEntry};
 use crate::jsonl::{Field, ScalarKind};
+use crate::logfile::{self, LogFile};
 use crate::{json, output};
 
 pub struct FollowRequest {
@@ -65,10 +66,13 @@ pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
     };
     let target = resolve_target(&catalog, &inputs, request)?;
     let path = target.path.as_path();
-    let size = fs::metadata(path)?.len();
+    // A compressed transcript is an archive: nothing more is written to it, so its length is
+    // measured once and it is read once.
+    let compressed = logfile::is_compressed(path);
+    let mut size = transcript_len(path)?;
     let start = request.after_byte.unwrap_or(size).min(size);
-    let mut cursor = align_to_line_start(path, start)?;
-    let mut seen = seen_before(&catalog, path, cursor)?;
+    let mut cursor = align_to_line_start(path, start, size)?;
+    let mut seen = seen_before(&catalog, path, cursor, size)?;
     // Made once the transcript holds a complete record, so the agent that writes it is known
     // before any message is classified.
     let mut reader = None;
@@ -78,17 +82,27 @@ pub fn run(root: &Path, request: &FollowRequest) -> io::Result<()> {
             reader = corpus::log_reader_at(&catalog, path, cursor)?;
         }
         let (messages, next) = match reader.as_mut() {
-            Some((reader, lines)) => scan(path, reader, lines, cursor, &mut seen, request)?,
+            Some((reader, lines)) => scan(path, size, reader, lines, cursor, &mut seen, request)?,
             None => (Vec::new(), cursor),
         };
         if !messages.is_empty() {
             return print_result("received", &target, next, &messages);
         }
         cursor = next;
-        if Instant::now() >= deadline {
+        if compressed || Instant::now() >= deadline {
             return print_result("waiting", &target, cursor, &messages);
         }
         sleep(Duration::from_millis(500));
+        size = transcript_len(path)?;
+    }
+}
+
+/// The length of a transcript's JSONL: the size of its file, or, compressed, of what it holds.
+fn transcript_len(path: &Path) -> io::Result<u64> {
+    if logfile::is_compressed(path) {
+        io::copy(&mut LogFile::open(path)?, &mut io::sink())
+    } else {
+        Ok(fs::metadata(path)?.len())
     }
 }
 
@@ -204,9 +218,7 @@ fn collect_session_files(
 }
 
 fn names_session(path: &Path, session: &str) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension == "jsonl")
-        && corpus::file_names_session(path, session)
+    logfile::is_log(path) && corpus::file_names_session(path, session)
 }
 
 fn modified_ms(metadata: &fs::Metadata) -> u64 {
@@ -230,6 +242,7 @@ fn seen_before(
     catalog: &BTreeMap<String, SourceEntry>,
     path: &Path,
     cursor: u64,
+    size: u64,
 ) -> io::Result<SeenMessages> {
     let mut seen = SeenMessages::default();
     if cursor == 0 {
@@ -240,9 +253,8 @@ fn seen_before(
     let Some((mut reader, _)) = corpus::log_reader_at(catalog, path, 0)? else {
         return Ok(seen);
     };
-    let start = start_of_last_lines(path, cursor, LOOK_BACK_LINES, LOOK_BACK_BYTES)?;
-    let mut input = BufReader::new(File::open(path)?);
-    input.seek(SeekFrom::Start(start))?;
+    let start = start_of_last_lines(path, cursor, size, LOOK_BACK_LINES, LOOK_BACK_BYTES)?;
+    let input = BufReader::new(LogFile::open_at(path, start)?);
     let mut bounded = input.take(cursor - start);
     let mut line = Vec::new();
     let mut position = start;
@@ -268,12 +280,17 @@ fn seen_before(
 
 /// Where the last `count` lines before `cursor`, a line start, begin, looking back at most
 /// `limit` bytes.
-fn start_of_last_lines(path: &Path, cursor: u64, count: usize, limit: u64) -> io::Result<u64> {
+fn start_of_last_lines(
+    path: &Path,
+    cursor: u64,
+    size: u64,
+    count: usize,
+    limit: u64,
+) -> io::Result<u64> {
     let floor = cursor.saturating_sub(limit);
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(floor))?;
+    let mut log = LogFile::open_at(path, floor)?;
     let mut bytes = vec![0; (cursor - floor) as usize];
-    file.read_exact(&mut bytes)?;
+    log.read_exact(&mut bytes)?;
     let mut newlines = 0;
     for (index, byte) in bytes.iter().enumerate().rev() {
         if *byte == b'\n' {
@@ -286,21 +303,20 @@ fn start_of_last_lines(path: &Path, cursor: u64, count: usize, limit: u64) -> io
     if floor == 0 {
         Ok(0)
     } else {
-        align_to_line_start(path, floor)
+        align_to_line_start(path, floor, size)
     }
 }
 
-/// Move a caller-supplied boundary forward to the start of the next line.
-fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
+/// Move a caller-supplied boundary forward to the start of the next line, in a transcript of
+/// `size` bytes.
+fn align_to_line_start(path: &Path, cursor: u64, size: u64) -> io::Result<u64> {
     if cursor == 0 {
         return Ok(0);
     }
-    let mut file = File::open(path)?;
-    let size = file.metadata()?.len();
     if cursor >= size {
         return Ok(size);
     }
-    file.seek(SeekFrom::Start(cursor - 1))?;
+    let mut file = LogFile::open_at(path, cursor - 1)?;
     let mut previous = [0u8; 1];
     file.read_exact(&mut previous)?;
     if previous[0] == b'\n' {
@@ -328,18 +344,17 @@ fn align_to_line_start(path: &Path, cursor: u64) -> io::Result<u64> {
 /// message already returned is not left for the next call.
 fn scan(
     path: &Path,
+    size: u64,
     reader: &mut LogReader,
     lines: &mut u64,
     cursor: u64,
     seen: &mut SeenMessages,
     request: &FollowRequest,
 ) -> io::Result<(Vec<Message>, u64)> {
-    let size = fs::metadata(path)?.len();
     if size <= cursor {
         return Ok((Vec::new(), cursor));
     }
-    let mut input = BufReader::new(File::open(path)?);
-    input.seek(SeekFrom::Start(cursor))?;
+    let input = BufReader::new(LogFile::open_at(path, cursor)?);
     let mut bounded = input.take(size - cursor);
     let mut line = Vec::new();
     let mut messages = Vec::new();
@@ -578,6 +593,7 @@ mod tests {
         Some(
             scan(
                 path,
+                transcript_len(path).expect("transcript length"),
                 &mut reader,
                 &mut lines,
                 cursor,

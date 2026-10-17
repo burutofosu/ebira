@@ -1,6 +1,7 @@
 use crate::core::TimelineRef;
 use crate::corpus::{self, SourceEntry, TimelineRun};
 use crate::format::{self, parse_event_header, EventHeader};
+use crate::logfile::LogFile;
 use crate::time::{self, Range};
 use crate::{json, output};
 use std::cmp::Ordering;
@@ -109,7 +110,7 @@ struct SearchStats {
 /// the sync is not read: its records are elsewhere now, so it counts as unreachable until the
 /// next sync.
 struct SourceReaders {
-    open: BTreeMap<String, Option<File>>,
+    open: BTreeMap<String, Option<LogFile>>,
 }
 
 impl SourceReaders {
@@ -117,7 +118,7 @@ impl SourceReaders {
         &mut self,
         source_id: &str,
         catalog: &BTreeMap<String, SourceEntry>,
-    ) -> Option<&mut File> {
+    ) -> Option<&mut LogFile> {
         self.open
             .entry(source_id.to_string())
             .or_insert_with(|| {
@@ -1722,10 +1723,8 @@ pub fn context(
         Some(file) => file.metadata().ok(),
         None => std::fs::metadata(&entry.path).ok(),
     };
-    let observed_size = observed
-        .as_ref()
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    // The size of the JSONL, which for a compressed log is not the size of its file.
+    let observed_size = freshness.observed_size(entry);
     let observed_modified_ms = observed
         .as_ref()
         .and_then(|metadata| metadata.modified().ok())
@@ -1805,7 +1804,7 @@ pub fn context(
 /// The bytes of a log from `byte_start`, `byte_len` of them, within the log and the context
 /// bound.
 fn read_range(
-    mut file: File,
+    mut file: LogFile,
     byte_start: u64,
     byte_len: u64,
     source_size: u64,

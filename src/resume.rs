@@ -5,6 +5,7 @@ use crate::core::{
 use crate::corpus::{self, SourceEntry};
 use crate::format::{body_fields, parse_event_header, push_field};
 use crate::jsonl::{parse_record, Field};
+use crate::logfile::LogFile;
 use crate::{json, output};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -380,13 +381,30 @@ fn brief_json(
     humans.reverse();
     let human_count = humans.len() as u64;
 
+    // The records are read in the order of the log, each once: a compressed log is read from
+    // its start, and going back would decompress it again.
+    let mut wanted = scanned
+        .recent_assistants
+        .iter()
+        .chain(&scanned.recent_commands)
+        .map(|event| &event.source_ref)
+        .collect::<Vec<_>>();
+    wanted.sort_by_key(|reference| reference.byte_start);
+    let mut originals = BTreeMap::new();
+    for reference in wanted {
+        if let Some(fields) = original_fields(log.as_mut(), reference) {
+            originals.insert(reference.byte_start, fields);
+        }
+    }
+    let original = |event: &RecoveryEvent| originals.get(&event.source_ref.byte_start);
+
     let mut texts = Vec::new();
     for event in scanned.recent_assistants.iter().rev() {
         if texts.len() == BRIEF_ASSISTANT_TEXTS {
             break;
         }
-        let text = original_fields(log.as_mut(), &event.source_ref)
-            .map(|fields| assistant_text(&fields))
+        let text = original(event)
+            .map(|fields| assistant_text(fields))
             .unwrap_or_default();
         if !text.trim().is_empty() {
             let (text, cut) = bounded(text.trim(), BRIEF_ASSISTANT_TEXT_LIMIT);
@@ -403,8 +421,8 @@ fn brief_json(
     texts.reverse();
 
     let commands = scanned.recent_commands.iter().map(|event| {
-        let calls = original_fields(log.as_mut(), &event.source_ref)
-            .map(|fields| tool_calls(&fields))
+        let calls = original(event)
+            .map(|fields| tool_calls(fields))
             .unwrap_or_default();
         let (name, input) = calls.into_iter().last().unwrap_or_else(|| {
             let values = body_fields(&event.body)
@@ -502,7 +520,7 @@ fn source_ref_json(source_ref: &SourceRef, source_path: &str) -> String {
 
 /// A record read from its log, opened by `corpus::open_log` only when it is the log the corpus
 /// read.
-fn original_fields(log: Option<&mut File>, source_ref: &SourceRef) -> Option<Vec<Field>> {
+fn original_fields(log: Option<&mut LogFile>, source_ref: &SourceRef) -> Option<Vec<Field>> {
     if source_ref.byte_len == 0 || source_ref.byte_len > MAX_ORIGINAL_RECORD_BYTES {
         return None;
     }

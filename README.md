@@ -28,6 +28,10 @@ and `~/.codex/archived_sessions`, respecting `CLAUDE_CONFIG_DIR` and `CODEX_HOME
 Run `ebira sync` again to pick up recent work. Changes to Ebira's storage
 format or reading rules trigger a rebuild from the logs.
 
+Codex compresses the logs of older threads with Zstandard (`.jsonl.zst`). Ebira
+reads them as the JSONL they hold, under the same source ids and byte offsets, so
+a reference made before a log was compressed still reads its record.
+
 ## Use
 
 ```sh
@@ -120,7 +124,8 @@ answer would read.
 
 ## Logs in other locations
 
-Add a JSONL file or directory. It is remembered for later syncs:
+Add a JSONL file (`.jsonl`, or `.jsonl.zst` compressed) or a directory. It is
+remembered for later syncs:
 
 ```sh
 ebira sync --source /path/to/transcripts
@@ -170,6 +175,9 @@ The `ebira` executable must be on `PATH`.
 Keep the corpus as private as your conversation logs. Keep the original logs
 available for source reads and rebuilds; `ebira help import` explains how to
 keep managed copies.
+
+A compressed log is read from its start, so reading a record near the end of a
+large one takes longer: a few seconds for a log that holds a gigabyte of JSONL.
 
 Claude Code and Codex log formats can change and may require an Ebira update.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for storage and implementation details.

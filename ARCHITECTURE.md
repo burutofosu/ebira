@@ -16,6 +16,8 @@ source retrieval. All commands run locally; `ask` also calls the Anthropic API
 | `time.rs` | Timestamps, dates, offsets, and `--from`/`--to` ranges |
 | `json.rs` | The JSON writer every command's result goes through |
 | `corpus.rs` | Source discovery, indexing, checkpoints, and generated files |
+| `logfile.rs` | A log's bytes: a JSONL file, or the JSONL a `.jsonl.zst` file holds |
+| `zstd.rs` | Zstandard decompression (RFC 8878), without a dependency |
 | `imports.rs` | Managed JSONL imports and provenance records |
 | `private_fs.rs` | Private creation modes for corpus directories, files, and managed copies |
 | `search.rs` | Literal search, timeline reads, raw scans, and context reads |
@@ -92,6 +94,7 @@ Each source file goes through these operations:
 
 ```text
 source path
+  -> JSONL bytes (decompressed for `.jsonl.zst`)
   -> source kind (a `.claude` or `.codex` directory, else the first records)
   -> source origin (path, and the opening session_meta record for Codex)
   -> JSONL record reader
@@ -109,6 +112,23 @@ after `session_meta` and `turn_context` do. A file that changed other than by
 appending is projected again. A file that is gone is dropped; one under a
 directory that could not be listed keeps its projection and is reported as
 unreadable.
+
+Codex compresses the rollouts of older threads with Zstandard (`.jsonl.zst`). A
+compressed log is read as the JSONL it holds, by `logfile.rs` and `zstd.rs`:
+
+- Its offsets, sizes, and checkpoints count the JSONL's bytes, and its source id
+  is made from its path without `.zst`. A log Codex compresses keeps its source
+  id, and its references read the same records once a sync has read it again.
+- It is replaced, never appended to, and the size of its JSONL is known only by
+  reading it, so it is the log the corpus read while its file identity and
+  modification time are unchanged; otherwise it is read again from its start.
+- While `x.jsonl` and `x.jsonl.zst` are both there, `x.jsonl` is read: the
+  compressed copy may still be being written.
+- Data that cannot be decompressed ends the read of that log alone. The records
+  before it are kept, and the log's disposition is `source_undecodable`.
+
+A compressed log is read from its start: reaching a later offset decompresses
+everything before it.
 
 Pending native question calls are also checkpointed, so an answer appended after
 a sync can still be matched to its question. Replaying a file reconstructs these
@@ -133,7 +153,9 @@ transcript while the transcript is still the file the corpus read, and from its
 start otherwise. Its messages carry the sender, channel, timestamp, and byte
 range the corpus gives the same records. Before it reads on from a cursor, it
 reads the person's messages in the last lines before it, so a message written as
-two records is returned once even when an earlier call returned the first.
+two records is returned once even when an earlier call returned the first. A
+compressed transcript is read once, without waiting: nothing more is written to
+it.
 
 ## Senders
 
@@ -196,8 +218,8 @@ resume pending paths. Partial corpus segments are removed during recovery.
 
 ## Managed imports
 
-`ebira import` copies `.jsonl` files into the managed store and writes two
-registries:
+`ebira import` copies `.jsonl` and `.jsonl.zst` files, compressed ones as they
+are, into the managed store and writes two registries:
 
 - The top-level registry records the import ID, provenance, label, source
   computer, original path, import time, and managed directory.
@@ -232,10 +254,11 @@ What the logs of a scope hold that the corpus has not read is judged by one test
 `current` when it is the file the corpus read, unchanged; `behind` when it has
 grown, by the bytes after what was read; `rewritten` when it was replaced,
 shortened, or changed in place, in which case all of it is read again; and
-`unreachable` when it cannot be read. `search`, `history`, `timeline`, and `said`
-report the stale sources and unscanned bytes of their scope; `resume` reports its
-transcript's freshness and whether to sync first. A transcript still being
-written is `behind` until the next sync.
+`unreachable` when it cannot be read. A compressed log is never `behind`.
+`search`, `history`, `timeline`, and `said` report the stale sources and
+unscanned bytes of their scope; `resume` reports its transcript's freshness and
+whether to sync first. A transcript still being written is `behind` until the
+next sync.
 
 ## Search
 

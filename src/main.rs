@@ -8,6 +8,7 @@ mod format;
 mod imports;
 mod json;
 mod jsonl;
+mod logfile;
 mod output;
 mod private_fs;
 mod questions;
@@ -15,6 +16,7 @@ mod resume;
 mod said;
 mod search;
 mod time;
+mod zstd;
 
 use search::SearchRequest;
 use std::io;
@@ -113,7 +115,8 @@ const COMMANDS: &[CommandSpec] = &[
         synopsis: "[--source <path>]... [--rebuild] [--rebuild-source <path>]... [--tool-output-chars <n>]",
         summary: "Create the corpus, or add what the logs gained since the last sync",
         details: &[
-            "  --source <path>              a JSONL file or a directory of them, kept for later syncs;",
+            "  --source <path>              a JSONL file (.jsonl or .jsonl.zst) or a directory of them,",
+            "                               kept for later syncs;",
             "                               without it the first sync reads the Claude Code and Codex",
             "                               transcript directories",
             "  --rebuild                    build the corpus again; with --source, from exactly those",
