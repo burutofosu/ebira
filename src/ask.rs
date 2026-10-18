@@ -152,9 +152,12 @@ struct Pool {
     terms: Vec<String>,
     counts: Vec<TermCount>,
     synced_through: Option<String>,
-    /// Every record already considered, so a later round screens only new ones.
+    /// Every record already screened (or, without the API, taken), so a later round screens
+    /// only new ones. A record left past a round's limit is not in it: a later round's strings
+    /// can bring it back.
     seen: HashSet<SourceRef>,
-    found: usize,
+    /// Every record a search found.
+    found: HashSet<SourceRef>,
     /// The relevant records with their score (the screen's 2 or 3; 0 without the API), in the
     /// order found.
     relevant: Vec<(Hit, u64)>,
@@ -529,7 +532,20 @@ struct Claim {
     quote: String,
     /// yyyy-mm-dd at the corpus offset.
     date: String,
+    /// The time of the record it comes from, as the log wrote it.
+    timestamp: String,
     source: SourceRef,
+}
+
+/// Whether one of the person's messages is one to check against the claim: another record,
+/// from the date the search starts, and written no earlier than the claim. A message earlier
+/// the same day is not a later change, however its time is written.
+fn written_after(corpus: &Corpus, claim: &Claim, from: &str, hit: &Hit) -> bool {
+    hit.source_ref != claim.source
+        && corpus
+            .local_date(&hit.timestamp)
+            .is_some_and(|date| date.as_str() >= from)
+        && corpus.instant(&hit.timestamp) >= corpus.instant(&claim.timestamp)
 }
 
 fn claims_to_check(corpus: &Corpus, answer: &Value, evidence: &[Evidence]) -> Vec<Claim> {
@@ -551,6 +567,7 @@ fn claims_to_check(corpus: &Corpus, answer: &Value, evidence: &[Evidence]) -> Ve
                 kind: kind.to_string(),
                 quote: finding.quote.clone(),
                 date,
+                timestamp: timestamp.to_string(),
                 source: source.clone(),
             });
             if claims.len() == MAX_CLAIMS {
@@ -561,8 +578,8 @@ fn claims_to_check(corpus: &Corpus, answer: &Value, evidence: &[Evidence]) -> Ve
     claims
 }
 
-/// The person's messages, dated on or after each claim, that the screen judges to change it (2
-/// or 3 points). Ranking by closeness to the question would drop them: a later change rarely
+/// The person's messages, written at or after each claim, that the screen judges to change it
+/// (2 or 3 points). Ranking by closeness to the question would drop them: a later change rarely
 /// repeats the question's words. ("Use whatever library gets it done" undoes a rule against new
 /// dependencies without the word dependency.)
 fn hunt_reversals(
@@ -684,12 +701,7 @@ fn hunt_reversals(
             let dated: Vec<&Hit> = found[index]
                 .hits
                 .iter()
-                .filter(|hit| hit.source_ref != claim.source)
-                .filter(|hit| {
-                    corpus
-                        .local_date(&hit.timestamp)
-                        .is_some_and(|date| date >= from)
-                })
+                .filter(|hit| written_after(corpus, claim, &from, hit))
                 .collect();
             let half = REVERSAL_PER_TERM / 2;
             let first = dated.iter().take(half);
@@ -745,9 +757,9 @@ fn hunt_reversals(
             })
             .collect();
         let user = format!(
-            "Item {} ({}, {}):\n「{}」\n\nThe person's messages on or after that date:\n{}",
+            "Item {} ({}, {}):\n「{}」\n\nThe person's messages from then on:\n{}",
             claim.id,
-            claim.date,
+            corpus.local(&claim.timestamp),
             claim.kind,
             text::one_line(&claim.quote),
             lines.join("\n")
@@ -863,14 +875,7 @@ fn gather(
     if pool.synced_through.is_none() {
         pool.synced_through = searched.synced_through;
     }
-    let mut candidates: Vec<Hit> = searched
-        .hits
-        .into_iter()
-        .filter(|hit| pool.seen.insert(hit.source_ref.clone()))
-        .collect();
-    rank(corpus, &mut candidates);
-    pool.found += candidates.len();
-    candidates.truncate(options.candidates);
+    let candidates = take_new(pool, corpus, searched.hits, options.candidates);
     match caller {
         Some(caller) if !candidates.is_empty() => {
             progress(&format!(
@@ -894,6 +899,25 @@ fn gather(
             .extend(candidates.into_iter().map(|hit| (hit, 0))),
     }
     Ok(())
+}
+
+/// This round's records not screened yet, best first, up to `limit`, which are marked as
+/// screened. One past the limit is not: a later round's strings can bring it back.
+fn take_new(pool: &mut Pool, corpus: &Corpus, hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    let mut this_round = HashSet::new();
+    let mut candidates: Vec<Hit> = hits
+        .into_iter()
+        .filter(|hit| {
+            !pool.seen.contains(&hit.source_ref) && this_round.insert(hit.source_ref.clone())
+        })
+        .collect();
+    rank(corpus, &mut candidates);
+    pool.found
+        .extend(candidates.iter().map(|hit| hit.source_ref.clone()));
+    candidates.truncate(limit);
+    pool.seen
+        .extend(candidates.iter().map(|hit| hit.source_ref.clone()));
+    candidates
 }
 
 /// The records, oldest first, each with the nearest readable records around it.
@@ -1371,7 +1395,7 @@ impl<'a> Summary<'a> {
         Summary {
             terms: &pool.terms,
             counts: &pool.counts,
-            found: pool.found,
+            found: pool.found.len(),
             screened: pool.screened.then_some((pool.threes, pool.twos)),
             kept,
             rounds: pool.rounds,
@@ -2018,6 +2042,26 @@ mod tests {
     }
 
     #[test]
+    fn a_record_past_a_rounds_limit_can_come_back_in_a_later_round() {
+        let found = vec![
+            hit("a", Who::Person, "2026-10-01T00:00:00Z", &["色が", "凡例"]),
+            hit("b", Who::Person, "2026-10-02T00:00:00Z", &["色が"]),
+            hit("c", Who::Person, "2026-10-03T00:00:00Z", &["色が"]),
+        ];
+        let mut pool = Pool::default();
+        let first = take_new(&mut pool, &corpus(), found.clone(), 2);
+        let texts = |hits: &[Hit]| hits.iter().map(|hit| hit.text.clone()).collect::<Vec<_>>();
+        assert_eq!(texts(&first), vec!["a", "c"]);
+        let second = take_new(&mut pool, &corpus(), found, 2);
+        assert_eq!(
+            texts(&second),
+            vec!["b"],
+            "the record past the first round's limit was not screened, so it comes back"
+        );
+        assert_eq!(pool.found.len(), 3, "a record found twice is counted once");
+    }
+
+    #[test]
     fn composes_a_block_with_the_hit_marked() {
         let lines = vec![
             line(
@@ -2207,6 +2251,38 @@ mod tests {
         assert_eq!(claims[0].kind, "decision");
         assert_eq!(claims[0].date, "2026-09-27");
         assert_eq!(claims[0].source.byte_start, 10);
+    }
+
+    #[test]
+    fn looks_for_changes_after_the_claim_not_earlier_the_same_day() {
+        // 15:00 at the corpus offset, UTC+09:00.
+        let claim = Claim {
+            id: "D1".to_string(),
+            kind: "decision".to_string(),
+            quote: "React に変える".to_string(),
+            date: "2026-10-18".to_string(),
+            timestamp: "2026-10-18T06:00:00Z".to_string(),
+            source: SourceRef {
+                source_id: "claude-claim".to_string(),
+                byte_start: 1,
+                byte_len: 1,
+            },
+        };
+        let morning = hit("Vue を使う", Who::Person, "2026-10-18T00:00:00Z", &["Vue"]);
+        let evening = hit("Vue に戻す", Who::Person, "2026-10-18T07:00:00Z", &["Vue"]);
+        let offset = hit(
+            "Vue のまま",
+            Who::Person,
+            "2026-10-18T15:30:00+09:00",
+            &["Vue"],
+        );
+        assert!(!written_after(&corpus(), &claim, "2026-10-18", &morning));
+        assert!(written_after(&corpus(), &claim, "2026-10-18", &evening));
+        assert!(written_after(&corpus(), &claim, "2026-10-18", &offset));
+        assert!(
+            !written_after(&corpus(), &claim, "2026-10-19", &evening),
+            "the date the search starts from still bounds it"
+        );
     }
 
     #[test]
@@ -2425,7 +2501,13 @@ mod tests {
                 total: 120,
             }],
             rounds: 2,
-            found: 30,
+            found: (0..30)
+                .map(|byte_start| SourceRef {
+                    source_id: "claude-a".to_string(),
+                    byte_start,
+                    byte_len: 1,
+                })
+                .collect(),
             screened: true,
             threes: 3,
             twos: 4,

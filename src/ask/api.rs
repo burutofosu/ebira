@@ -288,17 +288,27 @@ impl Client {
     }
 
     /// One request whose reply is JSON following `request.schema`, tried again on overload and
-    /// network errors.
+    /// network errors. A reply of another shape is not used: a service that does not enforce
+    /// the schema can send `{}`, which would read as an empty answer.
     pub fn send(&self, request: &Request) -> Result<Reply, ApiError> {
-        if self.endpoint.dialect == Dialect::ChatCompletions {
-            return self.send_chat(request);
+        let reply = if self.endpoint.dialect == Dialect::ChatCompletions {
+            self.send_chat(request)?
+        } else {
+            let fallbacks = takes_default_fallback(request.model);
+            let body = request_body(request, fallbacks);
+            let beta = fallbacks.then_some(FALLBACK_BETA);
+            let response =
+                self.with_retries(|| self.http("POST", "/v1/messages", Some(body.as_str()), beta))?;
+            read_reply(&response.body)?
+        };
+        match check_shape(&reply.output, request.schema, "reply") {
+            Ok(()) => Ok(reply),
+            Err(reason) => Err(ApiError::Unusable {
+                model: reply.model,
+                usage: reply.usage,
+                reason: format!("it does not have the shape asked for: {reason}"),
+            }),
         }
-        let fallbacks = takes_default_fallback(request.model);
-        let body = request_body(request, fallbacks);
-        let beta = fallbacks.then_some(FALLBACK_BETA);
-        let response =
-            self.with_retries(|| self.http("POST", "/v1/messages", Some(body.as_str()), beta))?;
-        read_reply(&response.body)
     }
 
     /// A Chat Completions request. Services differ in what they take: one that refuses a part
@@ -637,6 +647,42 @@ fn read_usage(usage: Option<&Value>) -> Usage {
         cache_read: usage.u64_at("cache_read_input_tokens"),
         cache_write: usage.u64_at("cache_creation_input_tokens"),
     }
+}
+
+/// Whether `value` has the shape `schema` asks for: the type of every value, and the properties
+/// an object requires, which is what the steps of `ask` rely on. A value outside an `enum` is
+/// let through: the steps already leave out a score or a kind they do not know.
+fn check_shape(value: &Value, schema: &Value, at: &str) -> Result<(), String> {
+    let expected = schema.str_at("type");
+    let fits = match expected {
+        "object" => matches!(value, Value::Object(_)),
+        "array" => matches!(value, Value::Array(_)),
+        "string" => matches!(value, Value::String(_)),
+        "integer" | "number" => matches!(value, Value::Number(_)),
+        "boolean" => matches!(value, Value::Bool(_)),
+        _ => true,
+    };
+    if !fits {
+        return Err(format!("{at} is not of type {expected}"));
+    }
+    for name in schema.array_at("required").iter().filter_map(Value::as_str) {
+        if value.get(name).is_none() {
+            return Err(format!("{at} has no {name}"));
+        }
+    }
+    if let Some(Value::Object(properties)) = schema.get("properties") {
+        for (name, property) in properties {
+            if let Some(inner) = value.get(name) {
+                check_shape(inner, property, &format!("{at}.{name}"))?;
+            }
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        for (index, item) in value.as_array().iter().enumerate() {
+            check_shape(item, items, &format!("{at}.{index}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// What a Chat Completions request holds, as far as services differ in what they take.
@@ -1164,5 +1210,41 @@ mod tests {
             read_chat_reply(r#"{"model":"m","choices":[]}"#),
             Err(ApiError::Unusable { .. })
         ));
+    }
+
+    #[test]
+    fn checks_the_shape_of_a_reply() {
+        let answer = super::super::prompts::answer_schema();
+        let full = value::parse(
+            r#"{"answer":"a","findings":[{"evidence":"E1","kind":"decision","quote":"q","note":""}],
+                "timeline":[],"gaps":[],"more_terms":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(check_shape(&full, &answer, "reply"), Ok(()));
+        let empty = value::parse("{}").unwrap();
+        assert_eq!(
+            check_shape(&empty, &answer, "reply"),
+            Err("reply has no answer".to_string())
+        );
+        let listed = value::parse(
+            r#"{"answer":["a"],"findings":[],"timeline":[],"gaps":[],"more_terms":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            check_shape(&listed, &answer, "reply"),
+            Err("reply.answer is not of type string".to_string())
+        );
+        let screen = super::super::prompts::screen_schema();
+        let unscored = value::parse(r#"{"scores":[{"id":"C1","score":2},{"id":"C2"}]}"#).unwrap();
+        assert_eq!(
+            check_shape(&unscored, &screen, "reply"),
+            Err("reply.scores.1 has no score".to_string())
+        );
+        let unknown = value::parse(r#"{"scores":[{"id":"C1","score":7}]}"#).unwrap();
+        assert_eq!(
+            check_shape(&unknown, &screen, "reply"),
+            Ok(()),
+            "a score outside the enum is left to the step"
+        );
     }
 }

@@ -1742,6 +1742,17 @@ fn hits_json(hits: &[SearchHit], offset_minutes: i64) -> String {
     json::array(hits.iter().map(|hit| hit_json(hit, offset_minutes)))
 }
 
+/// The bytes a record and its neighbours take in their log, as the corpus placed them.
+struct Span {
+    byte_start: u64,
+    byte_len: u64,
+    records: u64,
+    /// The line of the first record, when the corpus holds the one named.
+    line: Option<u64>,
+    /// The corpus's record at the bytes named.
+    anchor: Option<EventHeader>,
+}
+
 fn neighbouring_span(
     root: &Path,
     source_id: &str,
@@ -1749,10 +1760,11 @@ fn neighbouring_span(
     byte_len: u64,
     before: usize,
     after: usize,
-) -> io::Result<(u64, u64, u64, Option<u64>)> {
+) -> io::Result<Span> {
     let mut preceding: std::collections::VecDeque<(u64, u64, u64)> = Default::default();
     let mut anchor_seen = false;
     let mut anchor_line = None;
+    let mut anchor = None;
     let mut following = Vec::new();
     let mut included = 0u64;
     for path in corpus::source_files(root, source_id)? {
@@ -1779,6 +1791,7 @@ fn neighbouring_span(
             } else if header.byte_start == byte_start {
                 anchor_seen = true;
                 anchor_line = Some(header.line);
+                anchor = Some(header);
             } else if before > 0 {
                 if preceding.len() == before {
                     preceding.pop_front();
@@ -1802,7 +1815,13 @@ fn neighbouring_span(
             end = end.max(position.saturating_add(*length));
         }
     }
-    Ok((start, end.saturating_sub(start), included, line))
+    Ok(Span {
+        byte_start: start,
+        byte_len: end.saturating_sub(start),
+        records: included,
+        line,
+        anchor,
+    })
 }
 
 pub fn context(
@@ -1828,10 +1847,27 @@ pub fn context(
             format!("{}: the log of {} cannot be read", entry.path, source_id),
         ));
     }
-    let (byte_start, byte_len, neighbours, line) = if before == 0 && after == 0 {
-        (byte_start, byte_len, 1, None)
+    // A log that grew since the sync is taken to have been appended to; the record the reference
+    // names is checked against the corpus all the same, since a log rewritten in place where it
+    // was read holds another record there now.
+    let grew = matches!(freshness, corpus::Freshness::Behind(_));
+    let record_start = byte_start;
+    let (byte_start, byte_len, neighbours, line, anchor) = if before == 0 && after == 0 {
+        let anchor = if grew {
+            neighbouring_span(root, source_id, byte_start, byte_len, 0, 0)?.anchor
+        } else {
+            None
+        };
+        (byte_start, byte_len, 1, None, anchor)
     } else {
-        neighbouring_span(root, source_id, byte_start, byte_len, before, after)?
+        let span = neighbouring_span(root, source_id, byte_start, byte_len, before, after)?;
+        (
+            span.byte_start,
+            span.byte_len,
+            span.records,
+            span.line,
+            span.anchor,
+        )
     };
     let observed = match &file {
         Some(file) => file.metadata().ok(),
@@ -1851,6 +1887,16 @@ pub fn context(
         Some(file) => Some(read_range(file, byte_start, byte_len, observed_size)?),
         None => None,
     };
+    let rewritten = match (&read, &anchor) {
+        (Some(bytes), Some(anchor)) if grew => {
+            let offset = (record_start - byte_start) as usize;
+            bytes
+                .get(offset..offset.saturating_add(anchor.byte_len as usize))
+                .is_some_and(|record| !corpus::still_projected(anchor, record))
+        }
+        _ => false,
+    };
+    let read = read.filter(|_| !rewritten);
     if text_format {
         let mut text = format!(
             "# ebira context: {source_id} @{byte_start}+{byte_len}\n# source_freshness: {}\n",
@@ -1858,12 +1904,29 @@ pub fn context(
         );
         match &read {
             Some(bytes) => text.push_str(&crate::context_text::render(root, source_id, byte_start, bytes)?),
+            None if rewritten => text.push_str(&format!(
+                "# source_changed_since_projection: the log was rewritten where this record was; run `ebira sync --rebuild-source {}` and find a new source_ref\n",
+                entry.path
+            )),
             None => text.push_str("# source_changed_since_projection: sync and find a new source_ref before reading this record\n"),
         }
         return output::write(&text);
     }
     let next_actions = if read.is_some() {
         Vec::new()
+    } else if rewritten {
+        // A sync checks only the records at the ends of a log that grew: this one has to be read
+        // again whole.
+        vec![json::Object::new()
+            .name("action", "sync")
+            .raw(
+                "request",
+                &json::Object::new()
+                    .name("corpus", &root.to_string_lossy())
+                    .raw("rebuild_source", &json::strings([entry.path.as_str()]))
+                    .finish(),
+            )
+            .finish()]
     } else {
         vec![json::Object::new()
             .name("action", "sync")

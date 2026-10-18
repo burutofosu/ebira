@@ -528,6 +528,32 @@ fn settings_in_the_environment_choose_the_service_without_flags() {
 }
 
 #[test]
+fn a_reply_without_the_fields_asked_for_is_not_an_answer() {
+    let (logs, corpus) = synced("chat-empty");
+    let service = ChatService::start(|body| {
+        if body.contains(SCREEN) {
+            (200, chat("cheap-model", SCREENED))
+        } else {
+            (200, chat("cheap-model", "{}"))
+        }
+    });
+    let output = ask_compatible(&logs, &corpus, &service.url);
+    let requests = service.finish();
+    assert!(!requests.is_empty());
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not have the shape asked for: reply has no answer"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\"answered\""));
+}
+
+#[test]
 fn a_service_without_strict_schemas_is_asked_for_a_json_object() {
     let (logs, corpus) = synced("chat-object");
     let service = ChatService::start(|body| {

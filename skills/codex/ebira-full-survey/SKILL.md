@@ -95,7 +95,8 @@ ebira context --source-id <id> --byte-start <n> --byte-len <n> --before 5 --afte
 The text view omits reasoning and metadata but keeps original source references.
 Use `--format json` when you need the complete raw record.
 
-If it reports `source_changed_since_projection`, run `ebira sync` and search again.
+If it reports `source_changed_since_projection`, run the sync it names (`ebira sync`,
+or `ebira sync --rebuild-source <path>` for a log rewritten in place) and search again.
 
 ## A history from start to now
 

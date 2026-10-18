@@ -91,7 +91,9 @@ the original rather than its shortened corpus preview. It needs complete indexed
 records. Omit `--format text` (or use `--format json`) for the original raw JSONL,
 including metadata or an arbitrary byte range.
 
-If the log has been replaced or rewritten, sync and search again.
+If the log has been replaced or rewritten, sync and search again. A log rewritten
+in place where the record was is named in the result, to read again with
+`ebira sync --rebuild-source <path>`.
 Results are JSON by default. Multiple queries work with `said`, `search`, and
 `history`; `--raw` takes one query.
 

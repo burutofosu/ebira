@@ -109,8 +109,8 @@ they match hundreds of messages (する, いい, これ, 作業).";
 
 /// Judges whether a later message changes an earlier decision.
 pub const REVERSAL_SCREEN_SYSTEM: &str = "\
-A person stated something on a date (the item). Below are messages the person wrote on or after that date that \
-mention the same subject. For every message, judge by meaning whether it changes the item:
+A person stated something at a time (the item). Below are messages the person wrote at or after that time \
+that mention the same subject. For every message, judge by meaning whether it changes the item:
 3 = cancels, reverses, contradicts or replaces it (\"I never said that\", \"from now on\", a new rule that makes it void)
 2 = narrows or widens it, adds or removes a condition, or says it no longer holds in some case
 1 = mentions the same subject without changing it (repeats it, applies it, or talks about something near it)

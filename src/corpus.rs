@@ -367,10 +367,14 @@ pub fn build_with_preview(
                         && !active_files.is_empty()
                 })
                 .is_some();
+        // A log that grew is read on from where the corpus stopped, unless the records it read
+        // at either end are no longer there: then the log was rewritten in place, and is read
+        // again whole.
         let appendable = match old.filter(|_| !reusable && append_candidate) {
             Some(old) => {
                 source_projection_complete(old, &active_files)?
                     && committed_end_is_record_boundary(&entry.path, old.committed_byte_end)?
+                    && same_records(old, Some(&active_files), Path::new(&entry.path))
             }
             None => false,
         };
@@ -2966,15 +2970,21 @@ fn same_records(old: &SourceEntry, segments: Option<&Vec<PathBuf>>, path: &Path)
     };
     !records.is_empty()
         && records.iter().all(|record| {
-            record_at(&mut log, record.byte_start, record.byte_len).is_some_and(|line| {
-                record.kind == EventKind::Invalid.as_str()
-                    || parse_record(trim_newline(&line), record.byte_start)
-                        .ok()
-                        .and_then(|fields| record_meta(&fields).timestamp)
-                        .unwrap_or_default()
-                        == record.timestamp
-            })
+            record_at(&mut log, record.byte_start, record.byte_len)
+                .is_some_and(|line| still_projected(record, &line))
         })
+}
+
+/// Whether `line`, the bytes a log holds where the corpus read `header`'s record, is still that
+/// record: one written at the same time (a record that never parsed has no time to compare). Logs
+/// are only appended to; this tells one rewritten in place.
+pub fn still_projected(header: &EventHeader, line: &[u8]) -> bool {
+    header.kind == EventKind::Invalid.as_str()
+        || parse_record(trim_newline(line), header.byte_start)
+            .ok()
+            .and_then(|fields| record_meta(&fields).timestamp)
+            .unwrap_or_default()
+            == header.timestamp
 }
 
 /// The headers of the first and last records the corpus holds for `old`, in log order.
