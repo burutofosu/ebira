@@ -631,6 +631,9 @@ fn claude_text_sender(text: &str, has_image: bool, typed: &'static str) -> (Send
     if is_compaction_summary_text(text) {
         return (Sender::Summary, "compact_summary");
     }
+    if is_interrupt_marker(text) {
+        return (Sender::System, "interrupted");
+    }
     if starts_with_tag(text, &["task-notification"]) {
         return (Sender::System, "notification");
     }
@@ -773,6 +776,14 @@ fn codex_text_sender(text: &str, attached: bool) -> (Sender, &'static str) {
         return (Sender::Human, "question_reply");
     }
     (Sender::Human, "typed")
+}
+
+/// The message Claude Code writes when the person stops a reply or a tool call,
+/// `[Request interrupted by user]` or `[Request interrupted by user for tool use]`: a mark
+/// that they stopped the agent, in the program's words, not theirs.
+fn is_interrupt_marker(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("[Request interrupted by user") && text.ends_with(']') && !text.contains('\n')
 }
 
 /// Claude Code opens every compaction summary with this sentence. It also marks summaries
@@ -2191,6 +2202,23 @@ mod tests {
         let (sender, via, ..) =
             classified(ClaudeMain, &user("<command-name>/compact</command-name>"));
         assert_eq!((sender, via.as_str()), (Sender::Human, "slash_command"));
+        // Claude Code marks the person stopping the agent, in words of its own.
+        for marker in [
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
+        ] {
+            let (sender, via, ..) = classified(ClaudeMain, &user(marker));
+            assert_eq!((sender, via.as_str()), (Sender::System, "interrupted"));
+        }
+        let (sender, ..) = classified(
+            ClaudeMain,
+            &user("[Request interrupted by user] is what it said"),
+        );
+        assert_eq!(
+            sender,
+            Sender::Human,
+            "words around the mark are the person's"
+        );
         let (sender, via, ..) = classified(ClaudeSubagent, &user("Survey the code base"));
         assert_eq!((sender, via.as_str()), (Sender::Agent, "subagent_prompt"));
 
@@ -2491,7 +2519,7 @@ mod tests {
     /// how representative records are classified and projected changes with any change to
     /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
     /// here: the next sync then rebuilds every corpus made under the old rules.
-    const RULES_FINGERPRINT: (&str, u64, &str) = ("8", 6, "0f5d319f955644e8");
+    const RULES_FINGERPRINT: (&str, u64, &str) = ("8", 7, "97c2bc0785f3a307");
 
     #[test]
     fn reading_rules_are_versioned() {
@@ -2720,6 +2748,18 @@ mod tests {
                     ("/type", "user"),
                     ("/message/role", "user"),
                     ("/message/content/0/text", "a nested type comes first"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/message/role", "user"),
+                    ("/message/content/0/type", "text"),
+                    (
+                        "/message/content/0/text",
+                        "[Request interrupted by user for tool use]",
+                    ),
                 ],
             ),
             (

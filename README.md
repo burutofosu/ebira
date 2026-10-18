@@ -133,8 +133,9 @@ later. A reply cut at `max_tokens` is retried once with twice the output allowan
 up to 64,000 tokens, using the same model and evidence. Both billed attempts are
 recorded, including failures; an invalid response or refusal is not retried by
 this output-limit handling. `ebira ask-usage` sums what has been spent, from a ledger in the data
-directory. `--no-api` with `--term` searches only and lists the records an
-answer would read.
+directory, per question and apart from questions (lines written before questions
+were recorded, or by another program). `--no-api` with `--term` searches only and
+lists the records an answer would read.
 
 ## Logs in other locations
 

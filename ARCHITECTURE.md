@@ -186,7 +186,10 @@ own markers:
   is a tool result, `isMeta` is injected, subagent transcripts carry the
   parent's prompts. The remaining text, with `<system-reminder>` blocks
   removed, is the person's unless it opens with a tag the harness writes
-  (`task-notification`, `agent-message`, `local-command-stdout`, and similar).
+  (`task-notification`, `agent-message`, `local-command-stdout`, and similar)
+  or is the mark Claude Code writes when the person stops the agent
+  (`[Request interrupted by user]`, also `for tool use`), which is system text
+  (`via: interrupted`).
   `queued_command` attachments are the person's prompts typed while the agent
   was working, unless they are notifications.
 - Structured answers to Claude Code's `AskUserQuestion` and Codex's

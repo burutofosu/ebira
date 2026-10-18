@@ -122,6 +122,12 @@ impl Spending {
         (self.questions > 0).then(|| self.question_usd / self.questions as f64)
     }
 
+    /// What the ledger holds outside any question: lines written before questions were
+    /// recorded, or by another program.
+    pub fn without_question(&self) -> f64 {
+        (self.total - self.question_usd).max(0.0)
+    }
+
     pub fn json(&self, ledger: &Path, budget: Option<f64>) -> String {
         let amounts = |values: &BTreeMap<String, f64>, key: &str| {
             json::array(values.iter().map(|(name, usd)| {
@@ -142,6 +148,7 @@ impl Spending {
                 "usd_per_question",
                 &json::or_null(self.per_question().map(usd_json)),
             )
+            .raw("without_question_usd", &usd_json(self.without_question()))
             .raw("by_model", &amounts(&self.by_model, "model"))
             .raw("by_step", &amounts(&self.by_step, "step"))
             .number("unpriced_calls", self.unpriced as u64)
@@ -164,6 +171,13 @@ impl Spending {
             out.push_str(&format!(
                 "Questions: {} (${average:.3} each, searching and checking included)\n",
                 self.questions
+            ));
+        }
+        let outside = self.without_question();
+        if outside >= 0.0005 {
+            out.push_str(&format!(
+                "Not tied to a question: ${outside:.3} (written before questions were recorded, \
+                 or by another program)\n"
             ));
         }
         if !self.by_model.is_empty() {
@@ -257,9 +271,12 @@ mod tests {
         let text = spending.text(&path, Some(200.0));
         assert!(text.contains("Total: $1.300"), "{text}");
         assert!(text.contains("Questions: 2 ($0.150 each"), "{text}");
+        // The total is the questions' and the line from before them.
+        assert!(text.contains("Not tied to a question: $1.000"), "{text}");
         assert!(text.contains("$198.70"), "{text}");
         let json = spending.json(&path, None);
         assert!(json.contains("\"questions\":2"), "{json}");
+        assert!(json.contains("\"without_question_usd\":1.0000"), "{json}");
         assert!(json.contains("\"budget_usd\":null"), "{json}");
         let _ = fs::remove_dir_all(&directory);
     }
