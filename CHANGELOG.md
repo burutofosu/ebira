@@ -18,11 +18,11 @@ Found by the evaluation in `evals/`.
   told that they were not judged relevant; the result is
   `disposition: "nothing_relevant"`. It used to return `no_records` with no
   answer, though the record beside one found could bear on the question.
-- `ask` results have `not_settled`: when the records found do not settle the
-  question, what the result says first, with the strings searched, the
-  directory and dates searched, and how many records they found; `null`
-  otherwise. When no record holds any string, the text says so instead of
-  "No record holds the search strings".
+- `ask` results have `not_settled`, `null` unless the records found do not
+  settle the question: then it says so, with the strings searched, the
+  directory and dates searched, and how many records they found. The text
+  format puts it before the answer, and in place of "No record holds the search
+  strings" when no record holds any.
 
 ## 0.2.1 - 2026-10-18
 

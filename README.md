@@ -129,8 +129,8 @@ Japanese is written both ways, and the search matches literally. When the screen
 judges none of the records found relevant, the result says first that they do not
 settle the question, with the strings searched and how many records they found
 (`not_settled`), and the answer reads the closest of them with the records around
-them (`disposition: "nothing_relevant"`). When no record holds a search string, it
-says so (`no_records`) without calling the API again.
+them (`disposition: "nothing_relevant"`). When no record holds any search string,
+it says so (`no_records`) without calling the API again.
 
 Every quote is checked against the records before it is shown, and each finding
 cites its `source_ref`. A verified quote confirms the quoted words, not the
