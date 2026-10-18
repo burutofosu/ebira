@@ -69,7 +69,7 @@ Claude Code sets `CLAUDE_CODE_SESSION_ID` for the running session
 | `sender` | Meaning |
 | --- | --- |
 | `human` | The person: typed or pasted, typed while the agent worked, slash commands, answers to a question |
-| `agent` | Another agent in the user role: a subagent prompt, a Codex child or `codex exec` thread, a relayed agent message |
+| `agent` | Another agent in the user role: a subagent prompt, a Codex child or `codex exec` thread, a relayed agent message, the brief a session another one started opens with |
 | `system` | Tool results, notifications, injected context |
 | `summary` | A compaction summary |
 | `assistant` | The recording agent's replies and tool calls |

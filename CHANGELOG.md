@@ -4,6 +4,17 @@ The notable changes in each release of Ebira. Before 1.0, a minor version may
 change what a command writes; a change to the corpus's storage format or reading
 rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
+## Unreleased
+
+### Fixed
+
+- Turns Claude Desktop starts itself (`turnOrigin: "sdk"`) were read as the
+  person's messages: the brief a session another session started opens with,
+  and the notices the app writes into a session, such as `<side-sessions-event>`.
+  The brief is now an agent's (`via: session_brief`) and a notice is system text
+  (`via: notification`). The reading rules are now version 8, so the next sync
+  rebuilds the corpus, keeping its source ids.
+
 ## 0.3.0 - 2026-10-19
 
 Found by the evaluation in `evals/`.

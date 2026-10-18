@@ -189,7 +189,11 @@ own markers:
   (`task-notification`, `agent-message`, `local-command-stdout`, and similar)
   or is the mark Claude Code writes when the person stops the agent
   (`[Request interrupted by user]`, also `for tool use`), which is system text
-  (`via: interrupted`).
+  (`via: interrupted`). Claude Desktop names where each turn came from
+  (`turnOrigin`). A turn the app itself started (`sdk`) is not the person's: a
+  notice it writes in a tag of its own, such as `<side-sessions-event>`, is
+  system text (`via: notification`), and the brief another session wrote for a
+  session it started is an agent's (`via: session_brief`).
   `queued_command` attachments are the person's prompts typed while the agent
   was working, unless they are notifications.
 - Structured answers to Claude Code's `AskUserQuestion` and Codex's

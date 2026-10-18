@@ -573,13 +573,25 @@ fn claude_sender<F: FieldView>(
             if origin == SourceOrigin::ClaudeSubagent || flag_at(fields, "/isSidechain") {
                 return (Sender::Agent, "subagent_prompt");
             }
-            let (sender, via) = claude_text_sender(
-                &human_text(fields),
-                has_content_item_type(fields, "image"),
-                "typed",
-            );
+            let text = human_text(fields);
+            let (sender, via) =
+                claude_text_sender(&text, has_content_item_type(fields, "image"), "typed");
             if sender == Sender::Summary {
                 meta.event_kind = EventKind::Summary;
+            }
+            // Claude Desktop names where each turn came from: the person (`human`), or the app
+            // itself (`sdk`). The app writes its notices in a tag of their own, such as
+            // `<side-sessions-event>`, and opens a session another session started with the
+            // brief that session wrote. Neither is the person's.
+            if sender == Sender::Human
+                && field_at(fields, "/turnOrigin") == Some("sdk")
+                && field_at(fields, "/entrypoint") == Some("claude-desktop")
+            {
+                return if opens_with_a_tag(text.trim_start()) {
+                    (Sender::System, "notification")
+                } else {
+                    (Sender::Agent, "session_brief")
+                };
             }
             (sender, via)
         }
@@ -795,6 +807,21 @@ fn is_compaction_summary_text(text: &str) -> bool {
 
 /// Codex numbers the turns of a conversation imported from another agent this way.
 pub const IMPORTED_TURN_PREFIX: &str = "external-import-turn-";
+
+/// Whether the text opens with a tag of any name, such as `<side-sessions-event>`.
+fn opens_with_a_tag(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    let name = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    name > 0
+        && rest[name..]
+            .chars()
+            .next()
+            .is_some_and(|next| matches!(next, '>' | ' ' | '\n' | '\r' | '\t' | '/'))
+}
 
 fn starts_with_tag(text: &str, names: &[&str]) -> bool {
     let Some(rest) = text.strip_prefix('<') else {
@@ -2169,6 +2196,62 @@ mod tests {
     }
 
     #[test]
+    fn the_brief_a_desktop_session_starts_with_is_an_agents() {
+        use super::{Sender, SourceOrigin::ClaudeMain};
+        let turn = |origin: &'static str, entrypoint: &'static str, text: &'static str| {
+            vec![
+                ("/type", "user"),
+                ("/entrypoint", entrypoint),
+                ("/turnOrigin", origin),
+                ("/message/role", "user"),
+                ("/message/content", text),
+            ]
+        };
+        let brief = "Background (from the session that started this one):\nThe person maintains Ebira.\n\nTask:\nFix it.";
+        let (sender, via, kind, _) = classified(ClaudeMain, &turn("sdk", "claude-desktop", brief));
+        assert_eq!(
+            (sender, via.as_str(), kind),
+            (Sender::Agent, "session_brief", EventKind::User)
+        );
+        let (sender, via, _, _) =
+            classified(ClaudeMain, &turn("human", "claude-desktop", "直して"));
+        assert_eq!((sender, via.as_str()), (Sender::Human, "typed"));
+        let (sender, _, _, _) = classified(
+            ClaudeMain,
+            &turn(
+                "sdk",
+                "claude-desktop",
+                "<task-notification>done</task-notification>",
+            ),
+        );
+        assert_eq!(sender, Sender::System, "a notice stays the app's");
+        let (sender, via, _, _) = classified(
+            ClaudeMain,
+            &turn(
+                "sdk",
+                "claude-desktop",
+                "<side-sessions-event>None of the sessions you started is working now.</side-sessions-event>",
+            ),
+        );
+        assert_eq!(
+            (sender, via.as_str()),
+            (Sender::System, "notification"),
+            "a notice in a tag the app writes"
+        );
+        let (sender, _, _, _) = classified(
+            ClaudeMain,
+            &turn("human", "claude-desktop", "<p>tag</p> 見て"),
+        );
+        assert_eq!(sender, Sender::Human, "the person may open with a tag too");
+        let (sender, _, _, _) = classified(ClaudeMain, &turn("sdk", "cli", "fix it"));
+        assert_eq!(
+            sender,
+            Sender::Human,
+            "only Claude Desktop is known to open a session with another's brief"
+        );
+    }
+
+    #[test]
     fn claude_records_name_who_sent_them() {
         use super::{Sender, SourceOrigin::*};
         let user = |text: &'static str| {
@@ -2519,7 +2602,7 @@ mod tests {
     /// how representative records are classified and projected changes with any change to
     /// those rules. When it does, increase `corpus::RULES_VERSION` and record the new pair
     /// here: the next sync then rebuilds every corpus made under the old rules.
-    const RULES_FINGERPRINT: (&str, u64, &str) = ("8", 7, "97c2bc0785f3a307");
+    const RULES_FINGERPRINT: (&str, u64, &str) = ("8", 8, "9d482272465d8055");
 
     #[test]
     fn reading_rules_are_versioned() {
@@ -2532,6 +2615,29 @@ mod tests {
                     ("/type", "user"),
                     ("/message/role", "user"),
                     ("/message/content", "please fix it"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/entrypoint", "claude-desktop"),
+                    ("/turnOrigin", "sdk"),
+                    ("/message/role", "user"),
+                    ("/message/content", "Background (from the session that started this one):"),
+                ],
+            ),
+            (
+                ClaudeMain,
+                vec![
+                    ("/type", "user"),
+                    ("/entrypoint", "claude-desktop"),
+                    ("/turnOrigin", "sdk"),
+                    ("/message/role", "user"),
+                    (
+                        "/message/content",
+                        "<side-sessions-event>None of the sessions you started is working now.",
+                    ),
                 ],
             ),
             (
