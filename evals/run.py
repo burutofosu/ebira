@@ -497,9 +497,11 @@ def ask_all(out, ebira, cases, quick, jobs, max_usd):
 def answer_text(answer):
     if not answer:
         return "(no answer: ask failed)"
+    # What ask says first when the records found do not settle the question.
+    lead = [answer["not_settled"], ""] if answer.get("not_settled") else []
     if answer.get("disposition") == "no_records":
-        return "(no answer: ask found no records to answer from)"
-    lines = [answer.get("answer") or "(empty)"]
+        return lead[0] if lead else "(no answer: ask found no records to answer from)"
+    lines = lead + [answer.get("answer") or "(empty)"]
     findings = answer.get("findings") or []
     if findings:
         lines.append("\nFindings:")

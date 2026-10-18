@@ -180,6 +180,68 @@ fn without_the_api_it_lists_the_records_an_answer_would_read() {
 }
 
 #[test]
+fn finds_japanese_written_with_or_without_a_space_after_latin_letters() {
+    let root = std::env::temp_dir().join(format!("ebira-ask-spacing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join(".claude").join("projects").join("C--work-ledger");
+    std::fs::create_dir_all(&project).expect("create claude directories");
+    std::fs::write(
+        project.join("s-ledger.jsonl"),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"CSV 取り込み作って。日付は YYYY/MM/DD で"},"sessionId":"s-ledger","timestamp":"2026-09-04T00:10:00Z","cwd":"C:/work/ledger"}"#, "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"CSVの取り込みを実装します。"}]},"sessionId":"s-ledger","timestamp":"2026-09-04T00:12:00Z","cwd":"C:/work/ledger"}"#, "\n",
+        ),
+    )
+    .expect("write the session");
+    let corpus = root.join("corpus");
+    let corpus = corpus.to_str().expect("utf-8 path");
+    let run = |args: &[&str]| {
+        let output = ebira(&root).args(args).output().expect("ebira runs");
+        assert!(
+            output.status.success(),
+            "ebira {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("ebira writes UTF-8")
+    };
+    let logs = root.join(".claude").join("projects");
+    run(&[
+        "sync",
+        "--source",
+        logs.to_str().expect("utf-8 path"),
+        "--corpus",
+        corpus,
+    ]);
+    let text = run(&[
+        "ask",
+        "CSV の取り込みで決めたことは？",
+        "--corpus",
+        corpus,
+        "--term",
+        "csv取り込み",
+        "--term",
+        "CSV の取り込み",
+        "--no-api",
+        "--format",
+        "text",
+    ]);
+    assert!(
+        text.contains("▶ person 2026-09-04 00:10: CSV 取り込み作って。"),
+        "csv取り込み finds CSV 取り込み: {text}"
+    );
+    assert!(
+        text.contains("▶ agent 2026-09-04 00:12: CSVの取り込みを実装します。"),
+        "CSV の取り込み finds CSVの取り込み: {text}"
+    );
+    assert!(
+        text.contains("Search strings: csv取り込み, csv 取り込み, CSV の取り込み, CSVの取り込み\n"),
+        "each string is followed by its other spacing, in the same pass: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn leaves_out_copies_imported_into_another_thread() {
     // A Codex thread that imported the Claude conversation holds copies of its records, stamped
     // at the import two days later; the originals carry the real times.

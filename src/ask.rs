@@ -3,7 +3,10 @@
 //! Claude models choose literal search strings, screen what Ebira finds, and read the records
 //! around the best of it; a draft answer feeds a second round of searching and a check, for each
 //! decision it reports, of the person's later messages that may have changed it. Every quote in
-//! the answer is checked against the records it was given before it is shown.
+//! the answer is checked against the records it was given before it is shown. Each string is
+//! also searched with a space and with none between Latin letters and Japanese; when the screen
+//! judges nothing found relevant, the answer reads the closest records, and the result says first
+//! that they do not settle the question.
 //!
 //! The question and the text of the records read (not images) go to the API the person chose
 //! (the Claude API unless another is named, by a flag or by `ebira ask-setup`) under their own
@@ -112,6 +115,8 @@ const REVERSAL_TERMS: usize = 4;
 const REVERSAL_PER_TERM: usize = 40;
 const MAX_LATER: usize = 12;
 const SCREEN_CHUNK: usize = 40;
+/// How many of the records found the answer reads when the screen judged none relevant.
+const CLOSEST: usize = 8;
 const WORKERS: usize = 4;
 const RECENT_SESSIONS: usize = 4;
 const RECENT_MESSAGES: usize = 8;
@@ -161,6 +166,9 @@ struct Pool {
     /// The relevant records with their score (the screen's 2 or 3; 0 without the API), in the
     /// order found.
     relevant: Vec<(Hit, u64)>,
+    /// The records screened and not judged relevant, with the screen's 1 or 0 (1 for one it
+    /// gave no score), in the order found.
+    near: Vec<(Hit, u64)>,
     threes: usize,
     twos: usize,
     screened: bool,
@@ -170,14 +178,30 @@ struct Pool {
 impl Pool {
     /// The best `keep` records: the higher score first, then in the order found.
     fn best(&self, keep: usize) -> Vec<Hit> {
-        let mut order: Vec<usize> = (0..self.relevant.len()).collect();
-        order.sort_by_key(|&index| (std::cmp::Reverse(self.relevant[index].1), index));
-        order
-            .into_iter()
-            .take(keep)
-            .map(|index| self.relevant[index].0.clone())
-            .collect()
+        highest(&self.relevant, keep)
     }
+
+    /// When the screen judged none relevant, the `count` closest: those that share words with
+    /// the question before those it judged unrelated, then in the order found.
+    fn closest(&self, count: usize) -> Vec<Hit> {
+        highest(&self.near, count)
+    }
+
+    /// Whether the screen judged none of the records it screened relevant.
+    fn nothing_relevant(&self) -> bool {
+        self.screened && self.threes + self.twos == 0
+    }
+}
+
+/// The first `count` of the records by score, the higher first, then in their order.
+fn highest(scored: &[(Hit, u64)], count: usize) -> Vec<Hit> {
+    let mut order: Vec<usize> = (0..scored.len()).collect();
+    order.sort_by_key(|&index| (std::cmp::Reverse(scored[index].1), index));
+    order
+        .into_iter()
+        .take(count)
+        .map(|index| scored[index].0.clone())
+        .collect()
 }
 
 /// What happened on the way that the result should say: an inferred period, steps that failed,
@@ -386,10 +410,15 @@ fn ask(
         &mut notes,
     )?;
 
-    // 4. Read the records around the best ones.
-    let mut evidence = read_evidence(
+    // 4. Read the records around the best ones, or around the closest when the screen judged
+    // none relevant.
+    let mut evidence = read_pool(
         corpus,
-        with_recent(corpus, &filters, pool.best(options.keep), &mut notes),
+        &filters,
+        &pool,
+        options.keep,
+        Vec::new(),
+        &mut notes,
     );
 
     // 5. Answer.
@@ -398,7 +427,7 @@ fn ask(
             corpus,
             options,
             &evidence,
-            &Summary::of(&pool, evidence.len(), &notes),
+            &Summary::of(&pool, evidence.len(), &notes, &filters),
         ));
     };
     if evidence.is_empty() {
@@ -408,7 +437,7 @@ fn ask(
             options,
             None,
             &evidence,
-            &Summary::of(&pool, 0, &notes),
+            &Summary::of(&pool, 0, &notes, &filters),
             &spent,
         ));
     }
@@ -417,17 +446,17 @@ fn ask(
         .as_deref()
         .filter(|_| options.second_round || options.reversal_check)
         .unwrap_or(&options.answer_model);
-    let mut answer = answer_with(&caller, options, corpus, &evidence, draft_model)?;
+    let mut answer = answer_with(&caller, options, corpus, &evidence, &pool, draft_model)?;
     let mut records_changed = false;
 
     // 6. A second round: search the strings the answer suggests.
     if options.second_round {
         let more: Vec<String> = clean_terms(strings(&answer, "more_terms").into_iter())
             .into_iter()
-            .filter(|term| !pool.terms.contains(term))
+            .filter(|term| !holds_term(&pool.terms, term))
             .take(SECOND_ROUND_TERMS)
             .collect();
-        let before = pool.relevant.len();
+        let (relevant, near) = (pool.relevant.len(), pool.near.len());
         if !more.is_empty() {
             gather(
                 corpus,
@@ -439,7 +468,9 @@ fn ask(
                 &mut notes,
             )?;
         }
-        records_changed = pool.relevant.len() > before;
+        // While none is relevant, the closest are chosen again from what the round added.
+        records_changed =
+            pool.relevant.len() > relevant || (pool.nothing_relevant() && pool.near.len() > near);
     }
 
     // 7. For what the answer says was decided, look after its date for messages that change it.
@@ -452,21 +483,25 @@ fn ask(
 
     // 8. The final answer, from the answer model, over the records as they now stand.
     if records_changed {
-        let mut hits = pool.best(options.keep);
-        for found in later {
-            match hits
-                .iter_mut()
-                .find(|hit| hit.source_ref == found.source_ref)
-            {
-                Some(hit) => hit.note = found.note,
-                None => hits.push(found),
-            }
-        }
-        evidence = read_evidence(corpus, with_recent(corpus, &filters, hits, &mut notes));
-        answer = answer_with(&caller, options, corpus, &evidence, &options.answer_model)?;
+        evidence = read_pool(corpus, &filters, &pool, options.keep, later, &mut notes);
+        answer = answer_with(
+            &caller,
+            options,
+            corpus,
+            &evidence,
+            &pool,
+            &options.answer_model,
+        )?;
     } else if draft_model != options.answer_model {
         // The first answer was only a draft from another model.
-        answer = answer_with(&caller, options, corpus, &evidence, &options.answer_model)?;
+        answer = answer_with(
+            &caller,
+            options,
+            corpus,
+            &evidence,
+            &pool,
+            &options.answer_model,
+        )?;
     }
     let spent = caller.spent.lock().unwrap();
     Ok(answer_report(
@@ -474,9 +509,49 @@ fn ask(
         options,
         Some(&answer),
         &evidence,
-        &Summary::of(&pool, evidence.len(), &notes),
+        &Summary::of(&pool, evidence.len(), &notes, &filters),
         &spent,
     ))
+}
+
+/// The records the answer reads, each with the records around it: the best `keep` of the
+/// relevant ones with the recent messages of their sessions, or, when the screen judged none
+/// relevant, the closest (their sessions are not known to bear on the question); and `later`,
+/// the messages a reversal check found, each with what it may change.
+fn read_pool(
+    corpus: &Corpus,
+    filters: &Filters,
+    pool: &Pool,
+    keep: usize,
+    later: Vec<Hit>,
+    notes: &mut Notes,
+) -> Vec<Evidence> {
+    let closest = pool.nothing_relevant();
+    let mut hits = if closest {
+        pool.closest(CLOSEST.min(keep))
+    } else {
+        pool.best(keep)
+    };
+    if closest {
+        progress(&format!(
+            "none of the records screened was judged relevant; reading the {} closest",
+            hits.len()
+        ));
+    }
+    for found in later {
+        match hits
+            .iter_mut()
+            .find(|hit| hit.source_ref == found.source_ref)
+        {
+            Some(hit) => hit.note = found.note,
+            None => hits.push(found),
+        }
+    }
+    if closest {
+        read_evidence(corpus, hits)
+    } else {
+        read_evidence(corpus, with_recent(corpus, filters, hits, notes))
+    }
 }
 
 /// Add a bounded tail from the newest related sessions even when ranking or literal search
@@ -641,7 +716,7 @@ fn hunt_reversals(
     let chosen: Vec<Vec<String>> = claims
         .iter()
         .map(|claim| {
-            reply
+            let strings: Vec<String> = reply
                 .array_at("items")
                 .iter()
                 .find(|item| item.str_at("id") == claim.id)
@@ -656,7 +731,8 @@ fn hunt_reversals(
                 .unwrap_or_default()
                 .into_iter()
                 .take(REVERSAL_TERMS)
-                .collect()
+                .collect();
+            with_spacing_variants(&strings)
         })
         .collect();
 
@@ -665,7 +741,7 @@ fn hunt_reversals(
     // usually follows, and the newest, where the current state is.
     let mut all_terms: Vec<String> = Vec::new();
     for term in chosen.iter().flatten() {
-        if !all_terms.contains(term) {
+        if !holds_term(&all_terms, term) {
             all_terms.push(term.clone());
         }
     }
@@ -695,7 +771,10 @@ fn hunt_reversals(
         let from = start(claim);
         let mut list: Vec<Hit> = Vec::new();
         for term in strings {
-            let Some(index) = all_terms.iter().position(|known| known == term) else {
+            let Some(index) = all_terms
+                .iter()
+                .position(|known| known.eq_ignore_ascii_case(term))
+            else {
                 continue;
             };
             let dated: Vec<&Hit> = found[index]
@@ -856,8 +935,8 @@ fn take_in_turn(lists: Vec<Vec<(Hit, u64)>>, cap: usize) -> Vec<Hit> {
     taken
 }
 
-/// One round: search `terms`, drop records already considered, rank, and screen (with the
-/// API) into the pool.
+/// One round: search `terms` with their spacing variants (those no earlier round searched),
+/// drop records already considered, rank, and screen (with the API) into the pool.
 fn gather(
     corpus: &Corpus,
     caller: Option<&Caller>,
@@ -867,9 +946,16 @@ fn gather(
     pool: &mut Pool,
     notes: &mut Notes,
 ) -> Result<(), String> {
+    let terms: Vec<String> = with_spacing_variants(terms)
+        .into_iter()
+        .filter(|term| !holds_term(&pool.terms, term))
+        .collect();
+    if terms.is_empty() {
+        return Ok(());
+    }
     pool.rounds += 1;
     progress(&format!("searching for {} strings", terms.len()));
-    let searched = search(corpus, terms, filters, options)?;
+    let searched = search(corpus, &terms, filters, options)?;
     pool.terms.extend(terms.iter().cloned());
     pool.counts.extend(searched.counts);
     if pool.synced_through.is_none() {
@@ -889,7 +975,10 @@ fn gather(
                 match score {
                     Some(3) => pool.threes += 1,
                     Some(2) => pool.twos += 1,
-                    _ => continue,
+                    _ => {
+                        pool.near.push((hit, score.map_or(1, |score| score.min(1))));
+                        continue;
+                    }
                 }
                 pool.relevant.push((hit, score.unwrap_or(0)));
             }
@@ -977,6 +1066,7 @@ fn answer_with(
     options: &Options,
     corpus: &Corpus,
     evidence: &[Evidence],
+    pool: &Pool,
     model: &str,
 ) -> Result<Value, String> {
     progress(&format!(
@@ -984,9 +1074,23 @@ fn answer_with(
         evidence.len()
     ));
     let blocks: Vec<&str> = evidence.iter().map(|item| item.block.as_str()).collect();
+    // Records the screen judged unrelated invite an answer about something else.
+    let closest = if pool.nothing_relevant() {
+        format!(
+            "No record the search found ({} in all) was judged relevant to the question. The \
+             records below are the closest, and they may be about something else. If they do \
+             not settle the question, say so plainly at the start of the answer, then what in \
+             them comes closest, if anything does; never answer from a record about something \
+             else.\n\n",
+            pool.found.len()
+        )
+    } else {
+        String::new()
+    };
     let user = format!(
-        "Question: {}\nToday: {}\nTimes: every time below is local time, {}\n\nRecords ({} of them, \
-         by E number; ▶ marks the record the search found, the lines around it are its context):\n\n{}",
+        "Question: {}\nToday: {}\nTimes: every time below is local time, {}\n\n{closest}Records ({} \
+         of them, by E number; ▶ marks the record the search found, the lines around it are its \
+         context):\n\n{}",
         options.question,
         corpus.today(),
         corpus.zone(),
@@ -1022,6 +1126,25 @@ fn is_date(text: &str) -> bool {
             .iter()
             .enumerate()
             .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
+/// Whether `terms` holds `term`, ASCII case aside, as the search folds it.
+fn holds_term(terms: &[String], term: &str) -> bool {
+    terms.iter().any(|known| known.eq_ignore_ascii_case(term))
+}
+
+/// Each search string followed by its spacing variants (`csv 取り込み` for `csv取り込み`), every
+/// string once: the variants go into the same pass over the corpus as the strings.
+fn with_spacing_variants(terms: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for term in terms {
+        for string in std::iter::once(term.clone()).chain(text::spacing_variants(term)) {
+            if !holds_term(&out, &string) {
+                out.push(string);
+            }
+        }
+    }
+    out
 }
 
 /// Trimmed, without repeats, at most `MAX_TERMS`.
@@ -1385,23 +1508,80 @@ struct Summary<'a> {
     found: usize,
     screened: Option<(usize, usize)>,
     kept: usize,
+    /// The records read are the closest: the screen judged none relevant.
+    closest: bool,
     rounds: usize,
     synced_through: Option<&'a str>,
+    filters: &'a Filters,
     notes: &'a Notes,
 }
 
 impl<'a> Summary<'a> {
-    fn of(pool: &'a Pool, kept: usize, notes: &'a Notes) -> Summary<'a> {
+    fn of(pool: &'a Pool, kept: usize, notes: &'a Notes, filters: &'a Filters) -> Summary<'a> {
         Summary {
             terms: &pool.terms,
             counts: &pool.counts,
             found: pool.found.len(),
             screened: pool.screened.then_some((pool.threes, pool.twos)),
             kept,
+            closest: pool.nothing_relevant(),
             rounds: pool.rounds,
             synced_through: pool.synced_through.as_deref(),
+            filters,
             notes,
         }
+    }
+
+    /// What the result says first when the records found do not settle the question: that,
+    /// which strings were searched and where, and how many records they found. None when the
+    /// screen judged records relevant.
+    fn not_settled(&self) -> Option<String> {
+        let mut scope = String::new();
+        if let Some(cwd) = &self.filters.cwd {
+            scope.push_str(&format!(
+                " in conversations whose working directory contains {}",
+                crate::json::string(cwd)
+            ));
+        }
+        for (word, date) in [("from", &self.filters.from), ("to", &self.filters.to)] {
+            if let Some(date) = date {
+                scope.push_str(&format!(" {word} {date}"));
+            }
+        }
+        let (any, by) = match self.terms.len() {
+            1 => (
+                "the string searched".to_string(),
+                "the string searched".to_string(),
+            ),
+            count => (
+                format!("any of the {count} strings searched"),
+                format!("the {count} strings searched"),
+            ),
+        };
+        let searched = self.terms.join(", ");
+        if self.found == 0 {
+            return Some(format!(
+                "The records do not settle the question: no record holds {any}{scope}. Searched: \
+                 {searched}."
+            ));
+        }
+        self.closest.then(|| match self.found {
+            1 => format!(
+                "The record found does not settle the question: the one record found by \
+                 {by}{scope} was not judged relevant to it. The answer reads it, with the records \
+                 around it. Searched: {searched}."
+            ),
+            found => format!(
+                "The records found do not settle the question: none of the {found} records found \
+                 by {by}{scope} was judged relevant to it. The answer reads {}, with the records \
+                 around them. Searched: {searched}.",
+                if self.kept < found {
+                    format!("the {} closest", self.kept)
+                } else {
+                    "them".to_string()
+                }
+            ),
+        })
     }
 
     fn lines(&self, corpus: &Corpus) -> Vec<String> {
@@ -1444,6 +1624,10 @@ impl<'a> Summary<'a> {
             ));
         }
         lines.push(match self.screened {
+            Some(_) if self.closest => format!(
+                "Candidates {} -> relevant 0 -> the closest read {}",
+                self.found, self.kept
+            ),
             Some((threes, twos)) => format!(
                 "Candidates {} -> relevant {} (3 points {}, 2 points {}) -> records read {}",
                 self.found,
@@ -1866,15 +2050,19 @@ fn answer_report(
         let mut out = crate::json::Object::new()
             .name(
                 "disposition",
-                if answer.is_some() {
-                    "answered"
-                } else {
-                    "no_records"
+                match answer {
+                    None => "no_records",
+                    Some(_) if summary.closest => "nothing_relevant",
+                    Some(_) => "answered",
                 },
             )
             .name("mode", "ask")
             .name("api", &options.endpoint.name)
             .text("question", &options.question)
+            .raw(
+                "not_settled",
+                &crate::json::or_null(summary.not_settled().map(|lead| crate::json::string(&lead))),
+            )
             .raw(
                 "answer",
                 &crate::json::or_null(
@@ -1894,10 +2082,12 @@ fn answer_report(
     }
 
     let mut out = format!("Question: {}\n\n", options.question);
+    if let Some(lead) = summary.not_settled() {
+        out.push_str(&lead);
+        out.push_str("\n\n");
+    }
     match answer {
-        None => out.push_str(
-            "No record holds the search strings. Try other words, or name them with --term.\n\n",
-        ),
+        None => out.push_str("Try other words, or name them with --term.\n\n"),
         Some(answer) => {
             out.push_str(&format!("Answer\n{}\n\n", answer.str_at("answer").trim()));
             if !list.is_empty() {
@@ -2026,6 +2216,172 @@ mod tests {
                 .map(String::from),
         );
         assert_eq!(terms, vec!["色が", "MapLegend", "凡例"]);
+    }
+
+    #[test]
+    fn searches_each_string_with_its_spacing_variants_once() {
+        let terms: Vec<String> = ["csv取り込み", "CSV 取り込み", "日付", "Rust 製のCLI"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            with_spacing_variants(&terms),
+            vec![
+                "csv取り込み",
+                "csv 取り込み",
+                // CSV 取り込み and its variant CSV取り込み are those two, ASCII case aside.
+                "日付",
+                "Rust 製のCLI",
+                "Rust 製の CLI",
+                "Rust製のCLI"
+            ]
+        );
+        assert_eq!(
+            with_spacing_variants(&terms),
+            with_spacing_variants(&terms),
+            "the same every time"
+        );
+        assert!(holds_term(&terms, "CSV取り込み"));
+        assert!(!holds_term(&terms, "csv"));
+    }
+
+    #[test]
+    fn reads_the_closest_when_the_screen_judged_none_relevant() {
+        let scored = |text: &str, score: u64| {
+            let mut found = hit(text, Who::Agent, "2026-09-18T01:41:00Z", &["公開"]);
+            found.source_ref.source_id = text.to_string();
+            (found, score)
+        };
+        let pool = Pool {
+            near: vec![
+                scored("unrelated", 0),
+                scored("shares words", 1),
+                scored("unrelated too", 0),
+                scored("shares words too", 1),
+            ],
+            screened: true,
+            ..Pool::default()
+        };
+        assert!(pool.nothing_relevant());
+        assert!(pool.best(8).is_empty());
+        let closest: Vec<String> = pool.closest(3).into_iter().map(|hit| hit.text).collect();
+        assert_eq!(
+            closest,
+            vec!["shares words", "shares words too", "unrelated"],
+            "a record that shares words with the question comes first"
+        );
+        let without_the_api = Pool {
+            screened: false,
+            ..Pool::default()
+        };
+        assert!(
+            !without_the_api.nothing_relevant(),
+            "nothing was judged without the API"
+        );
+    }
+
+    #[test]
+    fn says_what_it_searched_when_no_record_holds_the_strings() {
+        let corpus = corpus();
+        let pool = Pool {
+            terms: vec!["ダークモード".to_string(), "dark mode".to_string()],
+            rounds: 1,
+            ..Pool::default()
+        };
+        let notes = Notes::default();
+        let filters = Filters {
+            cwd: Some("kurage-app".to_string()),
+            ..Filters::default()
+        };
+        let summary = Summary::of(&pool, 0, &notes, &filters);
+        let mut options = Options::thorough("ダークモードはどうするって決めた？".to_string());
+        options.text_format = true;
+        let text = answer_report(&corpus, &options, None, &[], &summary, &[]);
+        assert!(
+            text.contains(
+                "The records do not settle the question: no record holds any of the 2 strings \
+                 searched in conversations whose working directory contains \"kurage-app\". \
+                 Searched: ダークモード, dark mode.\n\nTry other words"
+            ),
+            "{text}"
+        );
+        options.text_format = false;
+        let json = answer_report(&corpus, &options, None, &[], &summary, &[]);
+        assert!(
+            json.starts_with(r#"{"disposition":"no_records","mode":"ask","api":"anthropic","question":"ダークモードはどうするって決めた？","not_settled":"The records do not settle the question: no record holds any of the 2 strings searched in conversations whose working directory contains \"kurage-app\". Searched: ダークモード, dark mode.","answer":null,"#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn says_the_records_found_do_not_settle_it_before_the_answer_from_the_closest() {
+        let corpus = corpus();
+        let words = "公開するときは README と LICENSE を整えましょう。";
+        let found = hit(words, Who::Agent, "2026-09-18T01:41:00Z", &["公開"]);
+        let lines = vec![
+            line(
+                Label::Person,
+                "2026-09-18T01:40:00Z",
+                "そのうち crates.io に出したいな",
+                false,
+                5,
+            ),
+            line(Label::Agent, "2026-09-18T01:41:00Z", words, true, 10),
+        ];
+        let evidence = vec![compose(&corpus, "E1".to_string(), found.clone(), Ok(lines))];
+        let pool = Pool {
+            terms: vec!["公開".to_string(), "publish".to_string()],
+            rounds: 1,
+            found: (0..4)
+                .map(|byte_start| SourceRef {
+                    source_id: "claude-a".to_string(),
+                    byte_start,
+                    byte_len: 1,
+                })
+                .collect(),
+            near: vec![(found, 1)],
+            screened: true,
+            ..Pool::default()
+        };
+        let notes = Notes::default();
+        let filters = Filters::default();
+        let summary = Summary::of(&pool, 1, &notes, &filters);
+        let answer = value::parse(
+            r#"{"answer":"公開した記録はありません。","findings":[
+                  {"evidence":"E1","kind":"other","quote":"そのうち crates.io に出したいな","note":""}],
+                "timeline":[],"gaps":[],"more_terms":[]}"#,
+        )
+        .unwrap();
+        let mut options = Options::thorough("いつ公開した？".to_string());
+        options.text_format = true;
+        let text = answer_report(&corpus, &options, Some(&answer), &evidence, &summary, &[]);
+        assert!(
+            text.starts_with(
+                "Question: いつ公開した？\n\nThe records found do not settle the question: none of \
+                 the 4 records found by the 2 strings searched was judged relevant to it. The \
+                 answer reads the 1 closest, with the records around them. Searched: 公開, \
+                 publish.\n\nAnswer\n公開した記録はありません。"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Candidates 4 -> relevant 0 -> the closest read 1"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("(not found in the records)"),
+            "the person's words beside the record found are checked like any: {text}"
+        );
+        options.text_format = false;
+        let json = answer_report(&corpus, &options, Some(&answer), &evidence, &summary, &[]);
+        assert!(
+            json.starts_with(r#"{"disposition":"nothing_relevant","mode":"ask""#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""quote_verified":true,"relevance":"","author":"person""#),
+            "{json}"
+        );
     }
 
     #[test]
@@ -2515,7 +2871,8 @@ mod tests {
             ..Pool::default()
         };
         let notes = Notes::default();
-        let summary = Summary::of(&pool, 1, &notes);
+        let filters = Filters::default();
+        let summary = Summary::of(&pool, 1, &notes, &filters);
         let spent = vec![Spend {
             step: "answer",
             model: "claude-opus-5-5".to_string(),
@@ -2577,7 +2934,7 @@ mod tests {
             &summary,
             &spent,
         );
-        assert!(json.starts_with(r#"{"disposition":"answered","mode":"ask","api":"anthropic","question":"地図の色の条件は？","answer":"10/4 に条件を外した。""#), "{json}");
+        assert!(json.starts_with(r#"{"disposition":"answered","mode":"ask","api":"anthropic","question":"地図の色の条件は？","not_settled":null,"answer":"10/4 に条件を外した。""#), "{json}");
         assert!(json.contains(r#""kind":"reversal","quote":"古いままでと言った記憶がない","quote_verified":true,"relevance":"9/27 の条件を外す","author":"person""#), "{json}");
         assert!(json.contains(r#""quote_verified":false"#), "{json}");
         assert!(json.contains(r#""cost_usd":{"total":0.0060,"answer":0.0060,"models":["claude-opus-5-5"],"tokens":1100,"unpriced_calls":0}"#), "{json}");

@@ -123,6 +123,15 @@ results; `search.recent_messages` reports how many were read, the time range and
 stale sources, and `recent_sessions_omitted` names the remaining count.
 This is bounded evidence, not proof that every later decision was found.
 
+Each search string is also searched, in the same pass, with a space and with none
+between Latin letters or digits and Japanese (`CSV 取り込み` and `CSV取り込み`):
+Japanese is written both ways, and the search matches literally. When the screen
+judges none of the records found relevant, the result says first that they do not
+settle the question, with the strings searched and how many records they found
+(`not_settled`), and the answer reads the closest of them with the records around
+them (`disposition: "nothing_relevant"`). When no record holds a search string, it
+says so (`no_records`) without calling the API again.
+
 Every quote is checked against the records before it is shown, and each finding
 cites its `source_ref`. A verified quote confirms the quoted words, not the
 answer's interpretation or completeness. Check important conclusions against the

@@ -4,6 +4,26 @@ The notable changes in each release of Ebira. Before 1.0, a minor version may
 change what a command writes; a change to the corpus's storage format or reading
 rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
+## Unreleased
+
+Found by the evaluation in `evals/`.
+
+### Changed
+
+- `ask` also searches each string with a space and with none between ASCII
+  letters or digits and kana or kanji, in the same pass: `csv取り込み` finds
+  `CSV 取り込み`. The variants are listed with the search strings.
+- When the screen judges none of the records found relevant, `ask` reads the
+  closest of them (up to 8) with the records around them and answers from them,
+  told that they were not judged relevant; the result is
+  `disposition: "nothing_relevant"`. It used to return `no_records` with no
+  answer, though the record beside one found could bear on the question.
+- `ask` results have `not_settled`: when the records found do not settle the
+  question, what the result says first, with the strings searched, the
+  directory and dates searched, and how many records they found; `null`
+  otherwise. When no record holds any string, the text says so instead of
+  "No record holds the search strings".
+
 ## 0.2.1 - 2026-10-18
 
 Found in an outside review of 0.2.0.

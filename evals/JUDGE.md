@@ -2,9 +2,11 @@
 
 `run.py` writes `judge.md`: for each case, the question, the key points a right answer
 makes, the mistakes to watch for, and the answer `ebira ask` gave (its text, its findings
-with their quotes, and what it says the records do not settle). Judge each answer on its
-own, by what it says, without knowing which version of Ebira or which models wrote it. Any
-capable model or person can judge; give it this file and `judge.md`.
+with their quotes, and what it says the records do not settle). When none of the records
+found was judged relevant, the answer starts with what `ask` itself says about the search:
+the strings searched and how many records they found; it is part of the answer. Judge
+each answer on its own, by what it says, without knowing which version of Ebira or which
+models wrote it. Any capable model or person can judge; give it this file and `judge.md`.
 
 For every key point, in order:
 

@@ -365,14 +365,24 @@ impl ChatService {
 
 /// Synthetic logs synced into a corpus, for the Chat Completions cases.
 fn synced(name: &str) -> (Logs, PathBuf) {
+    synced_log(
+        name,
+        concat!(
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-09-01T00:00:00Z","message":{"role":"user","content":"keep remote access"}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-09-02T00:00:00Z","message":{"role":"user","content":"LATEST_DECISION: remove it entirely"}}"#,
+            "\n",
+        ),
+    )
+}
+
+/// `log`, a Claude Code transcript, synced into a corpus.
+fn synced_log(name: &str, log: &str) -> (Logs, PathBuf) {
     let logs =
         Logs(std::env::temp_dir().join(format!("ebira-ask-api-{name}-{}", std::process::id())));
     let source = logs.0.join(".claude/projects/example/session.jsonl");
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
-    std::fs::write(&source, concat!(
-        r#"{"type":"user","sessionId":"s","timestamp":"2026-09-01T00:00:00Z","message":{"role":"user","content":"keep remote access"}}"#, "\n",
-        r#"{"type":"user","sessionId":"s","timestamp":"2026-09-02T00:00:00Z","message":{"role":"user","content":"LATEST_DECISION: remove it entirely"}}"#, "\n",
-    )).unwrap();
+    std::fs::write(&source, log).unwrap();
     let corpus = logs.0.join("corpus");
     let sync = ebira(&logs.0)
         .args([
@@ -393,11 +403,21 @@ fn synced(name: &str) -> (Logs, PathBuf) {
 }
 
 fn ask_compatible(logs: &Logs, corpus: &Path, url: &str) -> std::process::Output {
+    ask_compatible_about(logs, corpus, url, "What is decided?", "remote")
+}
+
+fn ask_compatible_about(
+    logs: &Logs,
+    corpus: &Path,
+    url: &str,
+    question: &str,
+    term: &str,
+) -> std::process::Output {
     ebira(&logs.0)
         .env("EBIRA_TEST_KEY", "test-key")
         .args([
             "ask",
-            "What is decided?",
+            question,
             "--api",
             "compatible",
             "--api-url",
@@ -409,7 +429,7 @@ fn ask_compatible(logs: &Logs, corpus: &Path, url: &str) -> std::process::Output
             "--cheap-model",
             "cheap-model",
             "--term",
-            "remote",
+            term,
             "--keep",
             "1",
             "--corpus",
@@ -588,6 +608,103 @@ fn a_service_without_strict_schemas_is_asked_for_a_json_object() {
         "the schema moves into the instructions"
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Remove it entirely."));
+}
+
+#[test]
+fn when_none_is_judged_relevant_the_closest_are_read_and_said_not_to_settle_it() {
+    // The search finds the agent's reply; the person's wish before it is what bears on the
+    // question, and the screen, which sees the reply alone, judges it unrelated.
+    let (logs, corpus) = synced_log(
+        "closest",
+        concat!(
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-09-18T01:40:00Z","message":{"role":"user","content":"そのうち crates.io に出したいな"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","timestamp":"2026-09-18T01:41:00Z","message":{"role":"assistant","content":[{"type":"text","text":"公開するときは README と LICENSE を整えましょう。"}]}}"#,
+            "\n",
+        ),
+    );
+    let service = ChatService::start(|body| {
+        if body.contains(SCREEN) {
+            (
+                200,
+                chat("cheap-model", r#"{"scores":[{"id":"C1","score":1}]}"#),
+            )
+        } else {
+            (
+                200,
+                chat(
+                    "strong-model",
+                    r#"{"answer":"公開した記録はありません。","findings":[{"evidence":"E1","kind":"other","quote":"そのうち crates.io に出したいな","note":""}],"timeline":[],"gaps":[],"more_terms":[]}"#,
+                ),
+            )
+        }
+    });
+    let output = ask_compatible_about(&logs, &corpus, &service.url, "いつ公開した？", "公開");
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answers: Vec<&String> = requests
+        .iter()
+        .map(|(_, body)| body)
+        .filter(|body| !body.contains(SCREEN))
+        .collect();
+    assert_eq!(answers.len(), 2, "the draft and the answer");
+    for body in answers {
+        assert!(
+            body.contains(
+                "No record the search found (1 in all) was judged relevant to the question"
+            ),
+            "the answer model is told: {body}"
+        );
+        assert!(
+            body.contains("そのうち crates.io に出したいな"),
+            "the record before the one found reaches it: {body}"
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(concat!(
+            r#"{"disposition":"nothing_relevant","mode":"ask","api":"compatible","question":"いつ公開した？","#,
+            r#""not_settled":"The record found does not settle the question: the one record found by the string searched was not judged relevant to it. The answer reads it, with the records around it. Searched: 公開.","#,
+            r#""answer":"公開した記録はありません。""#
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""quote":"そのうち crates.io に出したいな","quote_verified":true,"relevance":"","author":"person""#),
+        "the quote is checked, and credited to the person: {stdout}"
+    );
+}
+
+#[test]
+fn when_no_record_holds_the_strings_it_says_so_and_spends_nothing() {
+    let (logs, corpus) = synced("nothing");
+    let service = ChatService::start(|_| (200, chat("cheap-model", ANSWER)));
+    let output = ask_compatible_about(
+        &logs,
+        &corpus,
+        &service.url,
+        "What is decided?",
+        "no such words",
+    );
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(requests.is_empty(), "nothing to screen or to answer from");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(concat!(
+            r#"{"disposition":"no_records","mode":"ask","api":"compatible","question":"What is decided?","#,
+            r#""not_settled":"The records do not settle the question: no record holds the string searched. Searched: no such words.","answer":null,"#
+        )),
+        "{stdout}"
+    );
 }
 
 #[test]

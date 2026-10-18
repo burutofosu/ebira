@@ -100,6 +100,61 @@ fn find_folded(text: &str, term: &str) -> Option<usize> {
     text.to_ascii_lowercase().find(&term.to_ascii_lowercase())
 }
 
+/// Kana or a kanji, the Japanese that a space may or may not part from Latin letters.
+fn is_kana_or_kanji(character: char) -> bool {
+    matches!(character,
+        '\u{3005}'..='\u{3007}' // 々 〆 〇
+        | '\u{3041}'..='\u{3096}' // hiragana
+        | '\u{309D}'..='\u{309F}'
+        | '\u{30A1}'..='\u{30FA}' // katakana
+        | '\u{30FC}'..='\u{30FF}' // ー and the iteration marks
+        | '\u{31F0}'..='\u{31FF}'
+        | '\u{3400}'..='\u{4DBF}' // kanji
+        | '\u{4E00}'..='\u{9FFF}'
+        | '\u{F900}'..='\u{FAFF}'
+        | '\u{20000}'..='\u{3134F}'
+        | '\u{FF66}'..='\u{FF9F}' // half-width katakana
+    )
+}
+
+/// Whether a space may or may not stand between the two: ASCII letters or digits on one side,
+/// kana or kanji on the other.
+fn spacing_boundary(left: char, right: char) -> bool {
+    (left.is_ascii_alphanumeric() && is_kana_or_kanji(right))
+        || (is_kana_or_kanji(left) && right.is_ascii_alphanumeric())
+}
+
+/// The term written with a single space at every boundary between ASCII letters or digits and
+/// kana or kanji, and with none: Japanese is written both ways (`CSV 取り込み`, `CSV取り込み`),
+/// and the search matches spacing literally. Only the forms that differ from the term, the
+/// spaced first; none when it has no such boundary. A run of spaces is left as it is.
+pub fn spacing_variants(term: &str) -> Vec<String> {
+    let characters: Vec<char> = term.chars().collect();
+    let mut spaced = String::with_capacity(term.len() + 8);
+    let mut joined = String::with_capacity(term.len());
+    for (index, &character) in characters.iter().enumerate() {
+        let before = index.checked_sub(1).map(|at| characters[at]);
+        let after = characters.get(index + 1).copied();
+        match (before, after) {
+            (Some(left), Some(right)) if character == ' ' && spacing_boundary(left, right) => {
+                spaced.push(' ');
+                continue;
+            }
+            (Some(left), _) if spacing_boundary(left, character) => spaced.push(' '),
+            _ => {}
+        }
+        spaced.push(character);
+        joined.push(character);
+    }
+    let mut variants = Vec::new();
+    for variant in [spaced, joined] {
+        if variant != term && !variants.contains(&variant) {
+            variants.push(variant);
+        }
+    }
+    variants
+}
+
 /// The text compared without spaces, with full-width ASCII folded and ASCII lowercased.
 pub fn normalize(text: &str) -> String {
     text.chars()
@@ -240,6 +295,55 @@ mod tests {
         assert!(shown.contains("凡例が消えてる"));
         let english = format!("{}The Codex reply{}", "x".repeat(100), "y".repeat(100));
         assert!(window(&english, &["codex".to_string()], 40).contains("Codex reply"));
+    }
+
+    #[test]
+    fn spaces_latin_letters_from_japanese_both_ways() {
+        let variants = spacing_variants;
+        assert_eq!(variants("csv取り込み"), vec!["csv 取り込み"]);
+        assert_eq!(variants("CSV 取り込み"), vec!["CSV取り込み"]);
+        assert_eq!(variants("取り込みCSV"), vec!["取り込み CSV"]);
+        assert_eq!(variants("v2の設定"), vec!["v2 の設定"], "digits count too");
+        assert_eq!(variants("ｶﾀﾛｸﾞAPI"), vec!["ｶﾀﾛｸﾞ API"], "half-width katakana");
+        assert_eq!(
+            variants("サーバーAPI"),
+            vec!["サーバー API"],
+            "the long vowel mark is kana"
+        );
+        // Both boundaries get a space, or neither does; the mixed form is the term itself.
+        assert_eq!(
+            variants("Rust製のCLI"),
+            vec!["Rust 製の CLI"],
+            "one form is the term"
+        );
+        assert_eq!(
+            variants("Rust 製のCLI"),
+            vec!["Rust 製の CLI", "Rust製のCLI"]
+        );
+        assert_eq!(variants("Rust 製の CLI"), vec!["Rust製のCLI"]);
+    }
+
+    #[test]
+    fn leaves_other_spacing_alone() {
+        for term in [
+            "dark mode",
+            "ダーク モード",
+            "取り込み",
+            "README.md",
+            "CSV  取り込み",
+            "C++ の",
+            "ＣＳＶ取り込み",
+            "csv「取り込み」",
+            "",
+        ] {
+            assert!(spacing_variants(term).is_empty(), "{term:?}");
+        }
+        assert_eq!(
+            spacing_variants("ダーク モードをON"),
+            vec!["ダーク モードを ON"],
+            "a space between two Japanese words stays"
+        );
+        assert_eq!(spacing_variants("a 取 b"), vec!["a取b"]);
     }
 
     #[test]

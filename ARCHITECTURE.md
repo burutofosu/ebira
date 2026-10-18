@@ -394,11 +394,14 @@ earliest records that mention it.
 ## Ask
 
 `ask` reads the corpus as the other commands do and gives the models only what
-it read. A round's search strings go through one pass of `said` and one of
-`search`; the records around a hit are the corpus events of its log, named by
-their sender and kind; the answer's quotes are checked against the text the
-model was given, and each finding names the record it came from. The corpus lock
-is held for each read, not while a model is answering, so a sync can run between.
+it read. A round's search strings, each with its spacing variants (a space or
+none between Latin letters and Japanese), go through one pass of `said` and one
+of `search`; the literal match itself is unchanged. The records around a hit are
+the corpus events of its log, named by their sender and kind; the answer's quotes
+are checked against the text the model was given, and each finding names the
+record it came from. When the screen judges no record found relevant, the answer
+reads the closest instead, and is told so. The corpus lock is held for each read,
+not while a model is answering, so a sync can run between.
 
 Ebira keeps no summary of the records. The corpus holds the records' own fields
 and where each record is in its log, and an index would hold where text occurs,
