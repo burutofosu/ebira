@@ -4,6 +4,24 @@ The notable changes in each release of Ebira. Before 1.0, a minor version may
 change what a command writes; a change to the corpus's storage format or reading
 rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
+## 0.2.1 - 2026-10-18
+
+Found in an outside review of 0.2.0.
+
+### Fixed
+
+- `context` checks that the record a reference names is still the one the corpus
+  read when the log grew since the last sync. A log rewritten in place where the
+  record was is reported as changed, with the sync that reads it again
+  (`--rebuild-source`), instead of returning the other record. A sync reads a log
+  again whole when the records it read at either end of it are gone.
+- `ask` no longer takes a record left past one round's limit of candidates for
+  screened, so the second round's search strings can bring it back.
+- `ask` looks for later changes to a decision only in messages written at or after
+  it, not in earlier messages of the same day.
+- A reply from another service that lacks a field the request asks for, such as
+  `{}`, is an error rather than an empty answer.
+
 ## 0.2.0 - 2026-10-18
 
 ### Added
