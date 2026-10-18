@@ -21,7 +21,7 @@ building from source avoids that.
 To build from source, install Rust 1.89 or later:
 
 ```sh
-cargo install --locked --git https://github.com/burutofosu/ebira --tag v0.3.0
+cargo install --locked --git https://github.com/burutofosu/ebira --tag v0.3.1
 ebira sync
 ```
 
