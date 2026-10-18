@@ -198,10 +198,20 @@ own markers:
   points to the complete original record.
 - Codex user messages: child and `codex exec` threads carry another agent's
   prompts. In other threads, context blocks the app injects
-  (`environment_context`, `codex_internal_context`, `heartbeat`, and similar)
-  are system text, relayed agent messages are agent text, and the rest, with
-  `<in-app-browser-context>` removed, is the person's. Messages in turns named
-  `external-import-turn-*` are copies of another agent's conversation.
+  (`environment_context`, `codex_internal_context`, `heartbeat`,
+  `external_codex_apps_open_page`, and similar) are system text, relayed agent
+  messages are agent text, and the rest, with `<in-app-browser-context>`
+  removed, is the person's. Messages in turns named `external-import-turn-*`
+  are copies of another agent's conversation.
+- Codex wraps a message that came with something: sections under `# `
+  headings on the files attached or pasted, the response text annotated, or the
+  browser tabs open, then the message under `## My request:`. Of such a
+  message, the person's words are what follows that heading, after the start of
+  each text they pasted, which is all Codex keeps of it in the log (the rest is
+  in a file). A wrapped message is the person's even when no words are left, as
+  when they sent only files. The tags Codex writes around an attached image
+  (`<image name=… path=…>`, `</image>`) are items of their own and are dropped;
+  the image is counted.
 - A message that opens with Claude Code's compaction sentence is a summary in
   either format. Codex's `compacted` record is a summary when its `message`
   holds text, and otherwise the boundary, like Claude Code's `compact_boundary`.

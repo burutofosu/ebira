@@ -1673,7 +1673,7 @@ fn source_catalog_header(offset_minutes: i64) -> String {
 ///
 /// Increase it with every change to what a sync writes for the same logs, together with
 /// `RULES_FINGERPRINT` in the tests of `core.rs`, which fails until both are updated.
-pub const RULES_VERSION: u64 = 5;
+pub const RULES_VERSION: u64 = 6;
 
 /// How a corpus on disk relates to this build of Ebira.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
