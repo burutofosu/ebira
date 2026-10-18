@@ -14,14 +14,19 @@ reads to the model API you choose (Anthropic's by default) under your own key.
 Prebuilt Linux x86-64 and Windows x86-64 binaries are available on
 [GitHub Releases](https://github.com/burutofosu/ebira/releases/latest), together
 with `SHA256SUMS.txt`. Extract the archive and put `ebira` or `ebira.exe` on
-`PATH`. Linux and Windows are tested in CI; macOS has not been verified.
+`PATH`. Linux (WSL included) and Windows are tested in CI; macOS has not been
+verified. The binaries are unsigned, so Windows Smart App Control may block them;
+building from source avoids that.
 
 To build from source, install Rust 1.89 or later:
 
 ```sh
-cargo install --locked --git https://github.com/burutofosu/ebira --tag v0.1.0
+cargo install --locked --git https://github.com/burutofosu/ebira --tag v0.2.0
 ebira sync
 ```
+
+To update, install a newer release the same way, adding `--force`. The changes
+are listed in [CHANGELOG.md](CHANGELOG.md).
 
 The first sync finds transcripts in `~/.claude/projects`, `~/.codex/sessions`,
 and `~/.codex/archived_sessions`, respecting `CLAUDE_CONFIG_DIR` and `CODEX_HOME`.

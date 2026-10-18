@@ -124,7 +124,7 @@ jobs:
           source = Path("target") / target / "release" / binary
           subprocess.run([str(source.resolve()), "help"], check=True)
           entries = {binary: (source.read_bytes(), 0o755)}
-          for name in ("LICENSE", "README.md", "ARCHITECTURE.md"):
+          for name in ("LICENSE", "README.md", "ARCHITECTURE.md", "CHANGELOG.md"):
               entries[name] = (Path(name).read_bytes(), 0o644)
           for directory in ("skills", "examples"):
               for path in sorted(Path(directory).rglob("*")):
@@ -202,6 +202,14 @@ jobs:
           sha256sum --check --strict SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Check out the release notes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          path: source
+          sparse-checkout: docs/releases
+          persist-credentials: false
+
       - name: Publish to the matching GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -211,12 +219,19 @@ jobs:
             "ebira-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip"
             SHA256SUMS.txt
           )
+          # The notes written for the release, else notes generated from its changes.
+          notes="../source/docs/releases/${RELEASE_TAG}.md"
+          if [ -s "$notes" ]; then
+            notes_args=(--notes-file "$notes")
+          else
+            notes_args=(--generate-notes)
+          fi
           if gh release view "$RELEASE_TAG" --json id > /dev/null; then
             # Preserve the release and its notes; replace only these assets.
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           else
             gh release create "$RELEASE_TAG" "${assets[@]}" \
-              --verify-tag --title "Ebira ${RELEASE_TAG#v}" --generate-notes
+              --verify-tag --title "Ebira ${RELEASE_TAG#v}" "${notes_args[@]}"
           fi
 
       - name: Verify the published assets
