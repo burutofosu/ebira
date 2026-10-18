@@ -1,0 +1,36 @@
+# notifier: a team notification service, in English. Cases A5, B5, C5, D5, E5, F5.
+project notifier /work/notifier
+
+session claude 2026-09-08 digest
+09:00 you a5_rules: Build the daily digest. Send it at 8am local time, skip weekends, and never include archived projects.
+09:02 agent: I'll add a scheduled job for the digest.
+09:20 tool Write: src/digest.py
+  => File created successfully at: src/digest.py
+09:25 you b5_example: For the notification icon, something like a bell, maybe?
+09:26 agent: I'll use a bell icon for now.
+09:40 you c5_once: Never send more than one email per day.
+09:41 agent: Got it. Emails are capped at one per day.
+10:30 summary a5_summary: The user is building notifier. The daily digest is sent at 8am local time and leaves out archived projects. Email is capped at one per day. A bell icon is used for notifications.
+10:31 you: Now wire up the scheduler.
+10:40 tool Edit: src/schedule.py
+  => The file src/schedule.py has been updated successfully.
+10:41 agent a5_everyday: The digest is now scheduled for every day at 8am.
+
+session claude 2026-09-11 alerts
+11:00 you d5_slack: Use Slack for alerts.
+11:02 agent: I'll send alerts to a Slack webhook.
+11:45 you d5_discord: Actually, Discord. The team moved there.
+11:46 agent: Switching alerts to a Discord webhook.
+12:10 tool Bash: pytest tests/test_alerts.py
+  => 4 passed in 0.31s
+14:30 agent e5_agent: I decided to batch notifications every 15 minutes to reduce noise.
+14:35 you e5_ok: ok whatever works
+15:00 you d5_keep: Keep Discord, the webhook works fine.
+
+session claude 2026-09-22 failures
+09:00 you b5_later: Let's not decide the icon yet. Waiting on the brand guide.
+09:01 agent: Understood. The bell stays as a placeholder.
+09:30 you c5_failures: If a build fails, tell me right away. Don't wait for the digest.
+09:32 agent: Build failures now send an email immediately.
+09:40 tool Bash: pytest
+  => 23 passed in 1.12s

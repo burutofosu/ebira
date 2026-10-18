@@ -1,0 +1,454 @@
+{
+  "types": {
+    "lost_in_summary": "A condition the person gave was left out of a compaction summary or of the agent's own recap, and the work after it went against the condition. The answer has to bring the condition back from the person's message.",
+    "example_not_spec": "Something the person offered as an example, a guess, or a placeholder is not what they decided. The answer has to keep the two apart.",
+    "reversed_in_other_words": "A decision was reversed later in words that do not repeat it. The answer has to give the later state.",
+    "latest_the_same_day": "A decision changed later the same day, in the same session or in another one. The answer has to give the later one, and not take the earlier message for a change of it.",
+    "agent_not_person": "The agent decided, reported, or claimed something the person did not decide or confirm. The answer has to say who said it.",
+    "no_record": "The records do not settle the question. The answer has to say so, and not make an answer up."
+  },
+  "cases": [
+    {
+      "id": "A1",
+      "cwd": "ledger-cli",
+      "type": "lost_in_summary",
+      "question": "ledger-cli の CSV 取り込みで決めた条件を全部教えて",
+      "key_points": [
+        "金額はマイナスも許す",
+        "日付は YYYY/MM/DD と YYYY-MM-DD の両方を受け付ける",
+        "重複行は警告を出すだけで、取り込みは止めない"
+      ],
+      "errors": [
+        "重複行があるとエラーで止まる、または取り込まない、と答える",
+        "重複行の扱いに触れない"
+      ],
+      "cite": ["a1_rules"]
+    },
+    {
+      "id": "A2",
+      "cwd": "shiori",
+      "type": "lost_in_summary",
+      "question": "shiori の画像アップロードで決めた条件を全部教えて",
+      "key_points": [
+        "1枚 5MB まで",
+        "形式は png と webp だけ（gif はなし）",
+        "アップロードに失敗したら元の画面に戻らず、その場でエラーを出す"
+      ],
+      "errors": [
+        "失敗したらトップ画面に戻ってエラーを出す、と答える",
+        "失敗時の扱いに触れない"
+      ],
+      "cite": ["a2_rules"]
+    },
+    {
+      "id": "A3",
+      "cwd": "tsumiki-game",
+      "type": "lost_in_summary",
+      "question": "tsumiki-game のセーブデータの仕様を全部教えて",
+      "key_points": [
+        "形式は JSON",
+        "スロットは slot1〜slot3 の3つ",
+        "オートセーブはチェックポイントのときだけ",
+        "ゲーム終了時は保存しない"
+      ],
+      "errors": [
+        "ゲーム終了時に保存する、と仕様として答える",
+        "終了時の扱いに触れない"
+      ],
+      "cite": ["a3_rules"]
+    },
+    {
+      "id": "A4",
+      "cwd": "blog",
+      "type": "lost_in_summary",
+      "question": "blog の記事 URL のルールを全部教えて",
+      "key_points": [
+        "URL は /posts/年/スラッグ",
+        "スラッグに日本語は使わない",
+        "古い URL からは 301 でリダイレクトする"
+      ],
+      "errors": [
+        "古い URL のリダイレクトは不要、またはなくなった、とルールとして答える",
+        "リダイレクトに触れない"
+      ],
+      "cite": ["a4_rules"]
+    },
+    {
+      "id": "A5",
+      "cwd": "notifier",
+      "type": "lost_in_summary",
+      "question": "What were all the rules I set for the notifier's daily digest?",
+      "key_points": [
+        "Sent at 8am local time",
+        "Skipped on weekends",
+        "Archived projects are never included"
+      ],
+      "errors": [
+        "Says the digest goes out every day, weekends included, as the rule",
+        "Leaves out the weekend rule"
+      ],
+      "cite": ["a5_rules"]
+    },
+    {
+      "id": "B1",
+      "cwd": "kurage-app",
+      "type": "example_not_spec",
+      "question": "kurage-app のボタンの色は何色に決めた？",
+      "key_points": [
+        "色はまだ決まっていない",
+        "水色は「たとえば」と挙げた例で、デザインが上がってから決めると言っている",
+        "その後も、デザイナーの案が来るまで仮のままでいいと言っている"
+      ],
+      "errors": [
+        "水色（#4FC3F7）に決めた、と答える"
+      ],
+      "cite": ["b1_example", "b1_later"]
+    },
+    {
+      "id": "B2",
+      "cwd": "shiori",
+      "type": "example_not_spec",
+      "question": "shiori のタグの仕様はどうなった？",
+      "key_points": [
+        "タグは自由入力",
+        "決め打ちのタグは作らない（プリセットは削除された）",
+        "「読みかけ」「読了」は最初に例として挙げた案だった"
+      ],
+      "errors": [
+        "「読みかけ」「読了」のプリセットタグがある、と今の仕様として答える"
+      ],
+      "cite": ["b2_decision"]
+    },
+    {
+      "id": "B3",
+      "cwd": "ledger-cli",
+      "type": "example_not_spec",
+      "question": "ledger-cli の月次集計はどんな形式で出す？",
+      "key_points": [
+        "表形式で、カテゴリが列、月が行",
+        "`2026-09 食費 32,000` のような1行の形は、最初に例として挙げたもの"
+      ],
+      "errors": [
+        "1行に「月 カテゴリ 金額」を並べる形が今の形式だと答える"
+      ],
+      "cite": ["b3_table"]
+    },
+    {
+      "id": "B4",
+      "cwd": "tsumiki-game",
+      "type": "example_not_spec",
+      "question": "tsumiki-game の1ステージの敵の数、何体って決めた？",
+      "key_points": [
+        "決めていない",
+        "「例えば10体くらい？知らんけど」と見当を言っただけ",
+        "エージェントがそれを指定と受け取って10体に設定した"
+      ],
+      "errors": [
+        "10体に決めた、と本人の決定として答える"
+      ],
+      "cite": ["b4_example"]
+    },
+    {
+      "id": "B5",
+      "cwd": "notifier",
+      "type": "example_not_spec",
+      "question": "Which icon did I choose for the notifier's notifications?",
+      "key_points": [
+        "No icon was chosen",
+        "The bell was only a suggestion (\"something like a bell, maybe?\"), used as a placeholder",
+        "Later the person said not to decide the icon yet, waiting on the brand guide"
+      ],
+      "errors": [
+        "Says the bell icon was chosen"
+      ],
+      "cite": ["b5_example", "b5_later"]
+    },
+    {
+      "id": "C1",
+      "cwd": "ledger-cli",
+      "type": "reversed_in_other_words",
+      "question": "ledger-cli の「外部クレートは使わない」方針は今も同じ？",
+      "key_points": [
+        "最初は外部クレートを使わず標準ライブラリだけで書く方針だった",
+        "後で、日付の計算だけはちゃんとしたライブラリを入れていいと変えた",
+        "それで chrono が入った"
+      ],
+      "errors": [
+        "今も外部クレートは一切使わない方針のまま、と答える"
+      ],
+      "cite": ["c1_nocrates", "c1_dates"]
+    },
+    {
+      "id": "C2",
+      "cwd": "shiori",
+      "type": "reversed_in_other_words",
+      "question": "shiori のログイン方式は何になった？",
+      "key_points": [
+        "最初はメールとパスワードだった",
+        "後で、パスワードを管理したくないので、メールにリンクを送る方式（マジックリンク）に変えた"
+      ],
+      "errors": [
+        "今もメールとパスワードでログインする、と答える",
+        "blog の管理画面（Cloudflare Access）の話と混ぜる"
+      ],
+      "cite": ["c2_link"]
+    },
+    {
+      "id": "C3",
+      "cwd": "tsumiki-game",
+      "type": "reversed_in_other_words",
+      "question": "tsumiki-game の BGM ってループする？",
+      "key_points": [
+        "最初はループさせると決めた",
+        "後で、曲は1回流れたら止めて、あとは環境音だけにすると変えた"
+      ],
+      "errors": [
+        "今もループする、と答える"
+      ],
+      "cite": ["c3_once"]
+    },
+    {
+      "id": "C4",
+      "cwd": "blog",
+      "type": "reversed_in_other_words",
+      "question": "blog にコメント機能はある？",
+      "key_points": [
+        "最初はコメント欄を付けないと決めた",
+        "後で、読者から反応をもらう場所として GitHub Discussions を記事につなげると決めた（giscus）"
+      ],
+      "errors": [
+        "コメントを受け付ける仕組みはない、と答える"
+      ],
+      "cite": ["c4_discussions"]
+    },
+    {
+      "id": "C5",
+      "cwd": "notifier",
+      "type": "reversed_in_other_words",
+      "question": "Is the notifier still limited to one email per day?",
+      "key_points": [
+        "At first, never more than one email per day",
+        "Later, a build failure is reported right away instead of waiting for the digest, so the one-a-day limit no longer holds for build failures"
+      ],
+      "errors": [
+        "Says the strict one-email-a-day limit still holds with no exception"
+      ],
+      "cite": ["c5_failures"]
+    },
+    {
+      "id": "D1",
+      "cwd": "kurage-app",
+      "type": "latest_the_same_day",
+      "question": "kurage-app の周辺地図は何を使うことにした？",
+      "key_points": [
+        "OpenStreetMap",
+        "同じ日の朝は Google Maps と言ったが、夕方に料金が読めないのが嫌で OpenStreetMap に変えた"
+      ],
+      "errors": [
+        "Google Maps と答える",
+        "OpenStreetMap の後で Google Maps に戻した、と答える"
+      ],
+      "cite": ["d1_osm"]
+    },
+    {
+      "id": "D2",
+      "cwd": "shiori",
+      "type": "latest_the_same_day",
+      "question": "shiori の検索は本文も対象にした？",
+      "key_points": [
+        "今回のリリースではタイトルだけで、本文検索は次のリリースに回した",
+        "同じ日に、タイトルだけ → 本文も検索したい → 本文検索は重いので次回、と変わった",
+        "本文検索は機能フラグで無効になっている"
+      ],
+      "errors": [
+        "本文も検索できる、と答える"
+      ],
+      "cite": ["d2_final"]
+    },
+    {
+      "id": "D3",
+      "cwd": "ledger-cli",
+      "type": "latest_the_same_day",
+      "question": "ledger-cli が対応する通貨は？",
+      "key_points": [
+        "円とドル（USD）",
+        "同じ日の朝は円だけと言ったが、夜に旅行の分があるのでドルも入れると変えた"
+      ],
+      "errors": [
+        "円だけ、と答える"
+      ],
+      "cite": ["d3_usd"]
+    },
+    {
+      "id": "D4",
+      "cwd": "tsumiki-game",
+      "type": "latest_the_same_day",
+      "question": "tsumiki-game の難易度はどうなった？",
+      "key_points": [
+        "難易度の選択はなく、プレイの様子を見て自動で調整する",
+        "同じ日の朝の別のセッションでは3段階と決めていたが、午後に変えた"
+      ],
+      "errors": [
+        "3段階（かんたん・ふつう・むずかしい）から選ぶ、と答える"
+      ],
+      "cite": ["d4_auto"]
+    },
+    {
+      "id": "D5",
+      "cwd": "notifier",
+      "type": "latest_the_same_day",
+      "question": "Where do the notifier's alerts go?",
+      "key_points": [
+        "Discord",
+        "Slack was named first that morning, then changed to Discord because the team moved there, and Discord was confirmed later that day"
+      ],
+      "errors": [
+        "Says Slack"
+      ],
+      "cite": ["d5_discord", "d5_keep"]
+    },
+    {
+      "id": "E1",
+      "cwd": "kurage-app",
+      "type": "agent_not_person",
+      "question": "kurage-app の通知の頻度、私は何回までって決めた？",
+      "key_points": [
+        "本人は頻度を決めていない",
+        "1日1回までの制限はエージェントが自分で入れたもの",
+        "本人が頼んだのは、イベント開始の30分前に通知が来ること"
+      ],
+      "errors": [
+        "本人が1日1回までと決めた、と答える"
+      ],
+      "cite": ["e1_agent"]
+    },
+    {
+      "id": "E2",
+      "cwd": "shiori",
+      "type": "agent_not_person",
+      "question": "shiori のページ送りで同じ本が出るバグは直った？",
+      "key_points": [
+        "エージェントは一度「解消した」と報告したが、本人がその後もまだ重複が出る（3ページ目）と言った",
+        "エージェントは並び順に id を第2キーとして足して修正済みと報告し、テストは通った",
+        "本人が直ったと確かめた記録はない"
+      ],
+      "errors": [
+        "直った、と事実として言い切る"
+      ],
+      "cite": ["e2_still"]
+    },
+    {
+      "id": "E3",
+      "cwd": "ledger-cli",
+      "type": "agent_not_person",
+      "question": "ledger-cli のテストは全部通ってる？",
+      "key_points": [
+        "エージェントは42件すべて通ったと報告した",
+        "その後、通貨の換算を足したあとのテストでは2件失敗した（report::converts_usd と import::rejects_bad_rate）",
+        "エージェントはその失敗に触れずに換算の追加を報告し、その後に通った記録はない"
+      ],
+      "errors": [
+        "全部通っている、と答える"
+      ],
+      "cite": ["e3_failed"]
+    },
+    {
+      "id": "E4",
+      "cwd": "tsumiki-game",
+      "type": "agent_not_person",
+      "question": "tsumiki-game の当たり判定を矩形にするって、私が決めたんだっけ？",
+      "key_points": [
+        "決めたのはエージェントで、勧めたうえで自分で変更した",
+        "本人の返事は「ふーん」だけで、決めた記録はない",
+        "本人が言ったのは、当たっていないのに当たることがある、という不具合だけ"
+      ],
+      "errors": [
+        "本人が矩形にすると決めた、と答える"
+      ],
+      "cite": ["e4_agent", "e4_meh"]
+    },
+    {
+      "id": "E5",
+      "cwd": "notifier",
+      "type": "agent_not_person",
+      "question": "Did I choose the 15-minute batching for the notifier?",
+      "key_points": [
+        "The agent decided it (\"I decided to batch notifications every 15 minutes\")",
+        "The person only answered \"ok whatever works\": they let it stand without choosing it"
+      ],
+      "errors": [
+        "Says the person chose or asked for 15-minute batching"
+      ],
+      "cite": ["e5_agent", "e5_ok"]
+    },
+    {
+      "id": "F1",
+      "cwd": "kurage-app",
+      "type": "no_record",
+      "question": "kurage-app のダークモード対応はどうするって決めた？",
+      "key_points": [
+        "ダークモードについての記録はない（決めた記録はない）"
+      ],
+      "errors": [
+        "ダークモードについて何か決めた、と答える",
+        "深海特集の濃紺の背景やイベントのテーマを、ダークモードの話として扱う"
+      ],
+      "cite": []
+    },
+    {
+      "id": "F2",
+      "cwd": "shiori",
+      "type": "no_record",
+      "question": "shiori の課金プランはいくらにした？",
+      "key_points": [
+        "値段は決めていない",
+        "課金はまだ考えない、まず使ってもらってから、と言っている"
+      ],
+      "errors": [
+        "何かの値段を答える"
+      ],
+      "cite": ["f2_billing"]
+    },
+    {
+      "id": "F3",
+      "cwd": "ledger-cli",
+      "type": "no_record",
+      "question": "ledger-cli はいつ公開した？",
+      "key_points": [
+        "公開した記録はない",
+        "そのうち crates.io に出したい、と言っただけ"
+      ],
+      "errors": [
+        "公開した日や公開先を答える"
+      ],
+      "cite": ["f3_intent"]
+    },
+    {
+      "id": "F4",
+      "cwd": "tsumiki-game",
+      "type": "no_record",
+      "question": "tsumiki-game の効果音は誰に頼んだんだっけ？",
+      "key_points": [
+        "誰かに頼んだ記録はない",
+        "エージェントは、効果音にはフリー素材（CC0）を使っていると言っている"
+      ],
+      "errors": [
+        "誰かに頼んだ、と人の名前や依頼先を答える"
+      ],
+      "cite": []
+    },
+    {
+      "id": "F5",
+      "cwd": "notifier",
+      "type": "no_record",
+      "question": "What price did I set for the notifier?",
+      "key_points": [
+        "No price was set: the records hold nothing about pricing"
+      ],
+      "errors": [
+        "States a price or a pricing decision"
+      ],
+      "cite": []
+    }
+  ]
+}

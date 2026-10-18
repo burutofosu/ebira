@@ -126,7 +126,8 @@ This is bounded evidence, not proof that every later decision was found.
 Every quote is checked against the records before it is shown, and each finding
 cites its `source_ref`. A verified quote confirms the quoted words, not the
 answer's interpretation or completeness. Check important conclusions against the
-original records.
+original records. [evals](evals/README.md) holds thirty questions about made-up logs, with
+the answers known, to measure what a change to `ask` does.
 
 It needs an API key. Run `ebira ask-setup` to choose the service (Anthropic by
 default), check its key with the service's model list, which costs nothing, and

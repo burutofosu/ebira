@@ -1,0 +1,48 @@
+# tsumiki-game: a small block-stacking game. Cases A3, B4, C3, D4, E4, F4.
+project tsumiki-game /work/tsumiki-game
+
+session codex 2026-09-06 save
+10:00 you a3_rules: セーブデータの仕様：形式は JSON、スロットは slot1〜slot3 の3つ、オートセーブはチェックポイントのときだけ、ゲーム終了時は保存しない
+10:02 agent: セーブ機能を実装します。
+10:20 tool shell: godot --headless --script tests/save_test.gd
+  => save_test: 4 passed
+10:30 you c3_loop: BGM はループさせる
+10:31 agent: BGM をループ再生にします。
+11:00 agent a3_recap: ここまでのまとめです。セーブは JSON 形式で3スロット、チェックポイントでオートセーブします。BGM はループ再生です。
+11:05 you: OK、じゃあ終了処理まわりも整えて
+11:20 tool shell: godot --headless --script tests/quit_test.gd
+  => quit_test: 2 passed
+11:21 agent a3_exit: 終了時にセーブしてから閉じるようにしました。
+
+session codex 2026-09-19 sound
+20:00 you c3_once: 曲は一回流れたら止めて、あとは環境音だけでいい
+20:01 agent: BGM は1回だけ再生し、終わったら環境音に切り替えます。
+20:10 tool shell: godot --headless --script tests/audio_test.gd
+  => audio_test: 3 passed
+
+session claude 2026-09-09 enemies
+15:00 you b4_example: 敵の数とか、例えば1ステージ10体くらい？知らんけど
+15:02 agent b4_agent: 1ステージあたりの敵の数を10体に設定しました（ご指定どおり）。
+15:05 tool Edit: data/stages.json
+  => The file data/stages.json has been updated successfully.
+15:10 you: 動かしてみる
+
+session claude 2026-09-14 difficulty-am
+10:20 you d4_three: 難易度は3段階（かんたん・ふつう・むずかしい）
+10:21 agent: 難易度選択の画面を作ります。
+10:40 tool Write: scenes/difficulty_select.tscn
+  => File created successfully at: scenes/difficulty_select.tscn
+
+session claude 2026-09-14 difficulty-pm
+15:10 you d4_auto: 難易度の選択はなくして、プレイの様子を見て自動で調整するようにする
+15:11 agent: 難易度選択の画面を削除し、ミスの回数に応じて敵の速さを自動で調整します。
+15:30 tool Bash: rm scenes/difficulty_select.tscn
+  => (no output)
+
+session claude 2026-09-21 hitbox
+11:00 you: たまに当たってないのに当たる
+11:05 agent e4_agent: 当たり判定を円から矩形に変えるのがおすすめです。変更しておきました。
+11:06 tool Edit: scripts/player.gd
+  => The file scripts/player.gd has been updated successfully.
+11:10 you e4_meh: ふーん
+11:11 agent f4_assets: 他に調整したい点があれば教えてください。なお、効果音はフリー素材（CC0）を使っています。
