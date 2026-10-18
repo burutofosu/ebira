@@ -38,24 +38,37 @@ struct CommandSpec {
 
 const ASK_DETAILS: &[&str] = &[
     "  <question>                   what to find out, in your own words",
-    "  --quick                      Claude Haiku 5.5 throughout, without the check for later",
-    "                               changes: about a tenth of the cost, with more mistakes",
+    "  --quick                      the cheap model throughout, without the check for later changes:",
+    "                               about a tenth of the cost, with more mistakes",
     "  --cwd <text>                 conversations whose working directory contains the text",
     "  --from <time>, --to <time>   a yyyy-mm-dd date or an RFC 3339 time",
     "  --term <text>                a search string; repeat it to name several (otherwise the",
-    "                               plan model chooses them)",
+    "                               strong model chooses them)",
     "  --no-api                     search only, and list the records the answer would read",
     "                               (needs --term; nothing is sent or spent)",
     "  --format json|text           the result as one JSON object (default) or as text",
     "",
-    "Models and breadth:",
-    "  --plan-model <id>            chooses search strings (default claude-opus-5-5)",
-    "  --screen-model <id>          screens the records found (default claude-haiku-5-5)",
-    "  --draft-model <id>           writes the draft that feeds the second round",
+    "Service and models (saved by `ebira ask-setup`; a flag or an environment variable wins):",
+    "  --api <name>                 anthropic (default), openai, gemini, openrouter, or compatible:",
+    "                               any service or local server with the OpenAI Chat Completions API",
+    "  --api-url <url>              the base URL; compatible needs it (http://localhost:11434/v1)",
+    "  --api-key-env <name>         the variable that holds the key, if not the service's own:",
+    "                               ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY,",
+    "                               OPENROUTER_API_KEY, or EBIRA_ASK_API_KEY (compatible)",
+    "  --strong-model <id>          plans the search and writes the answer (default claude-opus-5-5)",
+    "  --cheap-model <id>           screens and drafts, and with --quick does everything",
     "                               (default claude-haiku-5-5)",
-    "  --answer-model <id>          writes the answer (default claude-opus-5-5)",
+    "The variables: EBIRA_ASK_API, EBIRA_ASK_API_URL, EBIRA_ASK_API_KEY_ENV, EBIRA_ASK_STRONG_MODEL,",
+    "EBIRA_ASK_CHEAP_MODEL. A service other than anthropic needs both models chosen. Prices are",
+    "known for Claude models only; other calls are recorded with their tokens and no price.",
+    "",
+    "One step's model, and breadth:",
+    "  --plan-model <id>            chooses search strings (default: the strong model)",
+    "  --screen-model <id>          screens the records found (default: the cheap model)",
+    "  --draft-model <id>           writes the draft that feeds the second round (the cheap model)",
+    "  --answer-model <id>          writes the answer (default: the strong model)",
     "  --effort <level>             low | medium | high | xhigh | max for the answer (default medium)",
-    "  --keep <n>                   ranked search records to read (default 40; later messages may add records)",
+    "  --keep <n>                   ranked records to read (default 40; recent messages may add more)",
     "  --person-per-term <n>        the person's messages per search string (default 60)",
     "  --agent-per-term <n>         the agents' replies per search string (default 40; 0 for none)",
     "  --candidates <n>             records screened per round (default 600)",
@@ -65,8 +78,8 @@ const ASK_DETAILS: &[&str] = &[
     "A reply cut at max_tokens is retried once with twice the output allowance (up to 64000).",
     "Both billed attempts are recorded, including a failed attempt.",
     "",
-    "The question and the text of the records read go to the Anthropic API under your key",
-    "(ANTHROPIC_API_KEY, or the one `ebira ask-setup` saved); nothing else leaves the computer.",
+    "The question and the text of the records read go to the API you name (Anthropic's unless",
+    "--api or `ebira ask-setup` says otherwise) under your key; nothing else leaves the computer.",
     "Every call is written to a ledger that `ebira ask-usage` sums.",
 ];
 
@@ -350,8 +363,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "ask",
-        synopsis: "<question> [--quick] [--cwd <text>] [--from <time>] [--to <time>] [--term <text>]... [--no-api] [--format json|text]",
-        summary: "Answer a question about past work from the records, with quotes (uses the Anthropic API)",
+        synopsis: "<question> [--quick] [--api <name>] [--cwd <text>] [--from <time>] [--to <time>] [--term <text>]... [--no-api] [--format json|text]",
+        summary: "Answer a question about past work from the records, with quotes (through a model's API)",
         details: ASK_DETAILS,
         values: &[
             "--corpus",
@@ -369,6 +382,11 @@ const COMMANDS: &[CommandSpec] = &[
             "--person-per-term",
             "--agent-per-term",
             "--candidates",
+            "--api",
+            "--api-url",
+            "--api-key-env",
+            "--strong-model",
+            "--cheap-model",
         ],
         positional: Some("<question>"),
         flags: &["--quick", "--no-api"],
@@ -376,13 +394,15 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ask-setup",
         synopsis: "[--no-open]",
-        summary: "Open a page on this computer to check, save, or remove the API key `ask` uses",
+        summary: "Open a page on this computer to choose the API, key, and models `ask` uses",
         details: &[
             "  --no-open                    print the page's address without opening a browser",
             "",
-            "The page saves the key as the Windows user environment variable ANTHROPIC_API_KEY,",
-            "from Windows or from WSL; elsewhere, set ANTHROPIC_API_KEY yourself. `ask` reads the",
-            "saved key there itself, also in a program started before it was saved.",
+            "The page checks a key with the service's model list, which costs nothing, and saves",
+            "the service, the key, and the models as Windows user environment variables, from",
+            "Windows or from WSL. `ask` reads them there itself, also in a program started before",
+            "they were saved; a flag or a variable set in the environment comes first. Elsewhere,",
+            "the page shows the variables to set.",
         ],
         values: &[],
         positional: None,
@@ -414,7 +434,7 @@ fn usage() -> String {
         env!("CARGO_PKG_VERSION")
     );
     for spec in COMMANDS {
-        text.push_str(&format!("  {:<10}{}\n", spec.name, spec.summary));
+        text.push_str(&format!("  {:<11}{}\n", spec.name, spec.summary));
     }
     text.push_str(
         "\nThe commands that read a corpus take --corpus <dir> (default: $EBIRA_CORPUS, else the\n\
@@ -593,6 +613,79 @@ fn bounded_number(
     }
 }
 
+/// The service `ask` sends its requests to, and its models. Each comes from its flag, else from
+/// its variable in this process (set even to nothing, it wins: the default then applies), else
+/// from what `ebira ask-setup` saved. A step's own model flag comes after all of them.
+fn ask_service(args: &[String], options: &mut ask::Options) -> io::Result<()> {
+    let setting = |flag: &str, variable: &str| {
+        option_values(args, flag)
+            .into_iter()
+            .next()
+            .or_else(|| match std::env::var_os(variable) {
+                Some(value) => Some(value.to_string_lossy().into_owned()),
+                None => ask::saved_setting(variable),
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    options.endpoint = ask::Endpoint::named(
+        setting("--api", "EBIRA_ASK_API")
+            .as_deref()
+            .unwrap_or("anthropic"),
+        setting("--api-url", "EBIRA_ASK_API_URL").as_deref(),
+        setting("--api-key-env", "EBIRA_ASK_API_KEY_ENV").as_deref(),
+    )
+    .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    // The strong model plans and answers, the cheap one screens and drafts; --quick has the
+    // cheap one do everything.
+    let quick = has_flag(args, "--quick");
+    let strong = setting("--strong-model", "EBIRA_ASK_STRONG_MODEL");
+    let cheap = setting("--cheap-model", "EBIRA_ASK_CHEAP_MODEL");
+    let planner = if quick { &cheap } else { &strong };
+    if let Some(model) = planner {
+        options.plan_model = model.clone();
+        options.answer_model = model.clone();
+    }
+    if let Some(model) = &cheap {
+        options.screen_model = model.clone();
+        if options.draft_model.is_some() {
+            options.draft_model = Some(model.clone());
+        }
+    }
+    if options.endpoint.name == "anthropic" {
+        return Ok(());
+    }
+    // The defaults are Claude models: another API needs its own named, before anything is sent.
+    let named = |flag: &str| !option_values(args, flag).is_empty();
+    let unnamed: Vec<&str> = [
+        ("--plan-model", planner.is_some()),
+        ("--answer-model", planner.is_some()),
+        ("--screen-model", cheap.is_some()),
+        ("--draft-model", quick || cheap.is_some()),
+    ]
+    .into_iter()
+    .filter(|(flag, covered)| !covered && !named(flag))
+    .map(|(flag, _)| flag)
+    .collect();
+    if unnamed.is_empty() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "--api {} needs its models named: {} (or each step's: {}), or choose them once with \
+             `ebira ask-setup`",
+            options.endpoint.name,
+            if quick {
+                "--cheap-model <id>"
+            } else {
+                "--strong-model <id> and --cheap-model <id>"
+            },
+            unnamed.join(", ")
+        ),
+    ))
+}
+
 fn ask_options(args: &[String], question: String) -> io::Result<ask::Options> {
     let mut options = if has_flag(args, "--quick") {
         ask::Options::quick(question)
@@ -611,6 +704,9 @@ fn ask_options(args: &[String], question: String) -> io::Result<ask::Options> {
     options.terms = option_values(args, "--term");
     options.no_api = has_flag(args, "--no-api");
     options.text_format = text_format(args)?;
+    if !options.no_api {
+        ask_service(args, &mut options)?;
+    }
     for (name, model) in [
         ("--plan-model", &mut options.plan_model),
         ("--screen-model", &mut options.screen_model),

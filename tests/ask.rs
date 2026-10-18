@@ -6,6 +6,16 @@ use std::process::Command;
 
 const EBIRA: &str = env!("CARGO_BIN_EXE_ebira");
 
+/// The settings `ebira ask-setup` saves. Set to nothing here, they keep what may be saved on
+/// this computer out of the tests: the defaults apply.
+const SETTINGS: [&str; 5] = [
+    "EBIRA_ASK_API",
+    "EBIRA_ASK_API_URL",
+    "EBIRA_ASK_API_KEY_ENV",
+    "EBIRA_ASK_STRONG_MODEL",
+    "EBIRA_ASK_CHEAP_MODEL",
+];
+
 /// Runs ebira with a home and data directories inside `home`, so nothing outside the test is
 /// read or written.
 fn ebira(home: &Path) -> Command {
@@ -20,6 +30,9 @@ fn ebira(home: &Path) -> Command {
         .env_remove("EBIRA_CORPUS")
         .env_remove("EBIRA_TZ_OFFSET")
         .env_remove("EBIRA_ASK_BUDGET_USD");
+    for name in SETTINGS {
+        command.env(name, "");
+    }
     command
 }
 
@@ -381,7 +394,11 @@ fn help_lists_the_ask_commands() {
     }
     let ask = logs.run(&["help", "ask"]);
     assert!(ask.starts_with("ebira ask <question>"), "{ask}");
-    assert!(ask.contains("go to the Anthropic API"), "{ask}");
+    assert!(ask.contains("go to the API you name"), "{ask}");
+    assert!(
+        ask.contains("--api <name>") && ask.contains("compatible"),
+        "{ask}"
+    );
     let setup = logs.run(&["help", "ask-setup"]);
     assert!(
         !setup.contains("--corpus"),

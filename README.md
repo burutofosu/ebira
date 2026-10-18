@@ -7,7 +7,7 @@ record behind a result.
 The original JSONL logs are the source of truth. Ebira builds a local
 projection called a corpus, which can be rebuilt from them. Nothing is uploaded,
 except by `ebira ask`, which sends your question and the text of the records it
-reads to the Anthropic API under your own key.
+reads to the model API you choose (Anthropic's by default) under your own key.
 
 ## Install and index
 
@@ -105,8 +105,9 @@ Run `ebira help` for all commands and `ebira help <command>` for options.
 ebira ask "What did I decide about retries, and did I change it later?" --format text
 ```
 
-Claude models choose search strings, screen what Ebira finds, and read the
-records around the best of it. A draft answer feeds a second round of searching
+Two models, Claude Opus 5.5 and Claude Haiku 5.5 unless others are chosen, pick
+the search strings, screen what Ebira finds, and read the records around the best
+of it. A draft answer feeds a second round of searching
 and a check of your later messages for changes to each decision it reports.
 It also reads the last eight human messages in up to four of the newest related
 sessions, without requiring those messages to repeat a search word. Date and
@@ -120,22 +121,55 @@ cites its `source_ref`. A verified quote confirms the quoted words, not the
 answer's interpretation or completeness. Check important conclusions against the
 original records.
 
-It needs an Anthropic API key: set `ANTHROPIC_API_KEY`, or run `ebira ask-setup`
-to check and save one from a page on this computer (on Windows and in WSL, it is
-saved as a Windows user environment variable, and Ebira reads it from there
-itself, so a program started before it was saved need not pass it). Answers give
-times in the corpus's zone. The question and the text of the
-records read, not images, go to the Anthropic API; nothing else leaves the
-computer. With the defaults, Claude Opus 5.5 and Claude Haiku 5.5, a question
-costs about $0.30 and takes about two minutes. `--quick` uses Claude Haiku 5.5
-throughout for about a tenth of that, with more mistakes about what changed
-later. A reply cut at `max_tokens` is retried once with twice the output allowance,
-up to 64,000 tokens, using the same model and evidence. Both billed attempts are
+It needs an API key. Run `ebira ask-setup` to choose the service (Anthropic by
+default), check its key with the service's model list, which costs nothing, and
+choose the models, on a page on this computer. On Windows and in WSL they are
+saved as Windows user environment variables, and `ebira ask` reads them there
+itself, so an agent started before they were saved need not pass them; elsewhere,
+the page shows the variables to set. For the defaults, setting
+`ANTHROPIC_API_KEY` is enough.
+
+Answers give times in the corpus's zone. The question and the text of the records
+read, not images, go to the chosen API; nothing else leaves the computer. With the
+defaults, Claude Opus 5.5 and Claude Haiku 5.5, a question costs about $0.35 and
+takes one to two minutes. `--quick` uses the cheap model throughout for about a
+tenth of that, with more mistakes about what changed later.
+
+A reply cut at `max_tokens` is retried once with twice the output allowance, up to
+64,000 tokens, using the same model and evidence. Both billed attempts are
 recorded, including failures; an invalid response or refusal is not retried by
-this output-limit handling. `ebira ask-usage` sums what has been spent, from a ledger in the data
-directory, per question and apart from questions (lines written before questions
-were recorded, or by another program). `--no-api` with `--term` searches only and
-lists the records an answer would read.
+this output-limit handling. `ebira ask-usage` sums what has been spent, from a
+ledger in the data directory, per question and apart from questions (lines
+written before questions were recorded, or by another program). `--no-api` with
+`--term` searches only and lists the records an answer would read.
+
+### Other services
+
+`ebira ask-setup` also offers OpenAI, Google Gemini, OpenRouter, and any other
+service or local server that speaks the OpenAI Chat Completions API (Ollama,
+LM Studio, vLLM, a proxy). Each keeps its key in its own variable
+(`OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, or `EBIRA_ASK_API_KEY`
+for another service; a local server may need none) and needs two models chosen
+from its list: a strong one that chooses the search strings and writes the
+answer, and a cheap one that screens and drafts, and with `--quick` does
+everything.
+
+Flags, or variables set in the environment, come before what is saved:
+
+```sh
+ebira ask "What did I decide about retries?" --api openai --strong-model <id> --cheap-model <id>
+ebira ask "What did I decide about retries?" --api compatible --api-url http://localhost:11434/v1 --cheap-model <id> --quick
+```
+
+The variables are `EBIRA_ASK_API`, `EBIRA_ASK_API_URL`, `EBIRA_ASK_API_KEY_ENV`
+(another variable to read the key from), `EBIRA_ASK_STRONG_MODEL`, and
+`EBIRA_ASK_CHEAP_MODEL`. The reply's shape is asked for with a strict JSON schema,
+which is also written into the instructions for a service that ignores it; a
+service that refuses part of a request (the schema, the effort, the name of the
+output limit) is asked again without that part. Prices are known only for Claude
+models: other calls are recorded with their tokens and counted as unpriced. The
+instructions were tuned with Claude models; whichever model answers, its quotes
+are checked against the records.
 
 ## Logs in other locations
 

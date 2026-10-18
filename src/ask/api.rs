@@ -1,4 +1,5 @@
-//! The Claude Messages API over HTTPS through curl, which Windows 10 and later and most Linux
+//! The Claude Messages API, or the OpenAI Chat Completions API that many other services and
+//! local servers speak, over HTTPS through curl, which Windows 10 and later and most Linux
 //! systems ship, so Ebira needs no HTTP library. The API key reaches curl on its standard input:
 //! never on a command line, never on disk.
 
@@ -19,9 +20,125 @@ const API_VERSION: &str = "2023-06-01";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const ATTEMPTS: u32 = 5;
 
+/// How a service is spoken to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    /// The Claude Messages API.
+    Anthropic,
+    /// The OpenAI Chat Completions API, which many services and local servers also speak.
+    ChatCompletions,
+}
+
+/// The names `--api` takes.
+pub const APIS: [&str; 5] = ["anthropic", "openai", "gemini", "openrouter", "compatible"];
+
+/// The service `ask` sends its requests to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    /// One of `APIS`.
+    pub name: String,
+    pub dialect: Dialect,
+    /// The base URL: the Messages API's host, or the path `/chat/completions` sits under.
+    pub url: String,
+    /// The environment variable that holds the key. A compatible server may take none.
+    pub key_variable: String,
+    /// Chat Completions: the output limit is named `max_completion_tokens` (OpenAI's reasoning
+    /// models refuse `max_tokens`), and the effort is sent as `reasoning_effort`.
+    completion_tokens: bool,
+    reasoning_effort: bool,
+}
+
+impl Endpoint {
+    /// The named service, at `url` and with its key in `key_variable` when they are given.
+    pub fn named(
+        name: &str,
+        url: Option<&str>,
+        key_variable: Option<&str>,
+    ) -> Result<Endpoint, String> {
+        let anthropic_url = std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+        let (dialect, default_url, default_key, completion_tokens, reasoning_effort) = match name {
+            "anthropic" => (
+                Dialect::Anthropic,
+                anthropic_url,
+                super::keys::VARIABLE,
+                false,
+                false,
+            ),
+            "openai" => (
+                Dialect::ChatCompletions,
+                "https://api.openai.com/v1".to_string(),
+                "OPENAI_API_KEY",
+                true,
+                true,
+            ),
+            "gemini" => (
+                Dialect::ChatCompletions,
+                "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+                "GEMINI_API_KEY",
+                false,
+                true,
+            ),
+            "openrouter" => (
+                Dialect::ChatCompletions,
+                "https://openrouter.ai/api/v1".to_string(),
+                "OPENROUTER_API_KEY",
+                false,
+                false,
+            ),
+            "compatible" => (
+                Dialect::ChatCompletions,
+                String::new(),
+                "EBIRA_ASK_API_KEY",
+                false,
+                false,
+            ),
+            _ => {
+                return Err(format!(
+                    "--api must be one of {}, got {name}",
+                    APIS.join(", ")
+                ))
+            }
+        };
+        let url = url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+            .unwrap_or(default_url);
+        if url.is_empty() {
+            return Err(
+                "--api compatible needs --api-url: the base URL that /chat/completions \
+                        sits under, such as http://localhost:11434/v1"
+                    .to_string(),
+            );
+        }
+        let key_variable = key_variable
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(default_key);
+        Ok(Endpoint {
+            name: name.to_string(),
+            dialect,
+            url: url.trim_end_matches('/').to_string(),
+            key_variable: key_variable.to_string(),
+            completion_tokens,
+            reasoning_effort,
+        })
+    }
+}
+
+impl Default for Endpoint {
+    /// The Claude API.
+    fn default() -> Endpoint {
+        Endpoint::named("anthropic", None, None).expect("the Claude API is always named")
+    }
+}
+
 pub struct Client {
     key: String,
-    url: String,
+    endpoint: Endpoint,
     scratch: PathBuf,
 }
 
@@ -135,17 +252,24 @@ impl fmt::Display for ApiError {
 }
 
 impl Client {
-    /// The client for the key `keys::find` gives (this process's `ANTHROPIC_API_KEY`, else the
-    /// Windows user environment), at `ANTHROPIC_BASE_URL` if it is set. `scratch` holds each
-    /// request's files while it runs.
-    pub fn from_env(scratch: PathBuf) -> Result<Client, String> {
-        let Some((key, _)) = super::keys::find() else {
-            return Err(super::keys::missing());
+    /// The client for `endpoint`, with the key in its variable (this process's environment, else
+    /// the Windows user environment). A compatible server, such as a local one, may take no key.
+    /// `scratch` holds each request's files while it runs.
+    pub fn for_endpoint(endpoint: &Endpoint, scratch: PathBuf) -> Result<Client, String> {
+        let key = match super::keys::find_named(&endpoint.key_variable) {
+            Some((key, _)) => key,
+            None if endpoint.name == "compatible" => String::new(),
+            None => return Err(super::keys::missing_named(&endpoint.key_variable)),
         };
-        Client::with_key(key, scratch)
+        Client::new(endpoint.clone(), key, scratch)
     }
 
-    pub fn with_key(key: String, scratch: PathBuf) -> Result<Client, String> {
+    /// The client for `endpoint` with this key (`ask-setup` checks a key with it).
+    pub fn for_key(endpoint: &Endpoint, key: String, scratch: PathBuf) -> Result<Client, String> {
+        Client::new(endpoint.clone(), key, scratch)
+    }
+
+    fn new(endpoint: Endpoint, key: String, scratch: PathBuf) -> Result<Client, String> {
         if !key
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -154,22 +278,21 @@ impl Client {
                 "the API key holds unexpected characters (quotes or spaces around it?)".into(),
             );
         }
-        let base = std::env::var("ANTHROPIC_BASE_URL")
-            .ok()
-            .filter(|url| !url.trim().is_empty())
-            .unwrap_or_else(|| "https://api.anthropic.com".to_string());
         private_fs::create_dir_all(&scratch)
             .map_err(|error| format!("cannot create {}: {error}", scratch.display()))?;
         Ok(Client {
             key,
-            url: base.trim().trim_end_matches('/').to_string(),
+            endpoint,
             scratch,
         })
     }
 
-    /// One Messages request whose reply is JSON following `request.schema`, tried again on
-    /// overload and network errors.
+    /// One request whose reply is JSON following `request.schema`, tried again on overload and
+    /// network errors.
     pub fn send(&self, request: &Request) -> Result<Reply, ApiError> {
+        if self.endpoint.dialect == Dialect::ChatCompletions {
+            return self.send_chat(request);
+        }
         let fallbacks = takes_default_fallback(request.model);
         let body = request_body(request, fallbacks);
         let beta = fallbacks.then_some(FALLBACK_BETA);
@@ -178,10 +301,51 @@ impl Client {
         read_reply(&response.body)
     }
 
-    /// The ids of the models this key can use. Listing them spends no tokens.
+    /// A Chat Completions request. Services differ in what they take: one that refuses a part
+    /// of the request (the strict schema, the effort, the name of the output limit) is asked
+    /// again without it.
+    fn send_chat(&self, request: &Request) -> Result<Reply, ApiError> {
+        let mut shape = ChatShape {
+            schema: true,
+            effort: self.endpoint.reasoning_effort,
+            completion_tokens: self.endpoint.completion_tokens,
+            limit_switched: false,
+        };
+        loop {
+            let body = chat_body(request, shape);
+            let error = match self
+                .with_retries(|| self.http("POST", "/chat/completions", Some(body.as_str()), None))
+            {
+                Ok(response) => return read_chat_reply(&response.body),
+                Err(error) => error,
+            };
+            let next = match &error {
+                ApiError::Status {
+                    status: 400,
+                    message,
+                    ..
+                } => shape.without(message),
+                _ => None,
+            };
+            match next {
+                Some(next) => shape = next,
+                None => return Err(error),
+            }
+        }
+    }
+
+    /// The ids of the models this key can use. Listing them spends no tokens. Asked once, not
+    /// again after a failure: a check should say at once that a server is not answering.
     pub fn models(&self) -> Result<Vec<String>, ApiError> {
-        let response =
-            self.with_retries(|| self.http("GET", "/v1/models?limit=1000", None, None))?;
+        let path = match self.endpoint.dialect {
+            Dialect::Anthropic => "/v1/models?limit=1000",
+            Dialect::ChatCompletions => "/models",
+        };
+        let response = match self.http("GET", path, None, None) {
+            Ok(response) if response.status == 200 => response,
+            Ok(response) => return Err(status_error(&response)),
+            Err((_, message)) => return Err(ApiError::Transport(message)),
+        };
         let value = value::parse(&response.body)
             .map_err(|error| ApiError::Transport(format!("the model list is not JSON: {error}")))?;
         Ok(value
@@ -237,12 +401,21 @@ impl Client {
         let mut set = |name: &str, value: &str| {
             config.push_str(&format!("{name} = \"{}\"\n", config_quote(value)))
         };
-        set("url", &format!("{}{path}", self.url));
+        set("url", &format!("{}{path}", self.endpoint.url));
         set("request", method);
-        set("header", &format!("x-api-key: {}", self.key));
-        set("header", &format!("anthropic-version: {API_VERSION}"));
-        if let Some(beta) = beta {
-            set("header", &format!("anthropic-beta: {beta}"));
+        match self.endpoint.dialect {
+            Dialect::Anthropic => {
+                set("header", &format!("x-api-key: {}", self.key));
+                set("header", &format!("anthropic-version: {API_VERSION}"));
+                if let Some(beta) = beta {
+                    set("header", &format!("anthropic-beta: {beta}"));
+                }
+            }
+            Dialect::ChatCompletions => {
+                if !self.key.is_empty() {
+                    set("header", &format!("authorization: Bearer {}", self.key));
+                }
+            }
         }
         if body.is_some() {
             set("header", "content-type: application/json");
@@ -293,7 +466,9 @@ impl Client {
             status,
             body,
             retry_after: header(&headers, "retry-after").and_then(|value| value.parse().ok()),
-            request_id: header(&headers, "request-id").unwrap_or_default(),
+            request_id: header(&headers, "request-id")
+                .or_else(|| header(&headers, "x-request-id"))
+                .unwrap_or_default(),
         })
     }
 }
@@ -464,6 +639,196 @@ fn read_usage(usage: Option<&Value>) -> Usage {
     }
 }
 
+/// What a Chat Completions request holds, as far as services differ in what they take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChatShape {
+    /// The reply's shape is asked for as a strict `json_schema`; else as a `json_object`, with
+    /// the schema in the instructions.
+    schema: bool,
+    /// The effort goes as `reasoning_effort`.
+    effort: bool,
+    /// The output limit is named `max_completion_tokens`; else `max_tokens`.
+    completion_tokens: bool,
+    /// The other name of the output limit was tried already.
+    limit_switched: bool,
+}
+
+impl ChatShape {
+    /// The shape without the part a refusal of the request (HTTP 400) names; none when it names
+    /// none that is left to drop.
+    fn without(self, message: &str) -> Option<ChatShape> {
+        let message = message.to_ascii_lowercase();
+        if self.effort && message.contains("reasoning") {
+            return Some(ChatShape {
+                effort: false,
+                ..self
+            });
+        }
+        if self.schema && (message.contains("response_format") || message.contains("schema")) {
+            return Some(ChatShape {
+                schema: false,
+                ..self
+            });
+        }
+        if !self.limit_switched && message.contains("max_") && message.contains("token") {
+            return Some(ChatShape {
+                completion_tokens: !self.completion_tokens,
+                limit_switched: true,
+                ..self
+            });
+        }
+        None
+    }
+}
+
+fn chat_body(request: &Request, shape: ChatShape) -> String {
+    // The schema goes in the instructions as well: some services take `response_format` and
+    // silently do nothing with it.
+    let system = format!(
+        "{}\n\nReply with one JSON object and nothing else. It must follow this JSON schema:\n{}",
+        request.system,
+        request.schema.to_json()
+    );
+    let format = if shape.schema {
+        value::object([
+            ("type", value::string("json_schema")),
+            (
+                "json_schema",
+                value::object([
+                    ("name", value::string("reply")),
+                    ("strict", Value::Bool(true)),
+                    ("schema", request.schema.clone()),
+                ]),
+            ),
+        ])
+    } else {
+        value::object([("type", value::string("json_object"))])
+    };
+    let limit = if shape.completion_tokens {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    let mut fields = vec![
+        ("model".to_string(), value::string(request.model)),
+        (
+            "messages".to_string(),
+            Value::Array(vec![
+                value::object([
+                    ("role", value::string("system")),
+                    ("content", value::string(system)),
+                ]),
+                value::object([
+                    ("role", value::string("user")),
+                    ("content", value::string(request.user)),
+                ]),
+            ]),
+        ),
+        (
+            limit.to_string(),
+            value::number(u64::from(request.max_tokens)),
+        ),
+        ("response_format".to_string(), format),
+    ];
+    if shape.effort {
+        fields.push((
+            "reasoning_effort".to_string(),
+            value::string(reasoning_effort(request.effort)),
+        ));
+    }
+    Value::Object(fields).to_json()
+}
+
+/// Ebira's effort as `reasoning_effort` takes it.
+fn reasoning_effort(effort: &str) -> &'static str {
+    match effort {
+        "low" => "low",
+        "medium" => "medium",
+        _ => "high",
+    }
+}
+
+fn read_chat_reply(body: &str) -> Result<Reply, ApiError> {
+    let reply = value::parse(body)
+        .map_err(|error| ApiError::Transport(format!("the reply is not JSON: {error}")))?;
+    let model = reply.str_at("model").to_string();
+    let usage = read_chat_usage(reply.get("usage"));
+    let Some(choice) = reply.array_at("choices").first() else {
+        return Err(ApiError::Unusable {
+            model,
+            usage,
+            reason: "the reply holds no choice".to_string(),
+        });
+    };
+    let message = choice.get("message");
+    let refusal = message
+        .map(|message| message.str_at("refusal"))
+        .unwrap_or("");
+    let finish = choice.str_at("finish_reason");
+    if !refusal.is_empty() || finish == "content_filter" {
+        return Err(ApiError::Refused {
+            model,
+            usage,
+            category: if refusal.is_empty() {
+                finish.to_string()
+            } else {
+                "refusal".to_string()
+            },
+        });
+    }
+    if finish == "length" {
+        return Err(ApiError::Truncated { model, usage });
+    }
+    let text = message.map(message_text).unwrap_or_default();
+    match value::parse(without_fence(text.trim())) {
+        Ok(output) => Ok(Reply {
+            output,
+            model,
+            usage,
+        }),
+        Err(error) => Err(ApiError::Unusable {
+            model,
+            usage,
+            reason: format!("the reply is not the JSON asked for ({error})"),
+        }),
+    }
+}
+
+/// A message's text: a string, or the text parts of a list.
+fn message_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts.iter().map(|part| part.str_at("text")).collect(),
+        _ => String::new(),
+    }
+}
+
+/// JSON a model wrapped in a Markdown code fence, without the fence.
+fn without_fence(text: &str) -> &str {
+    let Some(inner) = text.strip_prefix("```") else {
+        return text;
+    };
+    let inner = inner.strip_prefix("json").unwrap_or(inner).trim();
+    inner.strip_suffix("```").map(str::trim).unwrap_or(inner)
+}
+
+/// Chat Completions usage. The prompt's cached part is counted apart, as Claude's is.
+fn read_chat_usage(usage: Option<&Value>) -> Usage {
+    let Some(usage) = usage else {
+        return Usage::default();
+    };
+    let cached = usage
+        .get("prompt_tokens_details")
+        .map(|details| details.u64_at("cached_tokens"))
+        .unwrap_or(0);
+    Usage {
+        input: usage.u64_at("prompt_tokens").saturating_sub(cached),
+        output: usage.u64_at("completion_tokens"),
+        cache_read: cached,
+        cache_write: 0,
+    }
+}
+
 fn status_error(response: &Response) -> ApiError {
     let message = value::parse(&response.body)
         .ok()
@@ -626,5 +991,178 @@ mod tests {
     #[test]
     fn quotes_config_values() {
         assert_eq!(config_quote(r#"a"b\c"#), r#"a\"b\\c"#);
+    }
+
+    #[test]
+    fn names_each_service_with_its_url_and_key() {
+        let openai = Endpoint::named("openai", None, None).unwrap();
+        assert_eq!(openai.dialect, Dialect::ChatCompletions);
+        assert_eq!(openai.url, "https://api.openai.com/v1");
+        assert_eq!(openai.key_variable, "OPENAI_API_KEY");
+        let gemini = Endpoint::named("gemini", None, None).unwrap();
+        assert_eq!(
+            gemini.url,
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(gemini.key_variable, "GEMINI_API_KEY");
+        let local = Endpoint::named(
+            "compatible",
+            Some(" http://localhost:11434/v1/ "),
+            Some("LOCAL_KEY"),
+        )
+        .unwrap();
+        assert_eq!(local.url, "http://localhost:11434/v1");
+        assert_eq!(local.key_variable, "LOCAL_KEY");
+        assert!(Endpoint::named("compatible", None, None)
+            .unwrap_err()
+            .contains("--api-url"));
+        assert!(Endpoint::named("bedrock", None, None)
+            .unwrap_err()
+            .contains("anthropic, openai, gemini, openrouter, compatible"));
+        assert_eq!(Endpoint::default().dialect, Dialect::Anthropic);
+    }
+
+    fn chat_request(schema: &Value) -> Request<'_> {
+        Request {
+            model: "small-model",
+            effort: "xhigh",
+            max_tokens: 6000,
+            system: "sys",
+            user: "地図の色",
+            schema,
+        }
+    }
+
+    #[test]
+    fn builds_a_chat_completions_request_with_a_strict_schema() {
+        let schema = schema();
+        let shape = ChatShape {
+            schema: true,
+            effort: true,
+            completion_tokens: true,
+            limit_switched: false,
+        };
+        let body = value::parse(&chat_body(&chat_request(&schema), shape)).unwrap();
+        assert_eq!(body.str_at("model"), "small-model");
+        let messages = body.array_at("messages");
+        assert_eq!(messages[0].str_at("role"), "system");
+        assert!(messages[0].str_at("content").starts_with("sys\n\n"));
+        assert!(
+            messages[0]
+                .str_at("content")
+                .ends_with(&format!("follow this JSON schema:\n{}", schema.to_json())),
+            "the schema is in the instructions too, for a service that ignores response_format"
+        );
+        assert_eq!(messages[1].str_at("content"), "地図の色");
+        assert_eq!(body.u64_at("max_completion_tokens"), 6000);
+        assert!(body.get("max_tokens").is_none());
+        let format = body.get("response_format").unwrap();
+        assert_eq!(format.str_at("type"), "json_schema");
+        let json_schema = format.get("json_schema").unwrap();
+        assert_eq!(json_schema.get("strict"), Some(&Value::Bool(true)));
+        assert_eq!(json_schema.get("schema"), Some(&schema));
+        assert_eq!(body.str_at("reasoning_effort"), "high");
+
+        let plain = ChatShape {
+            schema: false,
+            effort: false,
+            completion_tokens: false,
+            limit_switched: true,
+        };
+        let body = value::parse(&chat_body(&chat_request(&schema), plain)).unwrap();
+        assert_eq!(body.u64_at("max_tokens"), 6000);
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(
+            body.get("response_format").unwrap().str_at("type"),
+            "json_object"
+        );
+        assert!(body.array_at("messages")[0]
+            .str_at("content")
+            .contains("follow this JSON schema"));
+    }
+
+    #[test]
+    fn drops_what_a_service_refuses_one_part_at_a_time() {
+        let full = ChatShape {
+            schema: true,
+            effort: true,
+            completion_tokens: true,
+            limit_switched: false,
+        };
+        let without_effort = full
+            .without("Unsupported parameter: 'reasoning_effort' is not supported with this model.")
+            .unwrap();
+        assert!(!without_effort.effort && without_effort.schema);
+        let without_schema = without_effort
+            .without("Invalid parameter: 'response_format' of type 'json_schema' is not supported")
+            .unwrap();
+        assert!(!without_schema.schema);
+        let other_limit = without_schema
+            .without("Unsupported parameter: 'max_completion_tokens'")
+            .unwrap();
+        assert!(!other_limit.completion_tokens && other_limit.limit_switched);
+        assert_eq!(
+            other_limit.without("Unsupported parameter: 'max_tokens'"),
+            None
+        );
+        assert_eq!(full.without("The model `x` does not exist"), None);
+    }
+
+    #[test]
+    fn reads_a_chat_completions_reply() {
+        let body = r#"{"model":"small-model-2026","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"はい\"}","refusal":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1200,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":1000}}}"#;
+        let reply = read_chat_reply(body).unwrap();
+        assert_eq!(reply.output.str_at("answer"), "はい");
+        assert_eq!(reply.model, "small-model-2026");
+        assert_eq!(
+            reply.usage,
+            Usage {
+                input: 200,
+                output: 300,
+                cache_read: 1000,
+                cache_write: 0
+            }
+        );
+        let fenced = r#"{"model":"m","choices":[{"message":{"content":"```json\n{\"answer\":\"ok\"}\n```"},"finish_reason":"stop"}]}"#;
+        assert_eq!(
+            read_chat_reply(fenced).unwrap().output.str_at("answer"),
+            "ok"
+        );
+        let parts = r#"{"model":"m","choices":[{"message":{"content":[{"type":"text","text":"{\"answer\":"},{"type":"text","text":"\"ok\"}"}]},"finish_reason":"stop"}]}"#;
+        assert_eq!(
+            read_chat_reply(parts).unwrap().output.str_at("answer"),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn reports_chat_refusals_cut_replies_and_other_text() {
+        let refused = r#"{"model":"m","choices":[{"message":{"content":null,"refusal":"I can't help with that."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        match read_chat_reply(refused) {
+            Err(error @ ApiError::Refused { .. }) => {
+                assert_eq!(error.billed().unwrap().1.input, 10)
+            }
+            _ => panic!("expected a refusal"),
+        }
+        let filtered = r#"{"model":"m","choices":[{"message":{"content":""},"finish_reason":"content_filter"}]}"#;
+        assert!(matches!(
+            read_chat_reply(filtered),
+            Err(ApiError::Refused { category, .. }) if category == "content_filter"
+        ));
+        let cut = r#"{"model":"m","choices":[{"message":{"content":"{\"sc"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":6000}}"#;
+        assert!(matches!(
+            read_chat_reply(cut),
+            Err(ApiError::Truncated { .. })
+        ));
+        let prose =
+            r#"{"model":"m","choices":[{"message":{"content":"Sure!"},"finish_reason":"stop"}]}"#;
+        assert!(matches!(
+            read_chat_reply(prose),
+            Err(ApiError::Unusable { .. })
+        ));
+        assert!(matches!(
+            read_chat_reply(r#"{"model":"m","choices":[]}"#),
+            Err(ApiError::Unusable { .. })
+        ));
     }
 }

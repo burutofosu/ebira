@@ -22,11 +22,12 @@ format or reading rules changed, sync rebuilds the corpus from the logs.
 
 ## Ask first
 
-When an Anthropic API key is set (`ANTHROPIC_API_KEY`, or one saved with
-`ebira ask-setup`), let Ebira do the first search and reading. Ebira reads a
-saved key from the Windows user environment itself, also when your process
-started before it was saved, so do not read the key or pass it yourself;
-without one, `ebira ask` stops at once with `no API key`, at no cost.
+When `ebira ask` has an API key (saved with `ebira ask-setup`, or
+`ANTHROPIC_API_KEY`), let Ebira do the first search and reading. Ebira reads the
+saved service, models, and key from the Windows user environment itself, also
+when your process started before they were saved, so do not read the key, pass
+it, or name a service or models yourself; without a key, `ebira ask` stops at
+once with `no API key`, at no cost.
 
 ```text
 ebira ask "<the question, in the person's words>" [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] --format text
@@ -35,8 +36,9 @@ ebira ask "<the question, in the person's words>" [--cwd <project-path-part>] [-
 It chooses search strings, screens what it finds, reads the records around the
 best of them, checks the person's later messages for changes to each decision it
 reports, and answers with quotes, each checked against the records and cited by
-source reference. It takes about two minutes and costs about 30 US cents a question;
-`--quick` costs a tenth and makes more mistakes about what changed later. A quote
+source reference. It takes one to two minutes and, with the default models,
+costs about 35 US cents a question; `--quick` costs a tenth and makes more
+mistakes about what changed later. A quote
 marked `(not found in the records)` is not one.
 
 The answer also includes a bounded tail of recent human messages from related

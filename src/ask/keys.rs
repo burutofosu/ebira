@@ -1,10 +1,11 @@
-//! Where the API key lives: this process's environment, or the Windows user environment
-//! (HKCU\Environment), which `ebira ask-setup` writes so that every tool on the computer can
-//! read it, from Windows and from WSL alike. The key reaches PowerShell on its standard input,
-//! never on a command line.
+//! Where the API keys and the settings `ebira ask-setup` saves live: this process's environment,
+//! or the Windows user environment (HKCU\Environment), which the page writes so that every tool
+//! on the computer can read it, from Windows and from WSL alike. Values reach PowerShell on its
+//! standard input, never on a command line.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 pub const VARIABLE: &str = "ANTHROPIC_API_KEY";
 
@@ -23,84 +24,107 @@ impl Source {
     }
 }
 
-/// The key from this process's environment, else the one saved in the Windows user environment.
-pub fn find() -> Option<(String, Source)> {
-    if let Ok(key) = std::env::var(VARIABLE) {
+/// The key in the environment variable `name`: this process's, else the Windows user one.
+pub fn find_named(name: &str) -> Option<(String, Source)> {
+    if let Ok(key) = std::env::var(name) {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Some((key, Source::Process));
         }
     }
-    read_user_variable(VARIABLE).map(|key| (key, Source::WindowsUser))
+    saved(name).map(|key| (key, Source::WindowsUser))
 }
 
-/// Why `find` found no key: where it looked, and what to do.
-pub fn missing() -> String {
-    missing_message(query_user_variable(VARIABLE).is_some())
+/// Why `find_named(name)` found no key: where it looked, and what to do.
+pub fn missing_named(name: &str) -> String {
+    missing_message(name, saved_values().is_some())
 }
 
-fn missing_message(windows_readable: bool) -> String {
+fn missing_message(name: &str, windows_readable: bool) -> String {
     if windows_readable {
         format!(
-            "no API key: {VARIABLE} is not set in this process, and none is saved in the Windows \
-             user environment; save one with `ebira ask-setup`"
+            "no API key: {name} is not set in this process, and none is saved in the Windows \
+             user environment; save one with `ebira ask-setup`, or set {name}"
         )
     } else {
         format!(
-            "no API key: {VARIABLE} is not set in this process, and the Windows user environment, \
-             where `ebira ask-setup` saves a key, cannot be read here; set {VARIABLE}"
+            "no API key: {name} is not set in this process, and the Windows user environment \
+             cannot be read here; set {name}"
         )
     }
 }
 
-/// A Windows user environment variable, read with reg.exe (from WSL through its Windows
-/// interop); none when it is unset or Windows cannot be reached.
-pub fn read_user_variable(name: &str) -> Option<String> {
-    query_user_variable(name).flatten()
+/// A value saved in the Windows user environment, such as a setting `ebira ask-setup` saved.
+/// One reg.exe call reads them all, the first time one is asked for.
+pub fn saved(name: &str) -> Option<String> {
+    lookup(saved_values()?, name)
 }
 
-/// None when Windows cannot be reached (reg.exe does not run); otherwise the variable, if set.
-pub fn query_user_variable(name: &str) -> Option<Option<String>> {
+fn saved_values() -> Option<&'static [(String, String)]> {
+    static SAVED: OnceLock<Option<Vec<(String, String)>>> = OnceLock::new();
+    SAVED.get_or_init(read_user_variables).as_deref()
+}
+
+/// The value of `name` among `values` (Windows names ignore case), if it holds more than spaces.
+pub fn lookup(values: &[(String, String)], name: &str) -> Option<String> {
+    values
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Every Windows user environment variable, read with one reg.exe call; none when Windows cannot
+/// be reached.
+pub fn read_user_variables() -> Option<Vec<(String, String)>> {
     let output = Command::new("reg.exe")
-        .args(["query", "HKCU\\Environment", "/v", name])
+        .args(["query", "HKCU\\Environment"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    // reg.exe exits with 1 when the value does not exist.
-    Some(if output.status.success() {
-        parse_reg_query(&String::from_utf8_lossy(&output.stdout), name)
-    } else {
-        None
-    })
+    output
+        .status
+        .success()
+        .then(|| parse_reg_values(&String::from_utf8_lossy(&output.stdout)))
 }
 
-fn parse_reg_query(output: &str, name: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        if !parts.next()?.eq_ignore_ascii_case(name) || !parts.next()?.starts_with("REG_") {
-            return None;
+fn parse_reg_values(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?;
+            if !parts.next()?.starts_with("REG_") {
+                return None;
+            }
+            let value = parts.collect::<Vec<_>>().join(" ");
+            (!value.is_empty()).then(|| (name.to_string(), value))
+        })
+        .collect()
+}
+
+/// Sets (or, given none, removes) several Windows user environment variables with one
+/// PowerShell call; the values reach it on its standard input. Programs started afterwards see
+/// them.
+pub fn set_user_variables(values: &[(&str, Option<&str>)]) -> Result<(), String> {
+    let mut input = String::new();
+    for (name, value) in values {
+        check_name(name)?;
+        let value = value.unwrap_or("").trim();
+        if value.chars().any(char::is_control) {
+            return Err(format!("{name} cannot hold line breaks or tabs"));
         }
-        let value = parts.collect::<Vec<_>>().join(" ");
-        (!value.is_empty()).then_some(value)
-    })
-}
-
-/// Sets a Windows user environment variable; programs started afterwards see it.
-pub fn set_user_variable(name: &str, value: &str) -> Result<(), String> {
-    check_name(name)?;
-    let script = format!(
-        "$v = [Console]::In.ReadToEnd().Trim(); if (-not $v) {{ exit 3 }}; \
-         [Environment]::SetEnvironmentVariable('{name}', $v, 'User')"
-    );
-    run_powershell(&script, value)
-}
-
-pub fn remove_user_variable(name: &str) -> Result<(), String> {
-    check_name(name)?;
+        input.push_str(&format!("{name}\t{value}\n"));
+    }
     run_powershell(
-        &format!("[Environment]::SetEnvironmentVariable('{name}', $null, 'User')"),
-        "",
+        "$text = [Console]::In.ReadToEnd(); \
+         foreach ($line in $text -split \"`n\") { \
+           $line = $line.TrimEnd(\"`r\"); if (-not $line) { continue }; \
+           $parts = $line.Split(\"`t\", 2); \
+           $value = if ($parts.Length -gt 1 -and $parts[1]) { $parts[1] } else { $null }; \
+           [Environment]::SetEnvironmentVariable($parts[0], $value, 'User') }",
+        &input,
     )
 }
 
@@ -151,6 +175,26 @@ fn run_powershell(script: &str, input: &str) -> Result<(), String> {
     }
 }
 
+/// Whether the text could be another service's key, and why not; a local server may take none.
+pub fn check_other_format(key: &str, optional: bool) -> Result<(), &'static str> {
+    if key.is_empty() {
+        return if optional {
+            Ok(())
+        } else {
+            Err("the key is empty")
+        };
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "the key holds characters a key cannot have (spaces, quotes, or full-width letters?)",
+        );
+    }
+    Ok(())
+}
+
 /// Whether the text looks like a key for the Messages API (not an Admin key), and why not.
 pub fn check_format(key: &str) -> Result<(), &'static str> {
     if key.is_empty() {
@@ -175,14 +219,20 @@ pub fn check_format(key: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The key with its middle hidden: `sk-ant-api03-…AbCd`.
+/// The key with its middle hidden: its prefix and its last four characters, such as
+/// `sk-ant-api03-…AbCd` or `sk-proj-…AbCd`.
 pub fn mask(key: &str) -> String {
-    let count = key.chars().count();
-    if count <= 17 {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 17 {
         return "…".repeat(3);
     }
-    let head: String = key.chars().take(13).collect();
-    let tail: String = key.chars().skip(count - 4).collect();
+    // The prefix runs to the last hyphen among the first 13 characters; without one, 4 are shown.
+    let head = chars[..13]
+        .iter()
+        .rposition(|c| *c == '-')
+        .map_or(4, |position| position + 1);
+    let head: String = chars[..head].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
     format!("{head}…{tail}")
 }
 
@@ -215,13 +265,16 @@ mod tests {
 
     #[test]
     fn a_missing_key_names_both_places_looked_in() {
-        let unsaved = missing_message(true);
+        let unsaved = missing_message(VARIABLE, true);
         assert!(unsaved.starts_with("no API key: ANTHROPIC_API_KEY is not set in this process"));
         assert!(unsaved.contains("none is saved in the Windows user environment"));
-        assert!(unsaved.ends_with("save one with `ebira ask-setup`"));
-        let unreadable = missing_message(false);
+        assert!(unsaved.ends_with("save one with `ebira ask-setup`, or set ANTHROPIC_API_KEY"));
+        let unreadable = missing_message(VARIABLE, false);
         assert!(unreadable.contains("cannot be read here"));
         assert!(unreadable.ends_with("set ANTHROPIC_API_KEY"));
+        let other = missing_message("OPENAI_API_KEY", true);
+        assert!(other.starts_with("no API key: OPENAI_API_KEY is not set in this process"));
+        assert!(other.ends_with("save one with `ebira ask-setup`, or set OPENAI_API_KEY"));
     }
 
     #[test]
@@ -233,14 +286,35 @@ mod tests {
     }
 
     #[test]
-    fn reads_reg_query_output() {
-        let output =
-            "\r\nHKEY_CURRENT_USER\\Environment\r\n    ANTHROPIC_API_KEY    REG_SZ    sk-ant-api03-abcdef\r\n\r\n";
+    fn reads_every_value_of_the_user_environment() {
+        let output = "\r\nHKEY_CURRENT_USER\\Environment\r\n    EBIRA_ASK_API    REG_SZ    openai\r\n    \
+                      Path    REG_EXPAND_SZ    C:\\Users\\h\\bin;C:\\Program Files\\x\r\n    EMPTY    REG_SZ    \r\n\r\n";
         assert_eq!(
-            parse_reg_query(output, "ANTHROPIC_API_KEY").as_deref(),
-            Some("sk-ant-api03-abcdef")
+            parse_reg_values(output),
+            vec![
+                ("EBIRA_ASK_API".to_string(), "openai".to_string()),
+                (
+                    "Path".to_string(),
+                    "C:\\Users\\h\\bin;C:\\Program Files\\x".to_string()
+                ),
+            ]
         );
-        assert_eq!(parse_reg_query(output, "OTHER"), None);
+        let values = parse_reg_values(output);
+        assert_eq!(lookup(&values, "ebira_ask_api").as_deref(), Some("openai"));
+        assert_eq!(lookup(&values, "EMPTY"), None);
+    }
+
+    #[test]
+    fn checks_other_keys_and_refuses_values_that_would_break_the_input() {
+        assert!(check_other_format("sk-proj-abc_DEF-123", false).is_ok());
+        assert!(
+            check_other_format("", true).is_ok(),
+            "a local server may take no key"
+        );
+        assert!(check_other_format("", false).is_err());
+        assert!(check_other_format("sk proj", false).is_err());
+        assert!(set_user_variables(&[("EBIRA_ASK_API", Some("open\nai"))]).is_err());
+        assert!(set_user_variables(&[("lower_case", None)]).is_err());
     }
 
     #[test]
@@ -259,6 +333,8 @@ mod tests {
             mask("sk-ant-api03-0123456789abcdefWXYZ"),
             "sk-ant-api03-…WXYZ"
         );
+        assert_eq!(mask("sk-proj-0123456789abcdefWXYZ"), "sk-proj-…WXYZ");
+        assert_eq!(mask("AIzaSyA0123456789abcdefWXYZ"), "AIza…WXYZ");
         assert_eq!(mask("short"), "………");
     }
 

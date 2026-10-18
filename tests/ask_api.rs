@@ -11,6 +11,16 @@ use std::time::{Duration, Instant};
 
 const EBIRA: &str = env!("CARGO_BIN_EXE_ebira");
 
+/// The settings `ebira ask-setup` saves. Set to nothing here, they keep what may be saved on
+/// this computer out of the tests: the defaults apply.
+const SETTINGS: [&str; 5] = [
+    "EBIRA_ASK_API",
+    "EBIRA_ASK_API_URL",
+    "EBIRA_ASK_API_KEY_ENV",
+    "EBIRA_ASK_STRONG_MODEL",
+    "EBIRA_ASK_CHEAP_MODEL",
+];
+
 fn ebira(root: &Path) -> Command {
     let mut command = Command::new(EBIRA);
     command
@@ -24,6 +34,9 @@ fn ebira(root: &Path) -> Command {
         .env_remove("CODEX_HOME")
         .env_remove("EBIRA_CORPUS")
         .env_remove("EBIRA_TZ_OFFSET");
+    for name in SETTINGS {
+        command.env(name, "");
+    }
     command
 }
 
@@ -250,4 +263,335 @@ fn repeated_truncation_is_a_failure_after_two_attempts() {
 fn other_unusable_replies_and_refusals_are_not_output_limit_retries() {
     run_case("invalid", "end_turn", false, 1, None);
     run_case("refused", "refusal", false, 1, None);
+}
+
+const SCREEN: &str = "You screen search results";
+const SCREENED: &str = r#"{"scores":[{"id":"C1","score":3}]}"#;
+const ANSWER: &str =
+    r#"{"answer":"Remove it entirely.","findings":[],"timeline":[],"gaps":[],"more_terms":[]}"#;
+
+/// A Chat Completions reply holding `content`.
+fn chat(model: &str, content: &str) -> String {
+    format!(
+        r#"{{"model":"{model}","choices":[{{"index":0,"message":{{"role":"assistant","content":{}}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":10,"completion_tokens":2}}}}"#,
+        quoted(content)
+    )
+}
+
+/// A loopback stand-in for a service that speaks the Chat Completions API: it keeps each
+/// request's head and body, and `reply` gives the status and body of each response.
+struct ChatService {
+    url: String,
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+    done: Arc<AtomicBool>,
+    server: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChatService {
+    fn start(reply: impl Fn(&str) -> (u16, String) + Send + 'static) -> ChatService {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (server_done, received) = (done.clone(), requests.clone());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !server_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                // Accepted sockets inherit the listener's nonblocking mode on Windows.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buffer = [0; 8192];
+                let (header_end, length) = loop {
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0, "HTTP header ended early");
+                    data.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                        let length = header
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
+                        if header.contains("expect: 100-continue") {
+                            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+                        }
+                        break (end + 4, length);
+                    }
+                };
+                while data.len() < header_end + length {
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0, "HTTP body ended early");
+                    data.extend_from_slice(&buffer[..n]);
+                }
+                let head = String::from_utf8_lossy(&data[..header_end]).to_string();
+                let body =
+                    String::from_utf8(data[header_end..header_end + length].to_vec()).unwrap();
+                let (status, reply) = reply(&body);
+                received.lock().unwrap().push((head, body));
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
+                write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+        });
+        ChatService {
+            url,
+            requests,
+            done,
+            server: Some(server),
+        }
+    }
+
+    /// Stops the service; each request's head and body, in the order they came.
+    fn finish(mut self) -> Vec<(String, String)> {
+        self.done.store(true, Ordering::SeqCst);
+        self.server.take().unwrap().join().unwrap();
+        let requests = self.requests.lock().unwrap().clone();
+        requests
+    }
+}
+
+/// Synthetic logs synced into a corpus, for the Chat Completions cases.
+fn synced(name: &str) -> (Logs, PathBuf) {
+    let logs =
+        Logs(std::env::temp_dir().join(format!("ebira-ask-api-{name}-{}", std::process::id())));
+    let source = logs.0.join(".claude/projects/example/session.jsonl");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, concat!(
+        r#"{"type":"user","sessionId":"s","timestamp":"2026-09-01T00:00:00Z","message":{"role":"user","content":"keep remote access"}}"#, "\n",
+        r#"{"type":"user","sessionId":"s","timestamp":"2026-09-02T00:00:00Z","message":{"role":"user","content":"LATEST_DECISION: remove it entirely"}}"#, "\n",
+    )).unwrap();
+    let corpus = logs.0.join("corpus");
+    let sync = ebira(&logs.0)
+        .args([
+            "sync",
+            "--source",
+            source.to_str().unwrap(),
+            "--corpus",
+            corpus.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        sync.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    (logs, corpus)
+}
+
+fn ask_compatible(logs: &Logs, corpus: &Path, url: &str) -> std::process::Output {
+    ebira(&logs.0)
+        .env("EBIRA_TEST_KEY", "test-key")
+        .args([
+            "ask",
+            "What is decided?",
+            "--api",
+            "compatible",
+            "--api-url",
+            url,
+            "--api-key-env",
+            "EBIRA_TEST_KEY",
+            "--strong-model",
+            "strong-model",
+            "--cheap-model",
+            "cheap-model",
+            "--term",
+            "remote",
+            "--keep",
+            "1",
+            "--corpus",
+            corpus.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn another_api_is_spoken_to_as_chat_completions() {
+    let (logs, corpus) = synced("chat");
+    let service = ChatService::start(|body| {
+        let model = if body.contains(r#""model":"strong-model""#) {
+            "strong-model"
+        } else {
+            "cheap-model"
+        };
+        if body.contains(SCREEN) {
+            (200, chat(model, SCREENED))
+        } else {
+            (200, chat(model, ANSWER))
+        }
+    });
+    let output = ask_compatible(&logs, &corpus, &service.url);
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!requests.is_empty());
+    for (head, body) in &requests {
+        assert!(
+            head.starts_with("POST /v1/chat/completions HTTP/1.1"),
+            "{head}"
+        );
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer test-key"), "{head}");
+        assert!(!head.contains("anthropic-version"), "{head}");
+        assert!(
+            body.contains(r#""response_format":{"type":"json_schema","json_schema":{"name":"reply","strict":true"#),
+            "{body}"
+        );
+        assert!(body.contains(r#""role":"system""#), "{body}");
+    }
+    assert!(requests
+        .iter()
+        .filter(|(_, body)| body.contains(SCREEN))
+        .all(|(_, body)| body.contains(r#""model":"cheap-model""#)));
+    assert!(
+        requests
+            .iter()
+            .any(|(_, body)| !body.contains(SCREEN) && body.contains(r#""model":"strong-model""#)),
+        "the strong model writes the answer"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""api":"compatible""#), "{stdout}");
+    assert!(stdout.contains("Remove it entirely."), "{stdout}");
+    assert!(
+        !stdout.contains(r#""unpriced_calls":0"#),
+        "calls to a model without a known price are counted as unpriced: {stdout}"
+    );
+}
+
+#[test]
+fn settings_in_the_environment_choose_the_service_without_flags() {
+    let (logs, corpus) = synced("chat-settings");
+    let service = ChatService::start(|body| {
+        let model = if body.contains(r#""model":"strong-model""#) {
+            "strong-model"
+        } else {
+            "cheap-model"
+        };
+        if body.contains(SCREEN) {
+            (200, chat(model, SCREENED))
+        } else {
+            (200, chat(model, ANSWER))
+        }
+    });
+    let output = ebira(&logs.0)
+        .env("EBIRA_ASK_API", "compatible")
+        .env("EBIRA_ASK_API_URL", &service.url)
+        .env("EBIRA_ASK_STRONG_MODEL", "strong-model")
+        .env("EBIRA_ASK_CHEAP_MODEL", "cheap-model")
+        .env("EBIRA_ASK_API_KEY", "saved-key")
+        .args([
+            "ask",
+            "What is decided?",
+            "--term",
+            "remote",
+            "--keep",
+            "1",
+            "--corpus",
+            corpus.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|(head, _)| head
+        .to_ascii_lowercase()
+        .contains("authorization: bearer saved-key")));
+    assert!(
+        requests
+            .iter()
+            .any(|(_, body)| !body.contains(SCREEN) && body.contains(r#""model":"strong-model""#)),
+        "the strong model writes the answer"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(r#""api":"compatible""#));
+}
+
+#[test]
+fn a_service_without_strict_schemas_is_asked_for_a_json_object() {
+    let (logs, corpus) = synced("chat-object");
+    let service = ChatService::start(|body| {
+        if body.contains("json_schema") {
+            return (
+                400,
+                r#"{"error":{"message":"Invalid parameter: response_format of type json_schema is not supported with this model."}}"#.to_string(),
+            );
+        }
+        if body.contains(SCREEN) {
+            (200, chat("cheap-model", SCREENED))
+        } else {
+            (200, chat("strong-model", ANSWER))
+        }
+    });
+    let output = ask_compatible(&logs, &corpus, &service.url);
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let objects: Vec<&(String, String)> = requests
+        .iter()
+        .filter(|(_, body)| body.contains(r#""response_format":{"type":"json_object"}"#))
+        .collect();
+    assert!(!objects.is_empty());
+    assert!(
+        objects
+            .iter()
+            .all(|(_, body)| body.contains("follow this JSON schema")),
+        "the schema moves into the instructions"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Remove it entirely."));
+}
+
+#[test]
+fn another_api_needs_its_models_named_before_anything_is_sent() {
+    let root = std::env::temp_dir().join(format!("ebira-ask-api-models-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let logs = Logs(root);
+    let output = ebira(&logs.0)
+        .env("OPENAI_API_KEY", "sk-test")
+        .args([
+            "ask",
+            "What is decided?",
+            "--api",
+            "openai",
+            "--term",
+            "remote",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "--api openai needs its models named: --strong-model <id> and --cheap-model <id>"
+        ) && stderr.contains("choose them once with `ebira ask-setup`"),
+        "{stderr}"
+    );
+    let unknown = ebira(&logs.0)
+        .args(["ask", "q", "--api", "bedrock", "--term", "x"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("--api must be one of"));
 }

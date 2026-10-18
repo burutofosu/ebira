@@ -5,8 +5,9 @@
 //! decision it reports, of the person's later messages that may have changed it. Every quote in
 //! the answer is checked against the records it was given before it is shown.
 //!
-//! The question and the text of the records read (not images) go to the Anthropic API under the
-//! person's own key; nothing else leaves the computer. Every call is written to a spending ledger.
+//! The question and the text of the records read (not images) go to the API the person chose
+//! (the Claude API unless another is named, by a flag or by `ebira ask-setup`) under their own
+//! key; nothing else leaves the computer. Every call is written to a spending ledger.
 
 mod api;
 mod keys;
@@ -17,6 +18,7 @@ mod text;
 pub mod usage;
 mod value;
 
+pub use api::Endpoint;
 use api::{ApiError, Client, Request, Usage};
 pub use records::Filters;
 use records::{Corpus, Hit, Label, Line, SourceRef, Who};
@@ -55,6 +57,8 @@ pub struct Options {
     pub screen_model: String,
     pub answer_model: String,
     pub effort: String,
+    /// The service the requests go to: the Claude API unless another is named.
+    pub endpoint: Endpoint,
 }
 
 impl Options {
@@ -80,6 +84,7 @@ impl Options {
             screen_model: "claude-haiku-5-5".to_string(),
             answer_model: "claude-opus-5-5".to_string(),
             effort: "medium".to_string(),
+            endpoint: Endpoint::default(),
         }
     }
 
@@ -111,6 +116,12 @@ const WORKERS: usize = 4;
 const RECENT_SESSIONS: usize = 4;
 const RECENT_MESSAGES: usize = 8;
 
+/// A setting `ebira ask-setup` saved in the Windows user environment, such as
+/// `EBIRA_ASK_STRONG_MODEL`; read once per run, with the saved keys.
+pub fn saved_setting(name: &str) -> Option<String> {
+    keys::saved(name)
+}
+
 /// Answers the question and writes the result.
 pub fn run(root: &Path, options: &Options, ledger: &Ledger, scratch: PathBuf) -> io::Result<()> {
     let corpus = Corpus::open(root)?;
@@ -118,7 +129,7 @@ pub fn run(root: &Path, options: &Options, ledger: &Ledger, scratch: PathBuf) ->
         None
     } else {
         Some(
-            Client::from_env(scratch)
+            Client::for_endpoint(&options.endpoint, scratch)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?,
         )
     };
@@ -1838,6 +1849,7 @@ fn answer_report(
                 },
             )
             .name("mode", "ask")
+            .name("api", &options.endpoint.name)
             .text("question", &options.question)
             .raw(
                 "answer",
@@ -2483,7 +2495,7 @@ mod tests {
             &summary,
             &spent,
         );
-        assert!(json.starts_with(r#"{"disposition":"answered","mode":"ask","question":"地図の色の条件は？","answer":"10/4 に条件を外した。""#), "{json}");
+        assert!(json.starts_with(r#"{"disposition":"answered","mode":"ask","api":"anthropic","question":"地図の色の条件は？","answer":"10/4 に条件を外した。""#), "{json}");
         assert!(json.contains(r#""kind":"reversal","quote":"古いままでと言った記憶がない","quote_verified":true,"relevance":"9/27 の条件を外す","author":"person""#), "{json}");
         assert!(json.contains(r#""quote_verified":false"#), "{json}");
         assert!(json.contains(r#""cost_usd":{"total":0.0060,"answer":0.0060,"models":["claude-opus-5-5"],"tokens":1100,"unpriced_calls":0}"#), "{json}");

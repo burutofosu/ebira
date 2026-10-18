@@ -29,10 +29,10 @@ source retrieval. All commands run locally; `ask` also calls the Anthropic API
 | `commits.rs` | Commit-name extraction and Git resolution |
 | `ask.rs` | `ask`: search strings, screening, the reading, the reversal check, and the answer |
 | `ask/records.rs` | The records `ask` reads, through `said`, `search`, and the corpus |
-| `ask/api.rs` | The Messages API through curl, and the price of a call |
-| `ask/keys.rs` | Where the API key is found and saved |
+| `ask/api.rs` | The Messages API or the Chat Completions API through curl, and the price of a call |
+| `ask/keys.rs` | Where the keys and the saved settings are read and written |
 | `ask/prompts.rs` | What each model is asked, and the shape of its reply |
-| `ask/setup.rs` | `ask-setup`: the page that checks, saves, and removes the key |
+| `ask/setup.rs` | `ask-setup`: the page that chooses the service, its key, and its models |
 | `ask/usage.rs` | The spending ledger and `ask-usage` |
 | `ask/text.rs`, `ask/value.rs` | Clipping and quote checks; a JSON value for the API |
 
@@ -405,11 +405,23 @@ and where each record is in its log, and an index would hold where text occurs,
 never what it means. Every answer is derived from the records again, and no
 model's reading enters the corpus.
 
-The API key comes from `ANTHROPIC_API_KEY`, else from the Windows user
-environment through `reg.exe`, which works from WSL too; curl receives it on its
-standard input, never on a command line. Each call is appended to
-`<data>/ask/usage.tsv` with its tokens, an estimated price, and the run it
-belongs to.
+The steps of `ask` hand the client a model, instructions, and the JSON schema of
+the reply; only the client knows the service. It speaks the Claude Messages API,
+or the OpenAI Chat Completions API that other services and local servers speak.
+For the latter the schema also goes into the instructions, since some services
+ignore `response_format`, and a request the service refuses in part is sent again
+without that part.
+
+The service and its models come from the flags, else from the `EBIRA_ASK_*`
+variables of the process, else from the Windows user environment, where
+`ask-setup` saves them; one `reg.exe` call reads that environment, from WSL too,
+and only when a setting or the key is not given otherwise. A default is saved as
+nothing, so a later version's defaults apply. The API key comes from the
+service's variable (`ANTHROPIC_API_KEY` unless another is named), in the process
+or in the Windows user environment; curl receives it on its standard input, never
+on a command line, and `ask-setup` hands it to PowerShell the same way. Each call
+is appended to `<data>/ask/usage.tsv` with its tokens, an estimated price (Claude
+models only), and the run it belongs to.
 
 ## Output
 

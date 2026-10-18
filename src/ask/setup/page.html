@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:,">
-<title>Ebira API key</title>
+<title>Ebira ask setup</title>
 <style>
   :root {
     --bg: #f5f4f0;
@@ -18,6 +18,7 @@
     --accent-text: #ffffff;
     --ok: #1d7340;
     --bad: #b3261e;
+    --warn: #8a5a00;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -31,6 +32,7 @@
       --accent-text: #0d1013;
       --ok: #6dc28e;
       --bad: #f2897c;
+      --warn: #e0b45c;
     }
   }
   * { box-sizing: border-box; }
@@ -40,7 +42,7 @@
     color: var(--text);
     font: 15px/1.7 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif;
   }
-  main { max-width: 640px; margin: 0 auto; padding: 40px 16px 56px; }
+  main { max-width: 680px; margin: 0 auto; padding: 40px 16px 56px; }
   h1 { font-size: 22px; line-height: 1.4; margin: 0 0 6px; }
   .lead { color: var(--muted); margin: 0 0 24px; }
   section {
@@ -52,12 +54,15 @@
   }
   h2 { font-size: 15px; margin: 0 0 10px; }
   .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
-  .state { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
-  .where { color: var(--muted); font-size: 13.5px; margin: 2px 0 0; }
-  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .state { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; margin-bottom: 12px; }
+  .where { color: var(--muted); font-size: 13.5px; }
+  label { display: block; font-weight: 600; margin: 14px 0 6px; }
+  label:first-of-type { margin-top: 0; }
+  .hint { display: block; font-weight: 400; color: var(--muted); font-size: 13.5px; }
+  #url-field { margin-top: 14px; }
   .field { display: flex; gap: 8px; }
-  input {
-    flex: 1;
+  input, select {
+    width: 100%;
     min-width: 0;
     padding: 9px 12px;
     border: 1px solid var(--line);
@@ -66,6 +71,8 @@
     color: var(--text);
     font: 14px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
+  select { font-family: inherit; font-size: 15px; }
+  .field input { flex: 1; }
   button {
     padding: 8px 14px;
     border: 1px solid var(--line);
@@ -78,16 +85,16 @@
     white-space: nowrap;
   }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
-  button:disabled { opacity: 0.55; cursor: default; }
-  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled, input:disabled, select:disabled { opacity: 0.55; cursor: default; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .note { color: var(--muted); font-size: 13.5px; margin: 12px 0 0; }
-  .result { margin: 0 0 16px; padding: 0 4px; }
+  .notice { color: var(--warn); margin: 0 0 16px; padding: 0 4px; }
+  .result { margin: 0 0 16px; padding: 0 4px; white-space: pre-line; overflow-wrap: anywhere; }
   .result:empty { display: none; }
   .result.ok { color: var(--ok); }
   .result.bad { color: var(--bad); }
-  .models { margin: -8px 0 16px; padding: 0 4px 0 24px; }
-  .models .no { color: var(--bad); }
+  .bottom { margin: 0 0 16px; }
   pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.65 ui-monospace, "Cascadia Mono", Consolas, monospace; color: var(--muted); }
   footer { display: flex; justify-content: flex-end; }
   [hidden] { display: none !important; }
@@ -95,36 +102,52 @@
 </head>
 <body>
 <main>
-  <h1>The API key for <span class="mono">ebira ask</span></h1>
-  <p class="lead">The key stays on this computer. It is saved as the Windows user environment variable <span class="mono">ANTHROPIC_API_KEY</span>, and this page only ever shows it masked.</p>
+  <h1>Set up <span class="mono">ebira ask</span></h1>
+  <p class="lead">Choose the service <span class="mono">ebira ask</span> sends its questions to, check its key, and choose its models. They are saved on this computer as Windows user environment variables, which <span class="mono">ebira ask</span> reads by itself; keys are only ever shown masked.</p>
+  <p id="notice" class="notice" hidden></p>
 
-  <section aria-labelledby="now-title">
-    <h2 id="now-title">Now</h2>
-    <div class="state"><span id="state">Loading…</span><span id="masked" class="mono"></span></div>
-    <p id="where" class="where"></p>
-    <div class="actions">
-      <button id="check-saved" type="button" hidden>Check the saved key</button>
-      <button id="delete" type="button" hidden>Remove the key</button>
+  <section aria-labelledby="service-title">
+    <h2 id="service-title">Service</h2>
+    <select id="api" aria-labelledby="service-title"></select>
+    <div id="url-field" hidden>
+      <label for="url">Base URL <span class="hint">the part before /chat/completions</span></label>
+      <input id="url" type="url" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="http://localhost:11434/v1">
     </div>
+    <p id="service-note" class="note"></p>
   </section>
 
-  <section aria-labelledby="enter-title">
-    <h2 id="enter-title">Enter a key</h2>
-    <label for="key">API key (it starts with sk-ant-)</label>
+  <section aria-labelledby="key-title">
+    <h2 id="key-title">Key</h2>
+    <div class="state"><span id="key-state">Loading…</span><span id="masked" class="mono"></span><span id="key-where" class="where"></span></div>
+    <label for="key" id="key-label">Key</label>
     <div class="field">
-      <input id="key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="sk-ant-api03-…">
+      <input id="key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off">
       <button id="toggle" type="button" aria-pressed="false" aria-controls="key">Show</button>
     </div>
     <div class="actions">
-      <button id="save" class="primary" type="button">Check and save</button>
-      <button id="check" type="button">Check only</button>
+      <button id="check" type="button">Check the key</button>
+      <button id="delete" type="button" hidden>Remove the saved key</button>
     </div>
-    <p class="note">Checking lists the models the key can use, which costs nothing.</p>
-    <p class="note">No workspace needs entering: a key belongs to the workspace it was created in, and the API applies it. A monthly spending limit can be set in the Console, in the workspace's settings.</p>
+    <p class="note">Checking lists the service's models, which costs nothing.</p>
+    <p id="anthropic-note" class="note">An Anthropic key belongs to the workspace it was created in; a monthly spending limit can be set in the Console, in the workspace's settings.</p>
+  </section>
+
+  <section aria-labelledby="models-title">
+    <h2 id="models-title">Models</h2>
+    <label for="strong">Strong model <span class="hint">plans the search and writes the answer</span></label>
+    <input id="strong" list="model-list" autocomplete="off" spellcheck="false" autocapitalize="off">
+    <label for="cheap">Cheap model <span class="hint">screens what is found and drafts; with <span class="mono">--quick</span>, does everything</span></label>
+    <input id="cheap" list="model-list" autocomplete="off" spellcheck="false" autocapitalize="off">
+    <datalist id="model-list"></datalist>
+    <p id="models-note" class="note"></p>
   </section>
 
   <p id="result" class="result" role="status" aria-live="polite"></p>
-  <ul id="models" class="models" hidden></ul>
+
+  <div class="actions bottom">
+    <button id="save" class="primary" type="button">Check and save</button>
+    <button id="reset" type="button" hidden>Back to the defaults</button>
+  </div>
 
   <section aria-labelledby="spending-title">
     <h2 id="spending-title">Spent so far by <span class="mono">ebira ask</span></h2>
