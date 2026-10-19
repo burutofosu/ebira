@@ -24,7 +24,7 @@ mod value;
 pub use api::Endpoint;
 use api::{ApiError, Client, Request, Usage};
 pub use records::Filters;
-use records::{Corpus, Hit, Label, Line, SourceRef, Who};
+use records::{Corpus, Hit, Label, Line, PersonMessages, SourceRef, Who};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,9 @@ pub struct Options {
     /// Search only, and show the records the answer model would read.
     pub no_api: bool,
     pub text_format: bool,
+    /// Where to write the records read and the person's messages a sweep judged relevant, as
+    /// text, for reading elsewhere.
+    pub export: Option<PathBuf>,
     /// How many records the answer model reads.
     pub keep: usize,
     /// The person's messages, and the agents' replies, taken per search string (newest first).
@@ -54,6 +57,11 @@ pub struct Options {
     /// After a first answer, look for later messages of the person that change what it says
     /// was decided.
     pub reversal_check: bool,
+    /// Screen every message the person wrote in the scope, not only those that hold a search
+    /// string; the agents' records are still found by the strings. On unless `--no-sweep`.
+    pub sweep: bool,
+    /// The most of the person's messages a sweep screens, the newest first.
+    pub sweep_limit: usize,
     /// The model of that first answer, a draft that only feeds the later searches.
     pub draft_model: Option<String>,
     pub plan_model: String,
@@ -76,12 +84,15 @@ impl Options {
             terms: Vec::new(),
             no_api: false,
             text_format: false,
+            export: None,
             keep: 40,
             person_per_term: 60,
             agent_per_term: 40,
             candidates: 600,
             second_round: true,
             reversal_check: true,
+            sweep: true,
+            sweep_limit: 4000,
             draft_model: Some("claude-haiku-5-5".to_string()),
             plan_model: "claude-opus-5-5".to_string(),
             screen_model: "claude-haiku-5-5".to_string(),
@@ -120,6 +131,22 @@ const CLOSEST: usize = 8;
 const WORKERS: usize = 4;
 const RECENT_SESSIONS: usize = 4;
 const RECENT_MESSAGES: usize = 8;
+/// How much of a message a sweep shows the screen: the person's messages are short, and a long
+/// one is mostly something pasted.
+const SWEEP_CHARS: usize = 600;
+/// How many of the person's later messages a reversal check reads for one claim in a sweep:
+/// the earliest and the latest halves when there are more.
+const REVERSAL_SWEEP_MAX: usize = 400;
+/// How many of the person's messages the plan model sees, spread over the scope, to learn how
+/// the person writes.
+const VOCABULARY_SAMPLE: usize = 40;
+/// How many of the sessions the answer did not read are listed, newest first.
+const UNREAD_LISTED: usize = 12;
+/// The person's other messages a sweep judged relevant, beyond those read with their context,
+/// go to the answer in one line each: at most this many (the earliest and the latest halves
+/// when there are more), each cut at this many characters.
+const SWEEP_DIGEST_MAX: usize = 300;
+const SWEEP_DIGEST_CHARS: usize = 160;
 
 /// A setting `ebira ask-setup` saved in the Windows user environment, such as
 /// `EBIRA_ASK_STRONG_MODEL`; read once per run, with the saved keys.
@@ -149,6 +176,29 @@ struct TermCount {
     who: Who,
     returned: usize,
     total: u64,
+    /// The time of the oldest record taken when not all were: nothing before it was read.
+    oldest_taken: Option<String>,
+}
+
+/// A sweep: every message the person wrote in the scope, screened against the question.
+struct Swept {
+    in_scope: usize,
+    screened: usize,
+    threes: usize,
+    twos: usize,
+    /// The time of the oldest and the newest message screened, as the logs wrote them.
+    oldest: String,
+    newest: String,
+    stale_sources: u64,
+    unscanned_bytes: u64,
+    /// Messages the screen gave no score to (a call failed): they count as unscreened.
+    unscreened: usize,
+    /// Whether the scope held more messages with text than the sweep's limit: only the newest
+    /// were screened.
+    truncated: bool,
+    /// Every message in the scope, newest first, screened or not: a reversal check reads those
+    /// after a claim, and the coverage counts the sessions.
+    messages: Vec<Hit>,
 }
 
 /// What the rounds of searching have gathered.
@@ -173,6 +223,7 @@ struct Pool {
     twos: usize,
     screened: bool,
     rounds: usize,
+    swept: Option<Swept>,
 }
 
 impl Pool {
@@ -213,6 +264,32 @@ struct Notes {
     checks: Vec<ReversalCheck>,
     recent: Vec<records::Recent>,
     recent_sessions_omitted: usize,
+    coverage: Option<Coverage>,
+    /// The sweep's digest: how many of the person's relevant messages were shown in one line,
+    /// and how many were left out.
+    digest: Option<(usize, usize)>,
+}
+
+/// Which conversations in the scope the records read come from, and which they leave unread:
+/// what the answer did not read, counted, for the person and for the answer.
+struct Coverage {
+    sessions_in_scope: usize,
+    sessions_with_evidence: usize,
+    /// Whether a sweep screened every message of the person's in the other sessions.
+    swept: bool,
+    unread: Vec<UnreadSession>,
+    unread_total: usize,
+}
+
+/// A session in the scope none of whose records the answer read: when the person wrote in it,
+/// how much, and how it opened.
+struct UnreadSession {
+    session: String,
+    project: String,
+    first: String,
+    last: String,
+    messages: usize,
+    opening: String,
 }
 
 struct ReversalCheck {
@@ -221,6 +298,11 @@ struct ReversalCheck {
     kind: String,
     quote: String,
     terms: Vec<String>,
+    /// Whether the candidates were every later message of the person's (a sweep), not the
+    /// records the strings found.
+    swept: bool,
+    /// The later messages there were before the check kept the earliest and the latest.
+    later_total: usize,
     candidates: usize,
     changes: usize,
 }
@@ -333,6 +415,14 @@ struct Evidence {
     block: String,
     /// The lines the answer model saw, to find whose words a quote is and where they are.
     lines: Vec<ShownLine>,
+    /// Shown in one line, without its context: one of the sweep's digest.
+    digest: bool,
+}
+
+/// How many of the records given to the answer were read with their context: the digest's
+/// one-line records are not counted as read.
+fn read_count(evidence: &[Evidence]) -> usize {
+    evidence.iter().filter(|item| !item.digest).count()
 }
 
 struct ShownLine {
@@ -355,16 +445,22 @@ fn ask(
 
     // 1. What to search for.
     let mut filters = options.filters.clone();
+    // The person's messages in the scope, read once for the plan model's sample of how the
+    // person writes, and kept for the sweep while the scope stays the same.
+    let mut prefetched: Option<PersonMessages> = None;
     let terms = if options.terms.is_empty() {
         let caller = caller
             .as_ref()
             .ok_or("without the API, name the search strings with --term")?;
         progress(&format!("choosing search strings ({})", options.plan_model));
+        let (sample, messages) = vocabulary(corpus, &filters);
+        prefetched = messages;
         let user = format!(
-            "Today: {} ({})\nQuestion: {}",
+            "Today: {} ({})\nQuestion: {}{}",
             corpus.today(),
             corpus.zone(),
-            options.question
+            options.question,
+            sample
         );
         let schema = prompts::plan_schema();
         let plan = caller
@@ -385,6 +481,7 @@ fn ask(
             filters.from = is_date(from).then(|| from.to_string());
             filters.to = is_date(to).then(|| to.to_string());
             notes.period = Some((from.to_string(), to.to_string()));
+            prefetched = None;
         }
         clean_terms(
             plan.array_at("terms")
@@ -398,8 +495,22 @@ fn ask(
         return Err("no search strings".to_string());
     }
 
-    // 2-3. Search and screen.
+    // 2-3. Search and screen; with a sweep, every message of the person's in the scope first.
     let mut pool = Pool::default();
+    if options.sweep {
+        let caller = caller
+            .as_ref()
+            .ok_or("--sweep screens the person's messages with the API")?;
+        sweep(
+            corpus,
+            caller,
+            options,
+            &filters,
+            prefetched.take(),
+            &mut pool,
+            &mut notes,
+        )?;
+    }
     gather(
         corpus,
         caller.as_ref(),
@@ -409,6 +520,26 @@ fn ask(
         &mut pool,
         &mut notes,
     )?;
+    // When no record holds any of the strings, choose others once: shorter stems, other
+    // spellings, the person's own words. A sweep does not need them for the person's side,
+    // but the agents' records are found by strings alone.
+    if pool.found.is_empty() && options.terms.is_empty() {
+        if let Some(caller) = caller.as_ref() {
+            let tried = pool.terms.clone();
+            let more = replan(caller, corpus, options, &tried, &mut notes);
+            if !more.is_empty() {
+                gather(
+                    corpus,
+                    Some(caller),
+                    options,
+                    &filters,
+                    &more,
+                    &mut pool,
+                    &mut notes,
+                )?;
+            }
+        }
+    }
 
     // 4. Read the records around the best ones, or around the closest when the screen judged
     // none relevant.
@@ -427,10 +558,12 @@ fn ask(
             corpus,
             options,
             &evidence,
-            &Summary::of(&pool, evidence.len(), &notes, &filters),
+            &Summary::of(&pool, read_count(&evidence), &notes, &filters),
         ));
     };
     if evidence.is_empty() {
+        notes.coverage = coverage(corpus, &filters, &pool, &evidence, prefetched.as_ref());
+        export_if_asked(corpus, options, &filters, &pool, &evidence, &mut notes);
         let spent = caller.spent.lock().unwrap();
         return Ok(answer_report(
             corpus,
@@ -446,7 +579,15 @@ fn ask(
         .as_deref()
         .filter(|_| options.second_round || options.reversal_check)
         .unwrap_or(&options.answer_model);
-    let mut answer = answer_with(&caller, options, corpus, &evidence, &pool, draft_model)?;
+    let mut answer = answer_with(
+        &caller,
+        options,
+        corpus,
+        &evidence,
+        &pool,
+        notes.digest,
+        draft_model,
+    )?;
     let mut records_changed = false;
 
     // 6. A second round: search the strings the answer suggests.
@@ -477,7 +618,9 @@ fn ask(
     let mut later = Vec::new();
     if options.reversal_check {
         let claims = claims_to_check(corpus, &answer, &evidence);
-        later = hunt_reversals(corpus, &caller, options, &filters, &claims, &mut notes);
+        later = hunt_reversals(
+            corpus, &caller, options, &filters, &claims, &pool, &mut notes,
+        );
         records_changed |= !later.is_empty();
     }
 
@@ -490,6 +633,7 @@ fn ask(
             corpus,
             &evidence,
             &pool,
+            notes.digest,
             &options.answer_model,
         )?;
     } else if draft_model != options.answer_model {
@@ -500,16 +644,19 @@ fn ask(
             corpus,
             &evidence,
             &pool,
+            notes.digest,
             &options.answer_model,
         )?;
     }
+    notes.coverage = coverage(corpus, &filters, &pool, &evidence, prefetched.as_ref());
+    export_if_asked(corpus, options, &filters, &pool, &evidence, &mut notes);
     let spent = caller.spent.lock().unwrap();
     Ok(answer_report(
         corpus,
         options,
         Some(&answer),
         &evidence,
-        &Summary::of(&pool, evidence.len(), &notes, &filters),
+        &Summary::of(&pool, read_count(&evidence), &notes, &filters),
         &spent,
     ))
 }
@@ -547,10 +694,80 @@ fn read_pool(
             None => hits.push(found),
         }
     }
-    if closest {
-        read_evidence(corpus, hits)
+    let hits = if closest {
+        hits
     } else {
-        read_evidence(corpus, with_recent(corpus, filters, hits, notes))
+        with_recent(corpus, filters, hits, notes)
+    };
+    let shown: HashSet<SourceRef> = hits.iter().map(|hit| hit.source_ref.clone()).collect();
+    let mut evidence = read_evidence(corpus, hits);
+    if !closest {
+        let (digest, left_out) = sweep_digest(corpus, pool, &shown);
+        notes.digest = (!digest.is_empty() || left_out > 0).then_some((digest.len(), left_out));
+        let base = evidence.len();
+        evidence.extend(
+            digest
+                .into_iter()
+                .enumerate()
+                .map(|(index, hit)| compose_digest(corpus, format!("E{}", base + index + 1), hit)),
+        );
+    }
+    evidence
+}
+
+/// The person's messages the sweep judged relevant that the answer does not read with their
+/// context: oldest first, up to `SWEEP_DIGEST_MAX` (the earliest and the latest halves when
+/// there are more), and how many were left out.
+fn sweep_digest(corpus: &Corpus, pool: &Pool, shown: &HashSet<SourceRef>) -> (Vec<Hit>, usize) {
+    if pool.swept.is_none() {
+        return (Vec::new(), 0);
+    }
+    let mut rest: Vec<Hit> = pool
+        .relevant
+        .iter()
+        .filter(|(hit, _)| {
+            hit.who == Who::Person && hit.terms.is_empty() && !shown.contains(&hit.source_ref)
+        })
+        .map(|(hit, _)| hit.clone())
+        .collect();
+    rest.sort_by(|left, right| time_order(corpus, left, right));
+    let left_out = rest.len().saturating_sub(SWEEP_DIGEST_MAX);
+    if rest.len() > SWEEP_DIGEST_MAX {
+        let latest = rest.split_off(rest.len() - SWEEP_DIGEST_MAX / 2);
+        rest.truncate(SWEEP_DIGEST_MAX - latest.len());
+        rest.extend(latest);
+    }
+    (rest, left_out)
+}
+
+/// The block for one of the digest's messages: one line, without its context.
+fn compose_digest(corpus: &Corpus, id: String, hit: Hit) -> Evidence {
+    let block = format!(
+        "{id} | {} | person | {} | {} | digest: shown in one line, without its context, cut at \
+         {} characters\n▶ person {}: {}\n",
+        corpus.local(&hit.timestamp),
+        if hit.project.is_empty() {
+            "?"
+        } else {
+            &hit.project
+        },
+        hit.app,
+        SWEEP_DIGEST_CHARS,
+        corpus.local(&hit.timestamp),
+        text::clip_head(&text::one_line(&hit.text), SWEEP_DIGEST_CHARS)
+    );
+    let lines = vec![ShownLine {
+        author: Author::Found(Who::Person),
+        timestamp: hit.timestamp.clone(),
+        text: hit.text.clone(),
+        source_ref: hit.source_ref.clone(),
+    }];
+    Evidence {
+        id,
+        hit,
+        block,
+        lines,
+        digest: true,
     }
 }
 
@@ -663,6 +880,7 @@ fn hunt_reversals(
     options: &Options,
     filters: &Filters,
     claims: &[Claim],
+    pool: &Pool,
     notes: &mut Notes,
 ) -> Vec<Hit> {
     if claims.is_empty() {
@@ -674,71 +892,82 @@ fn hunt_reversals(
         claims.len(),
         model
     ));
+    // After a sweep, every later message of the person's is read: no strings are needed.
+    let swept = if options.sweep {
+        pool.swept.as_ref()
+    } else {
+        None
+    };
 
     // 1. What a later message about each claim would contain: chosen by the plan model, like
     // every other search string (a weaker model rarely thinks of the alternative a change comes
     // as: another framework, another database).
-    let list: Vec<String> = claims
-        .iter()
-        .map(|claim| {
-            format!(
-                "{} | {} | {} | 「{}」",
-                claim.id,
-                claim.date,
-                claim.kind,
-                text::one_line(&claim.quote)
-            )
-        })
-        .collect();
-    let user = format!(
-        "Question: {}\n\nItems:\n{}",
-        options.question,
-        list.join("\n")
-    );
-    let schema = prompts::reversal_terms_schema();
-    let request = Request {
-        model: &options.plan_model,
-        effort: "low",
-        max_tokens: 4000,
-        system: prompts::REVERSAL_TERMS_SYSTEM,
-        user: &user,
-        schema: &schema,
+    let chosen: Vec<Vec<String>> = if swept.is_some() {
+        vec![Vec::new(); claims.len()]
+    } else {
+        let list: Vec<String> = claims
+            .iter()
+            .map(|claim| {
+                format!(
+                    "{} | {} | {} | 「{}」",
+                    claim.id,
+                    claim.date,
+                    claim.kind,
+                    text::one_line(&claim.quote)
+                )
+            })
+            .collect();
+        let user = format!(
+            "Question: {}\n\nItems:\n{}",
+            options.question,
+            list.join("\n")
+        );
+        let schema = prompts::reversal_terms_schema();
+        let request = Request {
+            model: &options.plan_model,
+            effort: "low",
+            max_tokens: 4000,
+            system: prompts::REVERSAL_TERMS_SYSTEM,
+            user: &user,
+            schema: &schema,
+        };
+        let reply = match caller.call("reversal-terms", &request) {
+            Ok(reply) => reply,
+            Err(error) => {
+                notes
+                    .issues
+                    .push(format!("reversal check: no search strings ({error})"));
+                return Vec::new();
+            }
+        };
+        claims
+            .iter()
+            .map(|claim| {
+                let strings: Vec<String> = reply
+                    .array_at("items")
+                    .iter()
+                    .find(|item| item.str_at("id") == claim.id)
+                    .map(|item| {
+                        clean_terms(
+                            item.array_at("terms")
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string),
+                        )
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(REVERSAL_TERMS)
+                    .collect();
+                with_spacing_variants(&strings)
+            })
+            .collect()
     };
-    let reply = match caller.call("reversal-terms", &request) {
-        Ok(reply) => reply,
-        Err(error) => {
-            notes
-                .issues
-                .push(format!("reversal check: no search strings ({error})"));
-            return Vec::new();
-        }
-    };
-    let chosen: Vec<Vec<String>> = claims
-        .iter()
-        .map(|claim| {
-            let strings: Vec<String> = reply
-                .array_at("items")
-                .iter()
-                .find(|item| item.str_at("id") == claim.id)
-                .map(|item| {
-                    clean_terms(
-                        item.array_at("terms")
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string),
-                    )
-                })
-                .unwrap_or_default()
-                .into_iter()
-                .take(REVERSAL_TERMS)
-                .collect();
-            with_spacing_variants(&strings)
-        })
-        .collect();
 
     // 2. The person's messages from each claim's date on: one pass for every string of every
     // claim, from the earliest date. A claim takes the first messages after it, where a change
-    // usually follows, and the newest, where the current state is.
+    // usually follows, and the newest, where the current state is. After a sweep, every message
+    // of the person's from the claim on is a candidate.
     let mut all_terms: Vec<String> = Vec::new();
     for term in chosen.iter().flatten() {
         if !holds_term(&all_terms, term) {
@@ -767,6 +996,7 @@ fn hunt_reversals(
         }
     };
     let mut candidates: Vec<(&Claim, Vec<Hit>)> = Vec::new();
+    let mut totals: HashMap<String, usize> = HashMap::new();
     for (claim, strings) in claims.iter().zip(&chosen) {
         let from = start(claim);
         let mut list: Vec<Hit> = Vec::new();
@@ -800,11 +1030,25 @@ fn hunt_reversals(
                 }
             }
         }
-        // Keep the earliest and the latest when there are more than one screen takes.
+        if let Some(swept) = swept {
+            list = swept
+                .messages
+                .iter()
+                .filter(|hit| written_after(corpus, claim, &from, hit))
+                .cloned()
+                .collect();
+        }
+        totals.insert(claim.id.clone(), list.len());
+        // Keep the earliest and the latest when there are more than the check takes.
+        let most = if swept.is_some() {
+            REVERSAL_SWEEP_MAX
+        } else {
+            SCREEN_CHUNK
+        };
         list.sort_by(|left, right| time_order(corpus, left, right));
-        if list.len() > SCREEN_CHUNK {
-            let latest = list.split_off(list.len() - SCREEN_CHUNK / 2);
-            list.truncate(SCREEN_CHUNK - latest.len());
+        if list.len() > most {
+            let latest = list.split_off(list.len() - most / 2);
+            list.truncate(most - latest.len());
             list.extend(latest);
         }
         candidates.push((claim, list));
@@ -815,86 +1059,104 @@ fn hunt_reversals(
         .collect();
     candidates.retain(|(_, list)| !list.is_empty());
 
-    // 3. Does each later message change the claim?
+    // 3. Does each later message change the claim? A claim's candidates go to the screen in
+    // chunks, in the order written.
     let schema = prompts::screen_schema();
     let judged = parallel(candidates, |(claim, list)| {
-        let lines: Vec<String> = list
-            .iter()
-            .enumerate()
-            .map(|(index, hit)| {
-                format!(
-                    "C{} | {} | {} | {}",
-                    index + 1,
-                    corpus.local(&hit.timestamp),
-                    if hit.project.is_empty() {
-                        "?"
-                    } else {
-                        &hit.project
-                    },
-                    text::one_line(&text::window(&hit.text, &hit.terms, 360))
-                )
-            })
-            .collect();
-        let user = format!(
-            "Item {} ({}, {}):\n「{}」\n\nThe person's messages from then on:\n{}",
-            claim.id,
-            corpus.local(&claim.timestamp),
-            claim.kind,
-            text::one_line(&claim.quote),
-            lines.join("\n")
-        );
-        let request = Request {
-            model,
-            effort: "low",
-            max_tokens: 6000,
-            system: prompts::REVERSAL_SCREEN_SYSTEM,
-            user: &user,
-            schema: &schema,
-        };
-        let result = caller.call("reversal-screen", &request);
-        (claim, list, result)
+        let mut results: Vec<(usize, usize, Result<Value, ApiError>)> = Vec::new();
+        for (index, chunk) in list.chunks(SCREEN_CHUNK).enumerate() {
+            let base = index * SCREEN_CHUNK;
+            let lines: Vec<String> = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, hit)| {
+                    format!(
+                        "C{} | {} | {} | {}",
+                        base + index + 1,
+                        corpus.local(&hit.timestamp),
+                        if hit.project.is_empty() {
+                            "?"
+                        } else {
+                            &hit.project
+                        },
+                        if swept.is_some() {
+                            text::one_line(&text::clip_middle(&hit.text, SWEEP_CHARS))
+                        } else {
+                            text::one_line(&text::window(&hit.text, &hit.terms, 360))
+                        }
+                    )
+                })
+                .collect();
+            let user = format!(
+                "Item {} ({}, {}):\n「{}」\n\nThe person's messages from then on:\n{}",
+                claim.id,
+                corpus.local(&claim.timestamp),
+                claim.kind,
+                text::one_line(&claim.quote),
+                lines.join("\n")
+            );
+            let request = Request {
+                model,
+                effort: "low",
+                max_tokens: 6000,
+                system: if swept.is_some() {
+                    prompts::REVERSAL_SWEEP_SYSTEM
+                } else {
+                    prompts::REVERSAL_SCREEN_SYSTEM
+                },
+                user: &user,
+                schema: &schema,
+            };
+            results.push((base, chunk.len(), caller.call("reversal-screen", &request)));
+        }
+        (claim, list, results)
     });
     // The messages that may change each claim, the likeliest first, claim by claim.
     let mut per_claim: Vec<Vec<(Hit, u64)>> = Vec::new();
     let mut changes: HashMap<String, usize> = HashMap::new();
-    for (claim, list, result) in judged {
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => {
-                notes.issues.push(format!(
-                    "reversal check: the messages after {} were not judged ({error})",
-                    claim.id
-                ));
-                continue;
-            }
-        };
+    for (claim, list, results) in judged {
         let mut found: Vec<(Hit, u64)> = Vec::new();
-        for entry in output.array_at("scores") {
-            let score = entry.get("score").and_then(Value::as_u64).unwrap_or(0);
-            let index = entry
-                .str_at("id")
-                .trim()
-                .trim_start_matches(['C', 'c'])
-                .parse::<usize>()
-                .ok();
-            let Some(hit) = index
-                .and_then(|number| number.checked_sub(1))
-                .and_then(|index| list.get(index))
-            else {
-                continue;
+        for (base, length, result) in results {
+            let output = match result {
+                Ok(output) => output,
+                Err(error) => {
+                    notes.issues.push(format!(
+                        "reversal check: the messages after {} (C{}-C{}) were not judged ({error})",
+                        claim.id,
+                        base + 1,
+                        base + length
+                    ));
+                    continue;
+                }
             };
-            if score < 2 {
-                continue;
+            for entry in output.array_at("scores") {
+                let score = entry.get("score").and_then(Value::as_u64).unwrap_or(0);
+                let index = entry
+                    .str_at("id")
+                    .trim()
+                    .trim_start_matches(['C', 'c'])
+                    .parse::<usize>()
+                    .ok();
+                let Some(hit) = index
+                    .and_then(|number| number.checked_sub(1))
+                    .filter(|index| (base..base + length).contains(index))
+                    .and_then(|index| list.get(index))
+                else {
+                    continue;
+                };
+                if score < 2 {
+                    continue;
+                }
+                *changes.entry(claim.id.clone()).or_default() += 1;
+                let mut hit = hit.clone();
+                hit.note = format!(
+                    "reversal check: may {} 「{}」 of {}",
+                    if score == 3 { "reverse" } else { "change" },
+                    text::clip_head(&text::one_line(&claim.quote), 40),
+                    claim.date
+                );
+                found.push((hit, score));
             }
-            *changes.entry(claim.id.clone()).or_default() += 1;
-            let mut hit = hit.clone();
-            hit.note = format!(
-                "reversal check: may {} 「{}」 of {}",
-                if score == 3 { "reverse" } else { "change" },
-                text::clip_head(&text::one_line(&claim.quote), 40),
-                claim.date
-            );
-            found.push((hit, score));
         }
         found.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
         per_claim.push(found);
@@ -907,6 +1169,8 @@ fn hunt_reversals(
             kind: claim.kind.clone(),
             quote: claim.quote.clone(),
             terms: strings,
+            swept: swept.is_some(),
+            later_total: totals.get(&claim.id).copied().unwrap_or(0),
             candidates: screened.get(&claim.id).copied().unwrap_or(0),
             changes: changes.get(&claim.id).copied().unwrap_or(0),
         });
@@ -969,7 +1233,14 @@ fn gather(
                 candidates.len(),
                 options.screen_model
             ));
-            let scores = screen(caller, options, corpus, &candidates, notes);
+            let scores = screen(
+                caller,
+                options,
+                corpus,
+                &candidates,
+                notes,
+                Screening::Found,
+            );
             pool.screened = true;
             for (hit, score) in candidates.into_iter().zip(scores) {
                 match score {
@@ -990,9 +1261,406 @@ fn gather(
     Ok(())
 }
 
+/// Screens every message the person wrote in the scope (the newest `sweep_limit` of them)
+/// against the question, in the order written, and puts the relevant ones in the pool: the
+/// person's side of the search no longer depends on the strings chosen. The agents' records
+/// are still found by the strings.
+fn sweep(
+    corpus: &Corpus,
+    caller: &Caller,
+    options: &Options,
+    filters: &Filters,
+    prefetched: Option<PersonMessages>,
+    pool: &mut Pool,
+    notes: &mut Notes,
+) -> Result<(), String> {
+    let found = match prefetched {
+        Some(found) => found,
+        None => corpus
+            .person_all(filters, usize::MAX)
+            .map_err(|error| format!("the sweep could not read the person's messages: {error}"))?,
+    };
+    // The newest `sweep_limit` messages with text, oldest first: each chunk the screen reads
+    // is a stretch of the conversation. A message of images alone has nothing to screen.
+    let with_text = found
+        .hits
+        .iter()
+        .filter(|hit| !hit.text.trim().is_empty())
+        .count();
+    let mut ordered: Vec<Hit> = found
+        .hits
+        .iter()
+        .filter(|hit| !hit.text.trim().is_empty())
+        .take(options.sweep_limit)
+        .cloned()
+        .collect();
+    ordered.reverse();
+    let mut swept = Swept {
+        in_scope: found.total,
+        screened: ordered.len(),
+        unscreened: 0,
+        truncated: with_text > ordered.len(),
+        threes: 0,
+        twos: 0,
+        oldest: ordered
+            .first()
+            .map(|hit| hit.timestamp.clone())
+            .unwrap_or_default(),
+        newest: ordered
+            .last()
+            .map(|hit| hit.timestamp.clone())
+            .unwrap_or_default(),
+        stale_sources: found.stale_sources,
+        unscanned_bytes: found.unscanned_bytes,
+        messages: found.hits,
+    };
+    if ordered.is_empty() {
+        pool.swept = Some(swept);
+        return Ok(());
+    }
+    progress(&format!(
+        "sweeping {} of the person's messages ({})",
+        ordered.len(),
+        options.screen_model
+    ));
+    let scores = screen(caller, options, corpus, &ordered, notes, Screening::Sweep);
+    pool.screened = true;
+    // Into the pool newest first, as the search's records go.
+    for (hit, score) in ordered.into_iter().zip(scores).rev() {
+        pool.seen.insert(hit.source_ref.clone());
+        match score {
+            None => {
+                swept.unscreened += 1;
+                pool.near.push((hit, 1));
+            }
+            Some(3) => {
+                swept.threes += 1;
+                pool.threes += 1;
+                pool.relevant.push((hit, 3));
+            }
+            Some(2) => {
+                swept.twos += 1;
+                pool.twos += 1;
+                pool.relevant.push((hit, 2));
+            }
+            _ => pool.near.push((hit, score.map_or(1, |score| score.min(1)))),
+        }
+    }
+    swept.screened -= swept.unscreened;
+    pool.swept = Some(swept);
+    Ok(())
+}
+
+/// A sample of the person's messages in the scope, spread over its span, for the plan model to
+/// see how the person writes: which words, which spellings. The messages read are returned for
+/// the sweep to use.
+fn vocabulary(corpus: &Corpus, filters: &Filters) -> (String, Option<PersonMessages>) {
+    let Ok(found) = corpus.person_all(filters, usize::MAX) else {
+        return (String::new(), None);
+    };
+    let messages: Vec<&Hit> = found
+        .hits
+        .iter()
+        .filter(|hit| !hit.text.trim().is_empty())
+        .collect();
+    if messages.is_empty() {
+        return (String::new(), Some(found));
+    }
+    let picked = spread(&messages, VOCABULARY_SAMPLE);
+    let mut out = format!(
+        "\n\nHow the person writes: {} of their {} messages in the scope, newest first (time | \
+         project | message):\n",
+        picked.len(),
+        messages.len()
+    );
+    for hit in picked {
+        out.push_str(&format!(
+            "{} | {} | {}\n",
+            corpus.local(&hit.timestamp),
+            if hit.project.is_empty() {
+                "?"
+            } else {
+                &hit.project
+            },
+            text::clip_head(&text::one_line(&hit.text), 140)
+        ));
+    }
+    (out, Some(found))
+}
+
+/// `count` of the items, spread evenly over them, the first and the last included.
+fn spread<T: Copy>(items: &[T], count: usize) -> Vec<T> {
+    if items.len() <= count {
+        return items.to_vec();
+    }
+    (0..count)
+        .map(|index| items[index * (items.len() - 1) / (count - 1).max(1)])
+        .collect()
+}
+
+/// Asks the plan model for other strings when the first ones found no record at all.
+fn replan(
+    caller: &Caller,
+    corpus: &Corpus,
+    options: &Options,
+    tried: &[String],
+    notes: &mut Notes,
+) -> Vec<String> {
+    progress(&format!(
+        "no record holds the strings; choosing others ({})",
+        options.plan_model
+    ));
+    let user = format!(
+        "Today: {} ({})\nQuestion: {}\n\nA first choice of strings found no record at all: {}. \
+         Choose other strings: shorter stems, other spellings (kana, kanji, katakana, full-width \
+         letters), the words the person would type, and the words an agent would use when \
+         reporting on it.",
+        corpus.today(),
+        corpus.zone(),
+        options.question,
+        tried.join(", ")
+    );
+    let schema = prompts::plan_schema();
+    let request = Request {
+        model: &options.plan_model,
+        effort: "low",
+        max_tokens: 4000,
+        system: prompts::PLAN_SYSTEM,
+        user: &user,
+        schema: &schema,
+    };
+    match caller.call("plan", &request) {
+        Ok(plan) => {
+            let more: Vec<String> = clean_terms(
+                plan.array_at("terms")
+                    .iter()
+                    .map(|term| term.str_at("text").to_string()),
+            )
+            .into_iter()
+            .filter(|term| !holds_term(tried, term))
+            .collect();
+            notes.issues.push(format!(
+                "No record held the first {} strings; {} others were chosen and searched",
+                tried.len(),
+                more.len()
+            ));
+            more
+        }
+        Err(error) => {
+            notes.issues.push(format!(
+                "no record held the strings, and choosing others failed ({error})"
+            ));
+            Vec::new()
+        }
+    }
+}
+
+/// The sessions in the scope with a message from the person, against the sessions the records
+/// read come from. Reads the person's messages once more unless a sweep already did.
+fn coverage(
+    corpus: &Corpus,
+    filters: &Filters,
+    pool: &Pool,
+    evidence: &[Evidence],
+    prefetched: Option<&PersonMessages>,
+) -> Option<Coverage> {
+    let owned;
+    let messages: &[Hit] = match (&pool.swept, prefetched) {
+        (Some(swept), _) => &swept.messages,
+        (None, Some(found)) => &found.hits,
+        (None, None) => {
+            owned = corpus.person_all(filters, usize::MAX).ok()?;
+            &owned.hits
+        }
+    };
+    let read: HashSet<&str> = evidence
+        .iter()
+        .map(|item| item.hit.session.as_str())
+        .collect();
+    // Newest first, as the messages come: the first message seen of a session is its newest.
+    let mut sessions: Vec<UnreadSession> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for hit in messages {
+        if hit.session.is_empty() {
+            continue;
+        }
+        match index.get(hit.session.as_str()) {
+            Some(&at) => {
+                let entry = &mut sessions[at];
+                entry.messages += 1;
+                entry.first = hit.timestamp.clone();
+                entry.opening = hit.text.clone();
+            }
+            None => {
+                index.insert(hit.session.as_str(), sessions.len());
+                sessions.push(UnreadSession {
+                    session: hit.session.clone(),
+                    project: hit.project.clone(),
+                    first: hit.timestamp.clone(),
+                    last: hit.timestamp.clone(),
+                    messages: 1,
+                    opening: hit.text.clone(),
+                });
+            }
+        }
+    }
+    let sessions_in_scope = sessions.len();
+    let sessions_with_evidence = sessions
+        .iter()
+        .filter(|session| read.contains(session.session.as_str()))
+        .count();
+    let mut unread: Vec<UnreadSession> = sessions
+        .into_iter()
+        .filter(|session| !read.contains(session.session.as_str()))
+        .collect();
+    let unread_total = unread.len();
+    unread.truncate(UNREAD_LISTED);
+    for session in &mut unread {
+        session.opening = text::clip_head(&text::one_line(&session.opening), 90);
+    }
+    Some(Coverage {
+        sessions_in_scope,
+        sessions_with_evidence,
+        swept: pool.swept.is_some(),
+        unread,
+        unread_total,
+    })
+}
+
+/// Writes, as text, the person's messages a sweep judged relevant (whole, oldest first) and
+/// the records the answer read: an extract to read elsewhere.
+/// Writes the export when one was asked for, and says so, or why not, in the notes.
+fn export_if_asked(
+    corpus: &Corpus,
+    options: &Options,
+    filters: &Filters,
+    pool: &Pool,
+    evidence: &[Evidence],
+    notes: &mut Notes,
+) {
+    let Some(path) = &options.export else {
+        return;
+    };
+    match write_export(path, corpus, options, filters, pool, evidence) {
+        Ok(()) => notes.issues.push(format!(
+            "Exported the records read and the person's relevant messages to {}",
+            path.display()
+        )),
+        Err(error) => notes.issues.push(format!(
+            "could not write the export to {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn write_export(
+    path: &Path,
+    corpus: &Corpus,
+    options: &Options,
+    filters: &Filters,
+    pool: &Pool,
+    evidence: &[Evidence],
+) -> io::Result<()> {
+    let mut out = format!(
+        "# ebira ask: what was read\nQuestion: {}\n",
+        options.question
+    );
+    if let Some(cwd) = &filters.cwd {
+        out.push_str(&format!("Working directory contains: {cwd}\n"));
+    }
+    for (word, date) in [("From", &filters.from), ("To", &filters.to)] {
+        if let Some(date) = date {
+            out.push_str(&format!("{word}: {date}\n"));
+        }
+    }
+    out.push_str(&format!("Times: {}\n\n", corpus.zone()));
+    if let Some(swept) = &pool.swept {
+        let mut relevant: Vec<&(Hit, u64)> = pool
+            .relevant
+            .iter()
+            .filter(|(hit, _)| hit.who == Who::Person && hit.terms.is_empty())
+            .collect();
+        relevant.sort_by(|left, right| time_order(corpus, &left.0, &right.0));
+        out.push_str(&format!(
+            "## The person's messages judged to bear on the question: {} of the {} screened ({} in \
+             the scope)\n\n",
+            relevant.len(),
+            swept.screened,
+            swept.in_scope
+        ));
+        for (hit, score) in relevant {
+            out.push_str(&format!(
+                "[{} | {} points | {} | session {} | {}]\n{}\n\n",
+                corpus.local(&hit.timestamp),
+                score,
+                if hit.project.is_empty() {
+                    "?"
+                } else {
+                    &hit.project
+                },
+                hit.session,
+                source_ref_text(&hit.source_ref),
+                hit.text.trim()
+            ));
+        }
+    }
+    let digests = evidence.len() - read_count(evidence);
+    out.push_str(&format!(
+        "## The records the answer read: {}{}\n\n",
+        read_count(evidence),
+        if digests > 0 {
+            format!(" (and {digests} more of the person's messages, in one line each)")
+        } else {
+            String::new()
+        }
+    ));
+    for item in evidence {
+        out.push_str(&format!(
+            "{}  {}\n\n",
+            item.block.trim_end(),
+            source_ref_text(&item.hit.source_ref)
+        ));
+    }
+    std::fs::write(path, out)
+}
+
+/// What a screen is given: the records a search found, shown around the strings that found
+/// them, or every message of the person's in a sweep, shown whole.
+#[derive(Clone, Copy)]
+enum Screening {
+    Found,
+    Sweep,
+}
+
+impl Screening {
+    fn step(self) -> &'static str {
+        match self {
+            Screening::Found => "screen",
+            Screening::Sweep => "sweep",
+        }
+    }
+
+    fn system(self) -> &'static str {
+        match self {
+            Screening::Found => prompts::SCREEN_SYSTEM,
+            Screening::Sweep => prompts::SWEEP_SYSTEM,
+        }
+    }
+
+    fn text(self, hit: &Hit) -> String {
+        match self {
+            Screening::Found => text::one_line(&text::window(&hit.text, &hit.terms, 360)),
+            Screening::Sweep => text::one_line(&text::clip_middle(&hit.text, SWEEP_CHARS)),
+        }
+    }
+}
+
 /// This round's records not screened yet, best first, up to `limit`, which are marked as
 /// screened. One past the limit is not: a later round's strings can bring it back.
 fn take_new(pool: &mut Pool, corpus: &Corpus, hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    // Every record found counts as found, also one a sweep or an earlier round screened.
+    pool.found
+        .extend(hits.iter().map(|hit| hit.source_ref.clone()));
     let mut this_round = HashSet::new();
     let mut candidates: Vec<Hit> = hits
         .into_iter()
@@ -1001,8 +1669,6 @@ fn take_new(pool: &mut Pool, corpus: &Corpus, hits: Vec<Hit>, limit: usize) -> V
         })
         .collect();
     rank(corpus, &mut candidates);
-    pool.found
-        .extend(candidates.iter().map(|hit| hit.source_ref.clone()));
     candidates.truncate(limit);
     pool.seen
         .extend(candidates.iter().map(|hit| hit.source_ref.clone()));
@@ -1067,6 +1733,7 @@ fn answer_with(
     corpus: &Corpus,
     evidence: &[Evidence],
     pool: &Pool,
+    digest: Option<(usize, usize)>,
     model: &str,
 ) -> Result<Value, String> {
     progress(&format!(
@@ -1087,9 +1754,65 @@ fn answer_with(
     } else {
         String::new()
     };
+    // After a sweep, the person's side is complete as far as the screen saw: a matter none of
+    // the records raises is one the person did not raise in the messages screened.
+    let swept = match &pool.swept {
+        Some(swept) if swept.screened > 0 => {
+            let which = if swept.truncated {
+                format!(
+                    "The newest {} of the {} messages the person wrote in the scope of this \
+                     question ({} to {}) were screened by a model for bearing on it; the older \
+                     ones were not",
+                    swept.screened,
+                    swept.in_scope,
+                    corpus.local(&swept.oldest),
+                    corpus.local(&swept.newest)
+                )
+            } else {
+                format!(
+                    "Every message the person wrote in the scope of this question ({} messages, \
+                     {} to {}) was screened by a model for bearing on it",
+                    swept.screened,
+                    corpus.local(&swept.oldest),
+                    corpus.local(&swept.newest)
+                )
+            };
+            let left_out = match digest {
+                Some((_, left_out)) if left_out > 0 => {
+                    format!(" ({left_out} of them were left out for room)")
+                }
+                _ => String::new(),
+            };
+            let unscreened = if swept.unscreened > 0 {
+                format!(
+                    " {} messages got no score and were not screened.",
+                    swept.unscreened
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{which}, and every one judged to bear on it is among the records below, with \
+                 its context or in one line{left_out}.{unscreened} So a matter none of these \
+                 records raises is one the person did not raise in the messages screened, as \
+                 far as the screen saw: say so under gaps instead of guessing, and do not claim \
+                 the person never said something outside that scope. The agents' records were \
+                 found by search strings and are not complete.\n\n"
+            )
+        }
+        _ => String::new(),
+    };
+    let digest_note = if evidence.iter().any(|item| item.digest) {
+        "Records marked digest are more of the person's messages the sweep judged to bear on the \
+         question, shown in one line each without their context and cut short: quote from them \
+         only the words shown, and count them when the question is about what the person said \
+         more than once.\n\n"
+    } else {
+        ""
+    };
     let user = format!(
-        "Question: {}\nToday: {}\nTimes: every time below is local time, {}\n\n{closest}Records ({} \
-         of them, by E number; ▶ marks the record the search found, the lines around it are its \
+        "Question: {}\nToday: {}\nTimes: every time below is local time, {}\n\n{closest}{swept}{digest_note}Records ({} \
+         of them, by E number; ▶ marks the record found, the lines around it are its \
          context):\n\n{}",
         options.question,
         corpus.today(),
@@ -1212,6 +1935,9 @@ fn search(
                 who,
                 returned: found.hits.len(),
                 total: found.total,
+                oldest_taken: ((found.hits.len() as u64) < found.total)
+                    .then(|| found.hits.last().map(|hit| hit.timestamp.clone()))
+                    .flatten(),
             });
             for hit in &found.hits {
                 match place.get(&hit.source_ref) {
@@ -1249,6 +1975,7 @@ fn screen(
     corpus: &Corpus,
     candidates: &[Hit],
     notes: &mut Notes,
+    screening: Screening,
 ) -> Vec<Option<u64>> {
     let schema = prompts::screen_schema();
     let chunks: Vec<(usize, &[Hit])> = candidates
@@ -1275,7 +2002,7 @@ fn screen(
                     } else {
                         &hit.project
                     },
-                    text::one_line(&text::window(&hit.text, &hit.terms, 360))
+                    screening.text(hit)
                 )
             })
             .collect();
@@ -1285,12 +2012,12 @@ fn screen(
             lines.join("\n")
         );
         let result = caller.call(
-            "screen",
+            screening.step(),
             &Request {
                 model: &options.screen_model,
                 effort: "low",
                 max_tokens: 6000,
-                system: prompts::SCREEN_SYSTEM,
+                system: screening.system(),
                 user: &user,
                 schema: &schema,
             },
@@ -1316,18 +2043,28 @@ fn screen(
                     }
                 }
             }
-            Err(error) => {
+            Err(error) => match screening {
                 // Keep the best-ranked third of the chunk rather than lose it, and say so.
-                notes.issues.push(format!(
-                    "candidates C{}-C{} were not screened ({error}); the third with the most \
-                     search strings was kept",
+                Screening::Found => {
+                    notes.issues.push(format!(
+                        "candidates C{}-C{} were not screened ({error}); the third with the most \
+                         search strings was kept",
+                        base + 1,
+                        base + length
+                    ));
+                    for (offset, score) in scores[base..base + length].iter_mut().enumerate() {
+                        *score = Some(if offset < length.div_ceil(3) { 2 } else { 1 });
+                    }
+                }
+                // A sweep's chunk is a stretch of the conversation, not ranked: nothing in it
+                // can be kept on its position.
+                Screening::Sweep => notes.issues.push(format!(
+                    "the person's messages C{}-C{} were not swept ({error}); they count as \
+                     unscreened",
                     base + 1,
                     base + length
-                ));
-                for (offset, score) in scores[base..base + length].iter_mut().enumerate() {
-                    *score = Some(if offset < length.div_ceil(3) { 2 } else { 1 });
-                }
-            }
+                )),
+            },
         }
     }
     let unscored = scores.iter().filter(|score| score.is_none()).count();
@@ -1499,6 +2236,7 @@ fn compose(corpus: &Corpus, id: String, hit: Hit, lines: Result<Vec<Line>, Strin
         hit,
         block,
         lines: shown,
+        digest: false,
     }
 }
 
@@ -1514,6 +2252,7 @@ struct Summary<'a> {
     synced_through: Option<&'a str>,
     filters: &'a Filters,
     notes: &'a Notes,
+    swept: Option<&'a Swept>,
 }
 
 impl<'a> Summary<'a> {
@@ -1529,6 +2268,26 @@ impl<'a> Summary<'a> {
             synced_through: pool.synced_through.as_deref(),
             filters,
             notes,
+            swept: pool.swept.as_ref(),
+        }
+    }
+
+    /// What a sweep adds to the statement that the records do not settle the question: that
+    /// none of the person's own messages in the scope was judged to bear on it either.
+    fn swept_sentence(&self) -> String {
+        match self.swept {
+            Some(swept) if swept.screened > 0 && swept.truncated => format!(
+                " Of the person's {} messages in the scope, the newest {} were screened and none \
+                 was judged to bear on the question.",
+                swept.in_scope, swept.screened
+            ),
+            Some(swept) if swept.screened > 0 => format!(
+                " Of the person's own messages in the scope, all {} were screened and none was \
+                 judged to bear on the question.",
+                swept.screened
+            ),
+            Some(_) => " The person wrote no message in the scope.".to_string(),
+            None => String::new(),
         }
     }
 
@@ -1559,22 +2318,35 @@ impl<'a> Summary<'a> {
             ),
         };
         let searched = self.terms.join(", ");
-        if self.found == 0 {
+        let swept = self.swept_sentence();
+        let swept_relevant = self
+            .swept
+            .is_some_and(|swept| swept.threes + swept.twos > 0);
+        if self.found == 0 && !swept_relevant {
+            let reads = if self.kept > 0 {
+                format!(
+                    " The answer reads the {} closest of the person's messages, with the records \
+                     around them.",
+                    self.kept
+                )
+            } else {
+                String::new()
+            };
             return Some(format!(
                 "The records do not settle the question: no record holds {any}{scope}. Searched: \
-                 {searched}."
+                 {searched}.{swept}{reads}"
             ));
         }
         self.closest.then(|| match self.found {
             1 => format!(
                 "The record found does not settle the question: the one record found by \
-                 {by}{scope} was not judged relevant to it. The answer reads it, with the records \
-                 around it. Searched: {searched}."
+                 {by}{scope} was not judged relevant to it.{swept} The answer reads it, with the \
+                 records around it. Searched: {searched}."
             ),
             found => format!(
                 "The records found do not settle the question: none of the {found} records found \
-                 by {by}{scope} was judged relevant to it. The answer reads {}, with the records \
-                 around them. Searched: {searched}.",
+                 by {by}{scope} was judged relevant to it.{swept} The answer reads {}, with the \
+                 records around them. Searched: {searched}.",
                 if self.kept < found {
                     format!("the {} closest", self.kept)
                 } else {
@@ -1605,7 +2377,7 @@ impl<'a> Summary<'a> {
             .filter(|count| (count.returned as u64) < count.total)
             .map(|count| {
                 format!(
-                    "{} ({} {}/{})",
+                    "{} ({} {}/{}{})",
                     count.term,
                     if count.who == Who::Person {
                         "person"
@@ -1613,7 +2385,12 @@ impl<'a> Summary<'a> {
                         "agent"
                     },
                     count.returned,
-                    count.total
+                    count.total,
+                    count
+                        .oldest_taken
+                        .as_deref()
+                        .map(|time| format!(", none before {}", corpus.local(time)))
+                        .unwrap_or_default()
                 )
             })
             .collect();
@@ -1641,6 +2418,83 @@ impl<'a> Summary<'a> {
                 self.found, self.kept
             ),
         });
+        if let Some(swept) = self.swept {
+            lines.push(format!(
+                "Swept the person's messages: {} in scope, {} screened{}, relevant {} (3 points {}, \
+                 2 points {}){}",
+                swept.in_scope,
+                swept.screened,
+                if swept.screened > 0 {
+                    format!(
+                        " ({} to {})",
+                        corpus.local(&swept.oldest),
+                        corpus.local(&swept.newest)
+                    )
+                } else {
+                    String::new()
+                },
+                swept.threes + swept.twos,
+                swept.threes,
+                swept.twos,
+                if swept.stale_sources > 0 || swept.unscanned_bytes > 0 {
+                    format!(
+                        "; stale sources {}, unscanned bytes {}",
+                        swept.stale_sources, swept.unscanned_bytes
+                    )
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if let Some((shown, left_out)) = self.notes.digest {
+            lines.push(format!(
+                "Sweep digest: {} more of the person's relevant messages were given to the answer \
+                 in one line each{}",
+                shown,
+                if left_out > 0 {
+                    format!(" ({left_out} left out)")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if let Some(coverage) = &self.notes.coverage {
+            lines.push(format!(
+                "Sessions in the scope with a message from the person: {}; the records read come \
+                 from {}; {} {}",
+                coverage.sessions_in_scope,
+                coverage.sessions_with_evidence,
+                coverage.unread_total,
+                if coverage.swept {
+                    "others had every message of the person's screened and none judged relevant"
+                } else {
+                    "others were not read"
+                }
+            ));
+            if !coverage.swept {
+                for session in &coverage.unread {
+                    lines.push(format!(
+                        "  not read: {} | {} | {} to {} | {} messages | {}",
+                        session.session,
+                        if session.project.is_empty() {
+                            "?"
+                        } else {
+                            &session.project
+                        },
+                        corpus.local(&session.first),
+                        corpus.local(&session.last),
+                        session.messages,
+                        session.opening
+                    ));
+                }
+                if coverage.unread_total > coverage.unread.len() {
+                    lines.push(format!(
+                        "  … and {} more sessions not read",
+                        coverage.unread_total - coverage.unread.len()
+                    ));
+                }
+            }
+        }
         lines.push(format!(
             "The corpus has read the logs through {} (run `ebira sync` first to include the latest)",
             self.synced_through
@@ -1649,12 +2503,21 @@ impl<'a> Summary<'a> {
         ));
         for check in &self.notes.checks {
             lines.push(format!(
-                "Reversal check {} ({}, {} 「{}」): strings {} -> {} candidates -> {} may change it",
+                "Reversal check {} ({}, {} 「{}」): {} -> {} candidates -> {} may change it",
                 check.id,
                 check.date,
                 check.kind,
                 text::clip_head(&text::one_line(&check.quote), 30),
-                check.terms.join(", "),
+                if !check.swept {
+                    format!("strings {}", check.terms.join(", "))
+                } else if check.candidates < check.later_total {
+                    format!(
+                        "the earliest and the latest {} of the person's {} later messages",
+                        check.candidates, check.later_total
+                    )
+                } else {
+                    format!("every later message of the person's ({})", check.candidates)
+                },
                 check.candidates,
                 check.changes
             ));
@@ -1687,13 +2550,17 @@ impl<'a> Summary<'a> {
                     .iter()
                     .find(|count| &count.term == term && count.who == who)
                 {
-                    Some(count) => object.raw(
-                        key,
-                        &crate::json::Object::new()
+                    Some(count) => {
+                        let mut taken = crate::json::Object::new();
+                        taken
                             .number("returned", count.returned as u64)
-                            .number("total", count.total)
-                            .finish(),
-                    ),
+                            .number("total", count.total);
+                        // Only when not all were taken: the oldest that was.
+                        if let Some(oldest) = &count.oldest_taken {
+                            taken.name("oldest_taken", oldest);
+                        }
+                        object.raw(key, &taken.finish())
+                    }
                     None => object.raw(key, "null"),
                 };
             }
@@ -1709,6 +2576,8 @@ impl<'a> Summary<'a> {
                     "terms",
                     &crate::json::strings(check.terms.iter().map(String::as_str)),
                 )
+                .boolean("swept", check.swept)
+                .number("later_messages", check.later_total as u64)
                 .number("candidates", check.candidates as u64)
                 .number("may_change", check.changes as u64)
                 .finish()
@@ -1757,6 +2626,62 @@ impl<'a> Summary<'a> {
             .number(
                 "recent_sessions_omitted",
                 self.notes.recent_sessions_omitted as u64,
+            )
+            .raw(
+                "sweep_digest",
+                &crate::json::or_null(self.notes.digest.map(|(shown, left_out)| {
+                    crate::json::Object::new()
+                        .number("shown", shown as u64)
+                        .number("left_out", left_out as u64)
+                        .finish()
+                })),
+            )
+            .raw(
+                "coverage",
+                &crate::json::or_null(self.notes.coverage.as_ref().map(|coverage| {
+                    let unread = coverage.unread.iter().map(|session| {
+                        crate::json::Object::new()
+                            .name("session", &session.session)
+                            .text("project", &session.project)
+                            .name("first", &session.first)
+                            .name("last", &session.last)
+                            .number("messages", session.messages as u64)
+                            .text("opening", &session.opening)
+                            .finish()
+                    });
+                    crate::json::Object::new()
+                        .number("sessions_in_scope", coverage.sessions_in_scope as u64)
+                        .number(
+                            "sessions_with_evidence",
+                            coverage.sessions_with_evidence as u64,
+                        )
+                        .number("sessions_unread", coverage.unread_total as u64)
+                        .boolean("unread_swept", coverage.swept)
+                        .raw("unread", &crate::json::array(unread))
+                        .finish()
+                })),
+            )
+            .raw(
+                "sweep",
+                &crate::json::or_null(self.swept.map(|swept| {
+                    crate::json::Object::new()
+                        .number("in_scope", swept.in_scope as u64)
+                        .number("screened", swept.screened as u64)
+                        .number("relevant", (swept.threes + swept.twos) as u64)
+                        .number("threes", swept.threes as u64)
+                        .number("twos", swept.twos as u64)
+                        .optional(
+                            "oldest",
+                            (swept.screened > 0).then_some(swept.oldest.as_str()),
+                        )
+                        .optional(
+                            "newest",
+                            (swept.screened > 0).then_some(swept.newest.as_str()),
+                        )
+                        .number("stale_sources", swept.stale_sources)
+                        .number("unscanned_source_bytes", swept.unscanned_bytes)
+                        .finish()
+                })),
             )
             .raw(
                 "issues",
@@ -2206,6 +3131,15 @@ mod tests {
 
     fn corpus() -> Corpus {
         Corpus::for_tests(540)
+    }
+
+    #[test]
+    fn spreads_a_sample_over_the_whole() {
+        let items: Vec<usize> = (0..100).collect();
+        let picked = spread(&items, 5);
+        assert_eq!(picked, vec![0, 24, 49, 74, 99]);
+        assert_eq!(spread(&items[..3], 5), vec![0, 1, 2]);
+        assert_eq!(spread(&items, 1), vec![0]);
     }
 
     #[test]
@@ -2855,6 +3789,7 @@ mod tests {
                 who: Who::Person,
                 returned: 60,
                 total: 120,
+                oldest_taken: Some("2026-09-01T00:00:00Z".to_string()),
             }],
             rounds: 2,
             found: (0..30)
@@ -2912,7 +3847,8 @@ mod tests {
         assert!(text.contains("--term \"colors\""), "{text}");
         assert!(
             text.contains(
-                "Held by many records, of which only the newest were taken: colors (person 60/120)"
+                "Held by many records, of which only the newest were taken: colors (person 60/120, \
+                 none before 2026-09-01 09:00)"
             ),
             "{text}"
         );

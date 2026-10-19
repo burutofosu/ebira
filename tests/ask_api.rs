@@ -176,6 +176,7 @@ fn run_case(
             "ask",
             "What is decided?",
             "--quick",
+            "--no-sweep",
             "--term",
             "remote",
             "--keep",
@@ -406,6 +407,8 @@ fn ask_compatible(logs: &Logs, corpus: &Path, url: &str) -> std::process::Output
     ask_compatible_about(logs, corpus, url, "What is decided?", "remote")
 }
 
+/// Asks through the compatible service with the strings alone: the sweep is off, so a test
+/// of another part of `ask` counts the calls that part makes.
 fn ask_compatible_about(
     logs: &Logs,
     corpus: &Path,
@@ -413,30 +416,153 @@ fn ask_compatible_about(
     question: &str,
     term: &str,
 ) -> std::process::Output {
-    ebira(&logs.0)
-        .env("EBIRA_TEST_KEY", "test-key")
-        .args([
-            "ask",
-            question,
-            "--api",
-            "compatible",
-            "--api-url",
-            url,
-            "--api-key-env",
-            "EBIRA_TEST_KEY",
-            "--strong-model",
-            "strong-model",
-            "--cheap-model",
-            "cheap-model",
-            "--term",
-            term,
-            "--keep",
-            "1",
-            "--corpus",
-            corpus.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap()
+    ask_compatible_with(logs, corpus, url, question, term, &["--no-sweep"])
+}
+
+fn ask_compatible_with(
+    logs: &Logs,
+    corpus: &Path,
+    url: &str,
+    question: &str,
+    term: &str,
+    extra: &[&str],
+) -> std::process::Output {
+    let mut command = ebira(&logs.0);
+    command.env("EBIRA_TEST_KEY", "test-key").args([
+        "ask",
+        question,
+        "--api",
+        "compatible",
+        "--api-url",
+        url,
+        "--api-key-env",
+        "EBIRA_TEST_KEY",
+        "--strong-model",
+        "strong-model",
+        "--cheap-model",
+        "cheap-model",
+        "--term",
+        term,
+        "--keep",
+        "1",
+        "--corpus",
+        corpus.to_str().unwrap(),
+    ]);
+    command.args(extra);
+    command.output().unwrap()
+}
+
+/// The sweep's screen, as the request names it.
+const SWEEP: &str = "You screen a person's own messages";
+
+#[test]
+fn the_sweep_screens_every_message_of_the_persons_and_reads_what_bears_on_the_question() {
+    // The string finds the first decision; the one that replaced it holds no search string
+    // and is found by the sweep alone, which screens every message the person wrote.
+    let (logs, corpus) = synced_log(
+        "sweep",
+        concat!(
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-09-15T00:00:00Z","message":{"role":"user","content":"ログインはメールとパスワードで"}}"#,
+            "
+",
+            r#"{"type":"assistant","sessionId":"s","timestamp":"2026-09-15T00:10:00Z","message":{"role":"assistant","content":[{"type":"text","text":"実装します。"}]}}"#,
+            "
+",
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-09-15T01:00:00Z","message":{"role":"user","content":"パスワード管理したくないから、メールにリンク送る方式にしよ"}}"#,
+            "
+",
+        ),
+    );
+    let service = ChatService::start(|body| {
+        if body.contains(SWEEP) {
+            (
+                200,
+                chat(
+                    "cheap-model",
+                    r#"{"scores":[{"id":"C1","score":2},{"id":"C2","score":3}]}"#,
+                ),
+            )
+        } else if body.contains(SCREEN) {
+            (
+                200,
+                chat("cheap-model", r#"{"scores":[{"id":"C1","score":2}]}"#),
+            )
+        } else {
+            (
+                200,
+                chat(
+                    "strong-model",
+                    r#"{"answer":"メールにリンクを送る方式です。","findings":[{"evidence":"E2","kind":"decision","quote":"メールにリンク送る方式にしよ","note":""}],"timeline":[],"gaps":[],"more_terms":[]}"#,
+                ),
+            )
+        }
+    });
+    let output = ask_compatible_with(
+        &logs,
+        &corpus,
+        &service.url,
+        "ログイン方式は何になった？",
+        "ログイン",
+        &["--keep", "2"],
+    );
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sweeps: Vec<&String> = requests
+        .iter()
+        .map(|(_, body)| body)
+        .filter(|body| body.contains(SWEEP))
+        .collect();
+    assert_eq!(sweeps.len(), 1, "one sweep of the person's two messages");
+    let first = sweeps[0].find("C1 | 2026-09-15 00:00 | ");
+    let second = sweeps[0].find("C2 | 2026-09-15 01:00 | ");
+    assert!(
+        first.is_some()
+            && second.is_some()
+            && first < second
+            && sweeps[0].contains("ログインはメールとパスワードで")
+            && sweeps[0].contains("パスワード管理したくないから"),
+        "both messages, oldest first: {}",
+        sweeps[0]
+    );
+    let answers: Vec<&String> = requests
+        .iter()
+        .map(|(_, body)| body)
+        .filter(|body| !body.contains(SWEEP) && !body.contains(SCREEN))
+        .collect();
+    assert_eq!(answers.len(), 2, "the draft and the answer");
+    for body in &answers {
+        assert!(
+            body.contains(
+                "Every message the person wrote in the scope of this question (2 messages, "
+            ),
+            "the answer model is told what was screened: {body}"
+        );
+        assert!(
+            body.contains("メールにリンク送る方式にしよ"),
+            "the message the string did not find reaches it: {body}"
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(r#"{"disposition":"answered","mode":"ask","api":"compatible","#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""quote":"メールにリンク送る方式にしよ","quote_verified":true,"relevance":"","author":"person""#),
+        "the quote is checked against the record the sweep found: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""sweep":{"in_scope":2,"screened":2,"relevant":2,"threes":1,"twos":1,"#),
+        "the sweep's counts: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""coverage":{"sessions_in_scope":1,"sessions_with_evidence":1,"sessions_unread":0,"unread_swept":true,"unread":[]}"#),
+        "the coverage: {stdout}"
+    );
 }
 
 #[test]

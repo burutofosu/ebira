@@ -407,6 +407,28 @@ record it came from. When the screen judges no record found relevant, the answer
 reads the closest instead, and is told so. The corpus lock is held for each read,
 not while a model is answering, so a sync can run between.
 
+The person's messages are the one part of a history small enough to read whole:
+a few thousand in a corpus of a million records. So `ask` sweeps them: one pass
+of `said` without a query gives every message the person wrote in the scope
+(`records::Corpus::person_all`; a `--cwd` bound takes every message of the
+sessions that have a message in that directory, since an app moves a session
+between folders), and the cheap model screens the newest `--sweep-limit` of them
+against the question in chunks of forty, in the order written, with the same
+scores as the search's screen. The relevant ones join the pool as the search's
+hits do; those beyond what the answer reads with their context go to it as a
+digest, one line each, at most 300 (the earliest and the latest halves when there
+are more), as evidence of their own so that a quote from them is checked and
+cited like any other. After a sweep, the check for later changes screens every
+later message of the person's (the earliest and the latest 200 when there are
+more) instead of searching for strings. The same pass gives the plan model a
+sample of how the person writes, spread over the scope, before it chooses the
+strings; when no record holds any string, the plan model is asked once more with
+the strings that failed. The result reports what was screened and what was not
+read: the sweep's counts, the sessions in the scope that contributed no record,
+and, for a string held by more records than were taken, the time of the oldest
+taken. `--no-sweep` leaves the person's side to the strings alone, as before.
+`--export` writes the records read and the sweep's relevant messages to a file.
+
 Ebira keeps no summary of the records. The corpus holds the records' own fields
 and where each record is in its log, and an index would hold where text occurs,
 never what it means. Every answer is derived from the records again, and no

@@ -137,6 +137,14 @@ FILLER_PROJECTS = {
                 ["scraper/main.py", "scraper/parse.py", "scraper/store.py", "scraper/cli.py"],
                 ("ruff check scraper", "scraper/parse.py:31:5: E722 Do not use bare `except`\nFound 1 error."),
                 ("ruff format scraper", "2 files reformatted, 4 files left unchanged")),
+    "kakeibo-app": ("/work/kakeibo-app", "ja", "claude",
+                    ["src/summary.ts", "src/components/SpendChart.tsx", "src/export/csv.ts", "src/app.ts"],
+                    ("npx eslint src", "✖ 1 problem (1 error, 0 warnings)\n  src/app.ts  9:3  error  'startup' is defined but never used"),
+                    ("npx prettier --write src", "src/summary.ts 28ms")),
+    "meibo-tool": ("/work/meibo-tool", "ja", "codex",
+                   ["meibo/list.py", "meibo/dedupe.py", "meibo/export.py", "meibo/search.py"],
+                   ("ruff check meibo", "meibo/list.py:14:1: E302 expected 2 blank lines\nFound 1 error."),
+                   ("ruff format meibo", "1 file reformatted, 5 files left unchanged")),
 }
 
 FILLER_TASKS = {
@@ -425,12 +433,13 @@ def build(out, ebira):
     return keys
 
 
-def ask(ebira, corpus, case, quick):
+def ask(ebira, corpus, case, quick, extra=()):
     # Asked from the project, as an agent working there asks: the person's messages rarely
     # name the project they are in.
     command = [ebira, "ask", case["question"], "--cwd", case["cwd"], "--corpus", str(corpus)]
     if quick:
         command.append("--quick")
+    command.extend(extra)
     started = time.time()
     result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
     seconds = round(time.time() - started, 1)
@@ -455,7 +464,7 @@ def cited(answer, keys, wanted):
     return sorted(found)
 
 
-def ask_all(out, ebira, cases, quick, jobs, max_usd):
+def ask_all(out, ebira, cases, quick, jobs, max_usd, extra=()):
     corpus = out / "corpus"
     keys = json.loads((out / "records.json").read_text(encoding="utf-8"))
     answers_dir = out / "answers"
@@ -468,7 +477,7 @@ def ask_all(out, ebira, cases, quick, jobs, max_usd):
         while queue or pending:
             while queue and len(pending) < jobs and (max_usd is None or spent < max_usd):
                 case = queue.pop(0)
-                pending[pool.submit(ask, ebira, corpus, case, quick)] = case
+                pending[pool.submit(ask, ebira, corpus, case, quick, extra)] = case
             if not pending:
                 break
             done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -587,6 +596,8 @@ def main():
     parser.add_argument("--out", required=True, type=Path, help="where the logs, corpus, and results go")
     parser.add_argument("--ebira", default="ebira", help="the ebira to run (default: ebira on PATH)")
     parser.add_argument("--quick", action="store_true", help="ask with --quick")
+    parser.add_argument("--ask-arg", action="append", default=[],
+                        help="another option for every ask, such as --sweep (repeat for several)")
     parser.add_argument("--cases", help="comma-separated case ids (default: all)")
     parser.add_argument("--jobs", type=int, default=3, help="questions asked at once (default 3)")
     parser.add_argument("--max-usd", type=float, help="stop starting cases once this much is spent")
@@ -602,7 +613,7 @@ def main():
     if args.build_only:
         return
     cases = load_cases(args.cases)
-    results = ask_all(out, args.ebira, cases, args.quick, args.jobs, args.max_usd)
+    results = ask_all(out, args.ebira, cases, args.quick, args.jobs, args.max_usd, args.ask_arg)
     write_reports(out, cases, results, args.quick)
 
 

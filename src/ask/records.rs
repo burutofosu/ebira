@@ -10,7 +10,7 @@ use crate::format::{self, EventHeader};
 use crate::said::{self, SaidRequest};
 use crate::search::{self, SearchRequest};
 use crate::time::{self, Range};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -63,6 +63,15 @@ pub struct Hit {
 pub struct Found {
     pub hits: Vec<Hit>,
     pub total: u64,
+}
+
+/// Every message the person wrote in a scope, the newest first, up to a limit: the candidates
+/// of a sweep, with how many there are in all and what the pass could not read.
+pub struct PersonMessages {
+    pub total: usize,
+    pub stale_sources: u64,
+    pub unscanned_bytes: u64,
+    pub hits: Vec<Hit>,
 }
 
 /// A bounded tail of a related session's own human messages, independent of search terms.
@@ -356,6 +365,73 @@ impl Corpus {
                 note: "Recent human message from a related session, included without a keyword match; check for later decisions and changes, and distinguish unrelated topics.".to_string(),
             }).collect();
         Ok(recent)
+    }
+
+    /// Every message the person wrote in the scope, newest first, at most `limit` of them: one
+    /// pass over the corpus without a search string. The directory bound takes whole
+    /// conversations: every message of a session that worked in the directory, also those
+    /// written while the session was elsewhere (an app moves a session between folders).
+    pub fn person_all(&self, filters: &Filters, limit: usize) -> io::Result<PersonMessages> {
+        let _lock = corpus::read_lock(&self.root)?;
+        let found = said::find(
+            &self.root,
+            &SaidRequest {
+                from: filters.from.clone(),
+                to: filters.to.clone(),
+                range: self.range(filters)?,
+                limit,
+                newest_first: true,
+                offset_minutes: self.offset_minutes,
+                ..SaidRequest::default()
+            },
+        )?;
+        let list = found.lists.into_iter().next().unwrap_or_default();
+        let sessions: Option<HashSet<String>> = filters.cwd.as_deref().map(|cwd| {
+            let wanted = cwd.to_ascii_lowercase();
+            list.messages
+                .iter()
+                .filter(|said| said.header.cwd.to_ascii_lowercase().contains(&wanted))
+                .map(|said| said.header.session.clone())
+                .collect()
+        });
+        let messages: Vec<said::Said> = list
+            .messages
+            .into_iter()
+            .filter(|said| {
+                sessions
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&said.header.session))
+            })
+            .collect();
+        let total = messages.len();
+        let hits = messages
+            .into_iter()
+            .take(limit)
+            .map(|said| Hit {
+                source_ref: SourceRef {
+                    source_id: said.header.source_id.clone(),
+                    byte_start: said.header.byte_start,
+                    byte_len: said.header.byte_len,
+                },
+                source_path: said.source_path,
+                line: said.header.line,
+                session: said.header.session.clone(),
+                project: text::project_from_cwd(&said.header.cwd),
+                timestamp: said.header.timestamp,
+                who: Who::Person,
+                app: said.app,
+                text: said.text,
+                images: said.images,
+                terms: Vec::new(),
+                note: String::new(),
+            })
+            .collect();
+        Ok(PersonMessages {
+            total,
+            stale_sources: found.stale_sources,
+            unscanned_bytes: found.unscanned_bytes,
+            hits,
+        })
     }
 
     /// The readable records around one: up to `before` records of its log before it and

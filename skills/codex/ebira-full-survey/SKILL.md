@@ -33,13 +33,15 @@ once with `no API key`, at no cost.
 ebira ask "<the question, in the person's words>" [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] --format text
 ```
 
-It chooses search strings, screens what it finds, reads the records around the
-best of them, checks the person's later messages for changes to each decision it
+It screens every message the person wrote in the scope with the cheap model, so
+a message in other words than any search string is found too, chooses search
+strings for the agents' records, reads the records around the best of what it
+finds, checks the person's later messages for changes to each decision it
 reports, and answers with quotes, each checked against the records and cited by
-source reference. It takes one to two minutes and, with the default models,
-costs about 35 US cents a question; `--quick` costs a tenth and makes more
-mistakes about what changed later. A quote
-marked `(not found in the records)` is not one.
+source reference. It takes one to three minutes and, with the default models,
+costs about 35 to 45 US cents a question; `--quick` costs a tenth and makes more
+mistakes about what changed later. The result says which sessions in the scope
+contributed no record. A quote marked `(not found in the records)` is not one.
 
 The answer also includes a bounded tail of recent human messages from related
 sessions, even without matching search words; its coverage is reported. A

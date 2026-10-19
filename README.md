@@ -123,20 +123,41 @@ results; `search.recent_messages` reports how many were read, the time range and
 stale sources, and `recent_sessions_omitted` names the remaining count.
 This is bounded evidence, not proof that every later decision was found.
 
+Your own messages are few next to the agents' records (a few thousand in a
+history of a million records), so `ask` does not leave them to the search
+strings: by default it screens every message you wrote in the scope, the newest
+4,000 at most, with the cheap model, in the order written, and the ones judged to
+bear on the question join the records read. Those beyond what the answer reads
+with their context are given to it in one line each (`search.sweep_digest`). The
+check for later changes then reads every later message of yours instead of
+searching for them. With `--cwd`, the scope is every message of the sessions that
+worked in that directory, also those written while a session was elsewhere.
+`search.sweep` reports how many messages were screened and judged relevant, and
+`search.coverage` which sessions in the scope the records read come from.
+`--no-sweep` turns this off, and `--sweep-limit <n>` changes the limit. The
+agents' records are still found by the search strings: when no record holds any
+of them, `ask` chooses others once, and a string held by more records than were
+taken is reported with the time before which none was read.
+
+`--export <path>` writes, as text, the records the answer read and every message
+of yours judged to bear on the question, whole, for reading elsewhere.
+
 Each search string is also searched, in the same pass, with a space and with none
 between Latin letters or digits and Japanese (`CSV 取り込み` and `CSV取り込み`):
 Japanese is written both ways, and the search matches literally. When the screen
 judges none of the records found relevant, the result says first that they do not
 settle the question, with the strings searched and how many records they found
 (`not_settled`), and the answer reads the closest of them with the records around
-them (`disposition: "nothing_relevant"`). When no record holds any search string,
-it says so (`no_records`) without calling the API again.
+them (`disposition: "nothing_relevant"`); after the sweep, those closest are your
+own messages. When no record holds any search string and none of your messages was
+judged to bear on the question, the result says so first. With `--no-sweep`, no
+record found means no further call (`no_records`).
 
 Every quote is checked against the records before it is shown, and each finding
 cites its `source_ref`. A verified quote confirms the quoted words, not the
 answer's interpretation or completeness. Check important conclusions against the
-original records. [evals](evals/README.md) holds thirty questions about made-up logs, with
-the answers known, to measure what a change to `ask` does.
+original records. [evals](evals/README.md) holds forty-two questions about made-up logs,
+with the answers known, to measure what a change to `ask` does.
 
 It needs an API key. Run `ebira ask-setup` to choose the service (Anthropic by
 default), check its key with the service's model list, which costs nothing, and
@@ -148,9 +169,9 @@ the page shows the variables to set. For the defaults, setting
 
 Answers give times in the corpus's zone. The question and the text of the records
 read, not images, go to the chosen API; nothing else leaves the computer. With the
-defaults, Claude Opus 5.5 and Claude Haiku 5.5, a question costs about $0.35 and
-takes one to two minutes. `--quick` uses the cheap model throughout for about a
-tenth of that, with more mistakes about what changed later.
+defaults, Claude Opus 5.5 and Claude Haiku 5.5, a question costs about 35 to 45 US
+cents and takes one to three minutes. `--quick` uses the cheap model throughout
+for about a tenth of that, with more mistakes about what changed later.
 
 A reply cut at `max_tokens` is retried once with twice the output allowance, up to
 64,000 tokens, using the same model and evidence. Both billed attempts are

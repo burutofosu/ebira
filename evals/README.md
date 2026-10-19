@@ -1,8 +1,8 @@
 # Evaluating `ebira ask`
 
-Thirty questions about made-up conversations, whose answers are known. They test what is
-hard about reading a person's history with coding agents, in six ways, five questions each
-(one of the five in English):
+Forty-two questions about made-up conversations, whose answers are known. They test what is
+hard about reading a person's history with coding agents: six ways with five questions each
+(one of the five in English), and four more with three each:
 
 | Type | What the answer has to do |
 | --- | --- |
@@ -12,8 +12,12 @@ hard about reading a person's history with coding agents, in six ways, five ques
 | `latest_the_same_day` | Give a decision changed later the same day, and not take the earlier message for a change of it |
 | `agent_not_person` | Say who decided, reported, or claimed something: the agent, or the person |
 | `no_record` | Say that the records do not settle the question, and not make an answer up |
+| `repeated_principle` | Give a rule the person stated several times in different words, and count or date the repetitions; an agent's restatement is not one |
+| `attempt_history` | Give each thing tried for a problem with how the person said it turned out, and the one that holds now |
+| `origin_of_rule` | Say that a rule the records carry as the person's was written by an agent or a summary, and what the person actually said |
+| `other_words` | Find the message that settles the question though it shares no noun with it |
 
-The conversations are in six projects, as Claude Code and Codex would log them, with
+The conversations are in eight projects, as Claude Code and Codex would log them, with
 compaction summaries, tool calls and their output, and a Codex message wrapped with the
 files it mentions. Generated filler sessions in the same projects, the same every time,
 settle nothing the questions ask about; they give the search something to sift through.
@@ -22,8 +26,10 @@ ask: the person's messages, as in real logs, do not name the project they are in
 
 ## What it does not test
 
-- The logs are small: 150 sessions and about 1,800 records, a little over a megabyte. Real
-  histories run to gigabytes, where choosing the search strings matters more.
+- The logs are small: about 200 sessions and 2,400 records, a little over a megabyte. Real
+  histories run to gigabytes, where choosing the search strings matters more, and the
+  person's messages in a project run to a thousand or more, where screening them all
+  matters more.
 - The person's lines were written for this, by a model. Real messages are terser and more
   ambiguous, and they run into failures nobody thought to write a case for.
 - One run per question. The search strings a model chooses vary from run to run, and so
@@ -43,12 +49,13 @@ This writes the logs and a corpus under `/tmp/ebira-eval`, asks the thirty quest
 verified quotes, and whether each answer cites the records the case names, and `judge.md`,
 the answers for a judge to score as [JUDGE.md](JUDGE.md) says. `--quick` asks with
 `--quick`, `--cases A1,D3` asks some cases, `--max-usd` stops starting cases past a sum, and
-`--build-only` writes the logs and the corpus only.
+`--build-only` writes the logs and the corpus only, and `--ask-arg=<option>` (repeatable)
+passes an option to every `ask`, such as `--ask-arg=--no-sweep`.
 
 `ebira ask` uses the API it is set up for (see `ebira help ask-setup`) and spends under that
 key. On logs this small a question costs less than on a real history: with the default
-models, about 4 US cents, so about $1.30 for the thirty; with `--quick`, under a cent. Python
-3.8 or later is needed, with the standard library only.
+models, about 5 US cents, so about $2.30 for the forty-two; with `--quick`, under a cent.
+Python 3.8 or later is needed, with the standard library only.
 
 ## Files
 

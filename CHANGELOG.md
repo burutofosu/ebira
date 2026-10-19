@@ -4,6 +4,40 @@ The notable changes in each release of Ebira. Before 1.0, a minor version may
 change what a command writes; a change to the corpus's storage format or reading
 rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
+## Unreleased
+
+Measured with the evaluation in `evals/`, now forty-two questions, and on the
+author's own history ([results](evals/results/2026-10-19-sweep.md)).
+
+### Changed
+
+- `ask` screens every message the person wrote in the scope (the newest 4,000 at
+  most) with the cheap model, not only the records that hold a search string, and
+  reads the relevant ones; those beyond what it reads with their context go to the
+  answer in one line each. The check for later changes reads every later message
+  of the person's instead of searching for them. With `--cwd`, the scope is every
+  message of the sessions that worked in that directory. On the forty-two
+  questions, `--quick` goes from 90% of the key points to 99% on the original
+  thirty, and the default models stay at 100%; a question costs about a fifth
+  more. `--no-sweep` turns it off, `--sweep-limit <n>` changes the limit.
+- The plan model sees a sample of the person's messages in the scope, spread over
+  it, before choosing the search strings; when no record holds any string, it is
+  asked once more.
+- The result says what was not read: `search.sweep` (messages screened and judged
+  relevant), `search.sweep_digest`, `search.coverage` (the sessions in the scope
+  the records read come from, and those not read), and for each search string held
+  by more records than were taken, `oldest_taken`, the time before which none was
+  read. The reversal checks report `swept` and `later_messages`.
+
+### Added
+
+- `ask --export <path>` writes, as text, the records the answer read and every
+  message of the person's judged to bear on the question.
+- Twelve evaluation cases of four new kinds: a rule the person repeated in
+  different words, a problem tried several ways, a rule an agent or a summary
+  wrote as the person's, and an answer in words the question does not use.
+  `evals/run.py --ask-arg` passes an option to every `ask`.
+
 ## 0.3.1 - 2026-10-19
 
 ### Fixed

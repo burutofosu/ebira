@@ -46,6 +46,15 @@ const ASK_DETAILS: &[&str] = &[
     "                               strong model chooses them)",
     "  --no-api                     search only, and list the records the answer would read",
     "                               (needs --term; nothing is sent or spent)",
+    "  --no-sweep                   do not screen every message you wrote in the scope: by default",
+    "                               every one of them (the newest 4000 at most; --sweep-limit <n>",
+    "                               changes that) is screened for bearing on the question, beyond",
+    "                               those that hold a search string, and the check for later",
+    "                               changes reads every later message of yours; the agents' records",
+    "                               are found by the strings either way",
+    "  --export <path>              also write, as text, the records the answer read and (with",
+    "                               --sweep) every message of yours judged to bear on the question,",
+    "                               whole, for reading elsewhere",
     "  --format json|text           the result as one JSON object (default) or as text",
     "",
     "Service and models (saved by `ebira ask-setup`; a flag or an environment variable wins):",
@@ -369,7 +378,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "ask",
-        synopsis: "<question> [--quick] [--api <name>] [--cwd <text>] [--from <time>] [--to <time>] [--term <text>]... [--no-api] [--format json|text]",
+        synopsis: "<question> [--quick] [--no-sweep] [--api <name>] [--cwd <text>] [--from <time>] [--to <time>] [--term <text>]... [--no-api] [--format json|text]",
         summary: "Answer a question about past work from the records, with quotes (through a model's API)",
         details: ASK_DETAILS,
         values: &[
@@ -388,6 +397,8 @@ const COMMANDS: &[CommandSpec] = &[
             "--person-per-term",
             "--agent-per-term",
             "--candidates",
+            "--sweep-limit",
+            "--export",
             "--api",
             "--api-url",
             "--api-key-env",
@@ -395,7 +406,7 @@ const COMMANDS: &[CommandSpec] = &[
             "--cheap-model",
         ],
         positional: Some("<question>"),
-        flags: &["--quick", "--no-api"],
+        flags: &["--quick", "--no-api", "--no-sweep"],
     },
     CommandSpec {
         name: "ask-setup",
@@ -739,6 +750,13 @@ fn ask_options(args: &[String], question: String) -> io::Result<ask::Options> {
     options.agent_per_term =
         bounded_number(args, "--agent-per-term", options.agent_per_term, 0, 400)?;
     options.candidates = bounded_number(args, "--candidates", options.candidates, 1, 2000)?;
+    // The sweep screens with the API: without it, only the strings are searched.
+    options.sweep = !has_flag(args, "--no-sweep") && !options.no_api;
+    options.sweep_limit = bounded_number(args, "--sweep-limit", options.sweep_limit, 1, 100_000)?;
+    options.export = option_values(args, "--export")
+        .into_iter()
+        .next()
+        .map(std::path::PathBuf::from);
     if options.no_api && options.terms.iter().all(|term| term.trim().is_empty()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

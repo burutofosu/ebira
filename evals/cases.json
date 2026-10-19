@@ -5,7 +5,11 @@
     "reversed_in_other_words": "A decision was reversed later in words that do not repeat it. The answer has to give the later state.",
     "latest_the_same_day": "A decision changed later the same day, in the same session or in another one. The answer has to give the later one, and not take the earlier message for a change of it.",
     "agent_not_person": "The agent decided, reported, or claimed something the person did not decide or confirm. The answer has to say who said it.",
-    "no_record": "The records do not settle the question. The answer has to say so, and not make an answer up."
+    "no_record": "The records do not settle the question. The answer has to say so, and not make an answer up.",
+    "repeated_principle": "The person stated the same rule several times, in different words, across sessions. The answer has to give the rule, say that it was repeated, and count or date the repetitions; a restatement by the agent is not one of them.",
+    "attempt_history": "Several things were tried for one problem, and the person said how each turned out. The answer has to give each attempt with its outcome and name the one that holds now, not a rejected one.",
+    "origin_of_rule": "A rule that the records carry as the person's was written by an agent or a compaction summary; the person only remarked on the matter, left it open, or said the opposite. The answer has to say who wrote the rule and what the person actually said.",
+    "other_words": "The person's message that settles the question shares no noun with the question: the person wrote casually, and the question uses the ordinary name. The answer has to find it anyway."
   },
   "cases": [
     {
@@ -449,6 +453,183 @@
         "States a price or a pricing decision"
       ],
       "cite": []
+    },
+    {
+      "id": "G1",
+      "cwd": "kakeibo-app",
+      "type": "repeated_principle",
+      "question": "kakeibo-app の作業で私が何度も言っている方針は何？",
+      "key_points": [
+        "症状だけを見た局所的な修正（パッチで誤魔化す）をやめ、原因や構造から直すこと",
+        "少なくとも 3 回、9/2・9/9・9/16 に別々の言い方で繰り返している",
+        "9/23 にエージェントが「局所修正は禁止」と言い直し、本人が「そうそう」と同意した"
+      ],
+      "errors": [
+        "一度しか言っていないことにする",
+        "方針をエージェントが決めたものとする"
+      ],
+      "cite": ["g1_a", "g1_b", "g1_c"]
+    },
+    {
+      "id": "G2",
+      "cwd": "kakeibo-app",
+      "type": "repeated_principle",
+      "question": "kakeibo-app の依存ライブラリについて私はどう言ってきた？",
+      "key_points": [
+        "ライブラリを足す前に相談（確認）するよう求めている",
+        "9/4・9/11・9/18 の 3 回、別の言い方で繰り返した（勝手に増やさないで、依存が増えるのは嫌）"
+      ],
+      "errors": [
+        "自由に追加していいと言ったことにする"
+      ],
+      "cite": ["g2_a", "g2_b", "g2_c"]
+    },
+    {
+      "id": "G3",
+      "cwd": "meibo-tool",
+      "type": "repeated_principle",
+      "question": "meibo-tool で返答の言語について私は何と言ってきた？",
+      "key_points": [
+        "日本語で答えるよう求めている",
+        "9/3・9/10・9/20 の 3 回繰り返し、9/20 には「毎回言わせないで」と不満を示した"
+      ],
+      "errors": [
+        "英語でよいと言ったことにする"
+      ],
+      "cite": ["g3_a", "g3_b", "g3_c"]
+    },
+    {
+      "id": "H1",
+      "cwd": "kakeibo-app",
+      "type": "attempt_history",
+      "question": "kakeibo-app の CSV の文字化けで何を試して、どうなった？",
+      "key_points": [
+        "UTF-8 の BOM を付けるだけでは直らなかった（9/5、本人「まだ化けてる」）",
+        "Shift_JIS 変換は文字は出たが金額の桁区切りが壊れ、本人が却下した（9/6）",
+        "UTF-8 BOM 付き・CRLF・数値をクォートで直り、採用された（9/10、本人「直った！これでいこう」）"
+      ],
+      "errors": [
+        "Shift_JIS が今の方式だとする",
+        "最初の BOM で直ったことにする"
+      ],
+      "cite": ["h1_out2", "h1_out3"]
+    },
+    {
+      "id": "H2",
+      "cwd": "kakeibo-app",
+      "type": "attempt_history",
+      "question": "kakeibo-app の起動が遅い問題はどう直った？",
+      "key_points": [
+        "集計の遅延ロードは効かなかった（9/12、本人「変わらない」）",
+        "直近 3 か月だけ読む案は速くなったが過去の月が開けず、本人が却下した（9/13）",
+        "全件を背景で読み、画面は今月分から出す形で解決し、本人が受け入れた（9/14）"
+      ],
+      "errors": [
+        "直近 3 か月だけ読むのが今の状態だとする"
+      ],
+      "cite": ["h2_out2", "h2_out3"]
+    },
+    {
+      "id": "H3",
+      "cwd": "meibo-tool",
+      "type": "attempt_history",
+      "question": "meibo-tool の重複登録はどう直した？",
+      "key_points": [
+        "名前の完全一致だけでは旧字体の登録が漏れた（9/6）",
+        "名前を正規化して比べると同姓同名の別人を弾いてしまい、却下された（9/7）",
+        "名前とメールアドレスの組で判定する形で確定した（9/8、本人「それでいこう」）"
+      ],
+      "errors": [
+        "名前の正規化が今の方式だとする"
+      ],
+      "cite": ["h3_out2", "h3_out3"]
+    },
+    {
+      "id": "I1",
+      "cwd": "kakeibo-app",
+      "type": "origin_of_rule",
+      "question": "kakeibo-app のグラフに赤を使わないというルールは誰が決めた？",
+      "key_points": [
+        "本人はそのルールを決めていない。「赤が目立つね」と感想を言っただけ（9/7）",
+        "ルールは圧縮の要約（エージェント側）が「ユーザー指示」として書いたもの",
+        "その後エージェントがルールどおりと言って赤を外した"
+      ],
+      "errors": [
+        "本人の指示だとする"
+      ],
+      "cite": ["i1_remark", "i1_summary"]
+    },
+    {
+      "id": "I2",
+      "cwd": "kakeibo-app",
+      "type": "origin_of_rule",
+      "question": "kakeibo-app でテストを書かないという方針は私が決めた？",
+      "key_points": [
+        "本人は決めていない。エージェントが 9/19 に方針として書いた",
+        "本人は「今回はいいけど、テストはそのうち入れたい」と留保した",
+        "9/24 の要約がそれを本人の決定として書いた"
+      ],
+      "errors": [
+        "本人の決定だとする"
+      ],
+      "cite": ["i2_person", "i2_agent"]
+    },
+    {
+      "id": "I3",
+      "cwd": "meibo-tool",
+      "type": "origin_of_rule",
+      "question": "meibo-tool の CSV の列順を変えないというルールは私の指示？",
+      "key_points": [
+        "本人の指示ではない。エージェントが 9/15 に方針として書いた",
+        "本人は「列順は好きにしていいよ、使ってるの私だけだし」と言った",
+        "9/21 の要約がそれを本人の要件として書いた"
+      ],
+      "errors": [
+        "本人の指示だとする"
+      ],
+      "cite": ["i3_person", "i3_agent"]
+    },
+    {
+      "id": "J1",
+      "cwd": "kakeibo-app",
+      "type": "other_words",
+      "question": "kakeibo-app の起動音について何を決めた？",
+      "key_points": [
+        "本人が 9/12 に要らないから消すよう求め、起動時の効果音は無効にされた"
+      ],
+      "errors": [
+        "残すことにしたとする",
+        "記録がないとする"
+      ],
+      "cite": ["j1_remove"]
+    },
+    {
+      "id": "J2",
+      "cwd": "kakeibo-app",
+      "type": "other_words",
+      "question": "kakeibo-app の予算の警告はいつ出す設定にした？",
+      "key_points": [
+        "予算の 8 割（80%）を超えたとき（9/17、本人の指示）"
+      ],
+      "errors": [
+        "別の閾値を答える",
+        "記録がないとする"
+      ],
+      "cite": ["j2_set"]
+    },
+    {
+      "id": "J3",
+      "cwd": "meibo-tool",
+      "type": "other_words",
+      "question": "meibo-tool のエクスポートのファイル名はどう決めた？",
+      "key_points": [
+        "いつのものか分かるよう日付を入れる（9/9、本人の求め）"
+      ],
+      "errors": [
+        "ファイル名は固定だとする",
+        "記録がないとする"
+      ],
+      "cite": ["j3_name"]
     }
   ]
 }

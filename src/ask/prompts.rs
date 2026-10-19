@@ -43,6 +43,18 @@ Score every candidate by meaning, not by shared words:
 
 Return one score for every id you were given.";
 
+/// Scores every message the person wrote in the scope, not search hits: a message can bear on
+/// the question without sharing a word with it.
+pub const SWEEP_SYSTEM: &str = "You screen a person's own messages to their coding agents (Claude Code and Codex) for bearing on a question about their past work. The candidates are every message the person wrote in the scope asked about, in the order written, not search hits: most are about other things, and a message can bear on the question without sharing a word with it (a decision in other words, a later change of mind, an example given to convey a feeling, a complaint about the thing, praise of it, a report that it is broken). Each candidate line gives an id, the time, the project, and the message; a long one is cut in the middle.
+
+Score every candidate by meaning, not by shared words:
+3 = central: a decision, a reversal, a rule, praise, a report of the problem, the cause found, or what was tried, about the matter asked
+2 = about the same matter and useful as background, or a change that may touch it
+1 = shares words with the question but is about something else
+0 = unrelated
+
+Return one score for every id you were given.";
+
 /// Reads the records and answers with citations.
 pub const ANSWER_SYSTEM: &str = "\
 You answer a question about a person's own history with coding agents (Claude Code and Codex), using only the records \
@@ -112,6 +124,15 @@ pub const REVERSAL_SCREEN_SYSTEM: &str = "\
 A person stated something at a time (the item). Below are messages the person wrote at or after that time \
 that mention the same subject. For every message, judge by meaning whether it changes the item:
 3 = cancels, reverses, contradicts or replaces it (\"I never said that\", \"from now on\", a new rule that makes it void)
+2 = narrows or widens it, adds or removes a condition, or says it no longer holds in some case
+1 = mentions the same subject without changing it (repeats it, applies it, or talks about something near it)
+0 = about something else
+A message can change the item without repeating its words or its topic. Return one score for every id.";
+
+/// Judges whether a later message changes an earlier decision, when every later message of the
+/// person's is given, not only those that share words with the decision.
+pub const REVERSAL_SWEEP_SYSTEM: &str = "A person stated something at a time (the item). Below are the messages the person wrote at or after that time, in the order written; most are about other things. For every message, judge by meaning whether it changes the item:
+3 = cancels, reverses, contradicts or replaces it (\"I never said that\", \"from now on\", a new rule that makes it void, a move to an alternative that leaves it behind)
 2 = narrows or widens it, adds or removes a condition, or says it no longer holds in some case
 1 = mentions the same subject without changing it (repeats it, applies it, or talks about something near it)
 0 = about something else
