@@ -4,7 +4,7 @@ The notable changes in each release of Ebira. Before 1.0, a minor version may
 change what a command writes; a change to the corpus's storage format or reading
 rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
-## Unreleased
+## 0.4.0 - 2026-10-20
 
 Measured with the evaluation in `evals/`, now forty-two questions, and on the
 author's own history ([results](evals/results/2026-10-19-sweep.md)).
