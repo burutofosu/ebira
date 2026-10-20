@@ -1,10 +1,11 @@
 # Changelog
 
-The notable changes in each release of Ebira. Before 1.0, a minor version may
-change what a command writes; a change to the corpus's storage format or reading
-rules makes the next `ebira sync` rebuild the corpus from the original logs.
+The notable changes in each release of Ebira. Before 1.0, any release may change
+what a command writes: a release moves the last number, and the middle one only
+for a large change (from 0.5.1 on). A change to the corpus's storage format or
+reading rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
-## Unreleased
+## 0.5.1 - 2026-10-20
 
 Measured on the evaluation in `evals/` and on the author's own history
 ([results](evals/results/2026-10-20-delivery.md)).
