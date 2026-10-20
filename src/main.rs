@@ -17,6 +17,7 @@ mod said;
 mod search;
 mod sessions;
 mod time;
+mod turns;
 mod zstd;
 
 use search::SearchRequest;
@@ -81,6 +82,15 @@ const ASK_DETAILS: &[&str] = &[
     "  --person-per-term <n>        the person's messages per search string (default 60)",
     "  --agent-per-term <n>         the agents' replies per search string (default 40; 0 for none)",
     "  --candidates <n>             records screened per round (default 600)",
+    "",
+    "Ways under trial, for measuring (they may change or go):",
+    "  --sweep-context              show the sweep each message with the agent's words around it",
+    "  --sweep-chunks               screen a long message in overlapping pieces, not its ends",
+    "  --turn-replies               screen the agent's replies in the turns of relevant messages",
+    "  --delivery current|spread    how the records found reach the answer (default current)",
+    "  --agent-select newest|idf|all which of the agents' records holding a string are screened",
+    "                               (default newest)",
+    "  --evidence-only              stop before the answer and write, as JSON, what it would read",
     "",
     "Also reads up to 8 recent human messages from each of the 4 newest related sessions,",
     "within the date/directory bounds. The result reports the coverage and any unread tail.",
@@ -232,7 +242,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "said",
-        synopsis: "[--session <id>] [--source-id <id>] [--cwd <text>] [--app claude|codex|other] [--query <text>]... [--ignore-case] [--from <time>] [--to <time>] [--order desc|asc] [--limit <n>] [--offset <n>] [--max-chars <n>] [--format json|text] [--include-imported]",
+        synopsis: "[--session <id>] [--source-id <id>] [--cwd <text>] [--app claude|codex|other] [--query <text>]... [--ignore-case] [--from <time>] [--to <time>] [--order desc|asc] [--limit <n>] [--offset <n>] [--max-chars <n>] [--format json|text] [--include-imported] [--context]",
         summary: "List the person's own messages, newest first",
         details: &[
             "  --query <text>               messages that hold the text; repeat it to look for",
@@ -241,6 +251,10 @@ const COMMANDS: &[CommandSpec] = &[
             "  --limit <n>, --max-chars <n> messages and characters per page (default 30 and 15000)",
             "  --include-imported           also list copies of the person's messages imported",
             "                               with another conversation",
+            "  --context                    show each message with the end of the agent's reply",
+            "                               before it and the agent's last reply in its turn, so",
+            "                               that a short reply (\"go with that\") says what it",
+            "                               answers; they count toward --max-chars",
         ],
         values: &[
             "--corpus",
@@ -258,7 +272,7 @@ const COMMANDS: &[CommandSpec] = &[
             "--format",
         ],
         positional: None,
-        flags: &["--ignore-case", "--include-imported"],
+        flags: &["--ignore-case", "--include-imported", "--context"],
     },
     CommandSpec {
         name: "resume",
@@ -398,6 +412,8 @@ const COMMANDS: &[CommandSpec] = &[
             "--agent-per-term",
             "--candidates",
             "--sweep-limit",
+            "--delivery",
+            "--agent-select",
             "--export",
             "--api",
             "--api-url",
@@ -406,7 +422,15 @@ const COMMANDS: &[CommandSpec] = &[
             "--cheap-model",
         ],
         positional: Some("<question>"),
-        flags: &["--quick", "--no-api", "--no-sweep"],
+        flags: &[
+            "--quick",
+            "--no-api",
+            "--no-sweep",
+            "--sweep-context",
+            "--sweep-chunks",
+            "--turn-replies",
+            "--evidence-only",
+        ],
     },
     CommandSpec {
         name: "ask-setup",
@@ -753,6 +777,26 @@ fn ask_options(args: &[String], question: String) -> io::Result<ask::Options> {
     // The sweep screens with the API: without it, only the strings are searched.
     options.sweep = !has_flag(args, "--no-sweep") && !options.no_api;
     options.sweep_limit = bounded_number(args, "--sweep-limit", options.sweep_limit, 1, 100_000)?;
+    options.sweep_context = has_flag(args, "--sweep-context");
+    options.sweep_chunks = has_flag(args, "--sweep-chunks");
+    options.turn_replies = has_flag(args, "--turn-replies");
+    options.evidence_only = has_flag(args, "--evidence-only");
+    if let Some(value) = option_values(args, "--delivery").into_iter().next() {
+        check_name("--delivery", &value, &["current", "spread"])?;
+        options.delivery = if value == "spread" {
+            ask::Delivery::Spread
+        } else {
+            ask::Delivery::Current
+        };
+    }
+    if let Some(value) = option_values(args, "--agent-select").into_iter().next() {
+        check_name("--agent-select", &value, &["newest", "idf", "all"])?;
+        options.agent_select = match value.as_str() {
+            "idf" => ask::AgentSelect::Idf,
+            "all" => ask::AgentSelect::All,
+            _ => ask::AgentSelect::Newest,
+        };
+    }
     options.export = option_values(args, "--export")
         .into_iter()
         .next()
@@ -1033,6 +1077,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 },
                 offset_minutes,
                 include_imported: has_flag(args, "--include-imported"),
+                context: has_flag(args, "--context"),
             };
             if let Some(app) = request.app.as_deref() {
                 if !matches!(app, "claude" | "codex" | "other") {

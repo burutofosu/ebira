@@ -53,7 +53,9 @@ PowerShell).
    ```
 
    Each message is headed by its `source-id` and byte range. Continue with
-   `--offset <n>` while the output ends with `# more`.
+   `--offset <n>` while the output ends with `# more`. Add `--context` to see
+   under each message the end of the agent's reply it answered and the agent's
+   last reply after it: a short reply ("go with that") says nothing on its own.
 
 4. Before acting on an earlier decision, read its original record:
 

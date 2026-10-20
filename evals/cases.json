@@ -9,7 +9,11 @@
     "repeated_principle": "The person stated the same rule several times, in different words, across sessions. The answer has to give the rule, say that it was repeated, and count or date the repetitions; a restatement by the agent is not one of them.",
     "attempt_history": "Several things were tried for one problem, and the person said how each turned out. The answer has to give each attempt with its outcome and name the one that holds now, not a rejected one.",
     "origin_of_rule": "A rule that the records carry as the person's was written by an agent or a compaction summary; the person only remarked on the matter, left it open, or said the opposite. The answer has to say who wrote the rule and what the person actually said.",
-    "other_words": "The person's message that settles the question shares no noun with the question: the person wrote casually, and the question uses the ordinary name. The answer has to find it anyway."
+    "other_words": "The person's message that settles the question shares no noun with the question: the person wrote casually, and the question uses the ordinary name. The answer has to find it anyway.",
+    "short_reply": "The person settled it with a short agreement (\"go with that\") to an agent's proposal; the reply means nothing without the agent's words around it. The answer has to find the agreement and say what was agreed to.",
+    "long_message": "What settles the question is in the middle of a long message the person pasted. The answer has to read it there.",
+    "span_of_repeats": "A rule was repeated many times over months among hundreds of other remarks of the person's. The answer has to give the first and the last time it was said.",
+    "agent_found_cause": "An agent found the cause of a problem months ago, and many newer agent records hold the same words. The answer has to find that record, and say that the person confirmed the fix."
   },
   "cases": [
     {
@@ -630,6 +634,193 @@
         "記録がないとする"
       ],
       "cite": ["j3_name"]
+    },
+    {
+      "id": "K1",
+      "cwd": "tabi-app",
+      "type": "short_reply",
+      "question": "tabi-app の地図ライブラリは何に決めた？",
+      "key_points": [
+        "Leaflet に決めた（7/8）",
+        "エージェントが Leaflet を勧め、本人は「それでいこう」と同意しただけ（ライブラリ名を本人が書いたのではない）"
+      ],
+      "errors": [
+        "Mapbox または Google Maps に決めたと答える",
+        "決まっていない、記録がないと答える"
+      ],
+      "cite": ["k1_ok", "k1_offer"]
+    },
+    {
+      "id": "K2",
+      "cwd": "tabi-app",
+      "type": "short_reply",
+      "question": "tabi-app を開いたとき、最初に何を表示することにした？",
+      "key_points": [
+        "前回開いていた旅程をそのまま開く（7/22）",
+        "エージェントの提案に本人が「いいね、そっちで」と同意して決まった"
+      ],
+      "errors": [
+        "毎回ホーム画面（旅程一覧）を出すと答える",
+        "決まっていないと答える"
+      ],
+      "cite": ["k2_ok", "k2_offer"]
+    },
+    {
+      "id": "K3",
+      "cwd": "tabi-app",
+      "type": "short_reply",
+      "question": "tabi-app で旅の写真の保存先はどうなった？",
+      "key_points": [
+        "写真は端末の中だけに保存し、クラウド（サーバー）には上げない（8/5）",
+        "エージェントの提案に本人が「OK それ採用」と同意して決まった"
+      ],
+      "errors": [
+        "クラウドやサーバーに保存すると答える",
+        "決まっていないと答える"
+      ],
+      "cite": ["k3_ok", "k3_offer"]
+    },
+    {
+      "id": "K4",
+      "cwd": "tabi-app",
+      "type": "short_reply",
+      "question": "tabi-app で予定の時刻はどの時間帯で表示することにした？",
+      "key_points": [
+        "旅行先の時間帯で表示する（9/10）",
+        "エージェントの提案に本人が「そうしよう」と同意して決まった（本人は時間帯という言葉を書いていない）"
+      ],
+      "errors": [
+        "端末の時間帯で表示すると答える",
+        "決まっていない、記録がないと答える"
+      ],
+      "cite": ["k4_ok", "k4_offer"]
+    },
+    {
+      "id": "K5",
+      "cwd": "tabi-app",
+      "type": "short_reply",
+      "question": "tabi-app の書き出しは何から作ることにした？",
+      "key_points": [
+        "PDF から作る（CSV はその次）（9/18）",
+        "エージェントの提案に本人が「任せる、それで」と同意して決まった"
+      ],
+      "errors": [
+        "CSV から作ると答える",
+        "決まっていない、記録がないと答える"
+      ],
+      "cite": ["k5_ok", "k5_offer"]
+    },
+    {
+      "id": "K6",
+      "cwd": "tabi-app",
+      "type": "short_reply",
+      "question": "tabi-app で旅程を削除したときはどうなる仕様にした？",
+      "key_points": [
+        "すぐには消さず、ゴミ箱に14日間残して、その間は戻せる（9/25）",
+        "エージェントの提案に本人が「うん、その方向で」と同意して決まった"
+      ],
+      "errors": [
+        "すぐに完全に消えると答える",
+        "退会時の30日と取り違える",
+        "決まっていない、記録がないと答える"
+      ],
+      "cite": ["k6_ok", "k6_offer"]
+    },
+    {
+      "id": "L1",
+      "cwd": "tabi-app",
+      "type": "long_message",
+      "question": "tabi-app で通信できないときの動きはどう決めた？",
+      "key_points": [
+        "直近7日分の旅程だけ見られる（8/20 の仕様メモ）",
+        "編集は通信が戻って同期が終わってから（通信できない間は編集できない）"
+      ],
+      "errors": [
+        "全部の旅程が見られると答える",
+        "通信できなくても編集できると答える",
+        "決まっていないと答える"
+      ],
+      "cite": ["l_spec"],
+      "key_text": ["直近7日"]
+    },
+    {
+      "id": "L2",
+      "cwd": "tabi-app",
+      "type": "long_message",
+      "question": "tabi-app の通知はいつ出すことにした？",
+      "key_points": [
+        "朝8時（8/20 の仕様メモ）",
+        "出発3時間前",
+        "それ以外の通知は出さない"
+      ],
+      "errors": [
+        "ほかのタイミング（前日の夜など）を挙げる",
+        "決まっていないと答える"
+      ],
+      "cite": ["l_spec"],
+      "key_text": ["出発3時間前"]
+    },
+    {
+      "id": "M1",
+      "cwd": "atelier",
+      "type": "repeated_principle",
+      "question": "atelier のデザインで、私が繰り返し言ってきた方針は？",
+      "key_points": [
+        "色は3色まで（ベース・文字・アクセント）。言い方を変えて何度も言っている（9回、6/11〜9/16）",
+        "フォントは1種類（Noto Sans JP、差はウェイトでつける）。何度も言っている（8回、6/1〜9/13）",
+        "余白は詰めない。何度も言っている（7回、6/1〜9/25）"
+      ],
+      "errors": [
+        "見出しを紺に、カードの余白を 24px に、などその場限りの指示を方針として挙げる",
+        "エージェントの「直しました」を本人の発言として数える"
+      ],
+      "cite": ["ma1", "ma2", "ma3", "ma4", "ma5", "ma6", "ma7", "ma8", "ma9", "mb1", "mb2", "mb3", "mb4", "mb5", "mb6", "mb7", "mb8", "mc1", "mc2", "mc3", "mc4", "mc5", "mc6", "mc7"]
+    },
+    {
+      "id": "M2",
+      "cwd": "atelier",
+      "type": "span_of_repeats",
+      "question": "atelier で「余白は詰めない」という話を最初にしたのはいつで、最後にしたのはいつ？",
+      "key_points": [
+        "最初は 6/1（「余白は詰めないで」）",
+        "最後は 9/25（「余白はケチらない方針で」）",
+        "その間にも言い方を変えて何度も言っている（全部で7回）"
+      ],
+      "errors": [
+        "カードの内側の余白を 24px に、などの個別の指示を方針の発言として数える",
+        "最初か最後の日付を取り違える"
+      ],
+      "cite": ["mc1", "mc2", "mc3", "mc4", "mc5", "mc6", "mc7"]
+    },
+    {
+      "id": "N1",
+      "cwd": "sensor-hub",
+      "type": "agent_found_cause",
+      "question": "sensor-hub でセンサーの値が途中で来なくなった件、原因は何だった？",
+      "key_points": [
+        "クライアントの MQTT keepalive（60秒）がブローカー側の max_keepalive（30秒）より長く、ブローカーが接続を切っていた（8/4、エージェントの調査）",
+        "keepalive を 20 秒にして、本人が「直った」と確認した"
+      ],
+      "errors": [
+        "再接続間隔、QoS、トピック名など別の変更を原因とする",
+        "原因はわからないと答える"
+      ],
+      "cite": ["n1_cause", "n1_report", "n1_fixed"]
+    },
+    {
+      "id": "N2",
+      "cwd": "sensor-hub",
+      "type": "agent_found_cause",
+      "question": "sensor-hub の起動が遅かったのはなぜで、どう直した？",
+      "key_points": [
+        "起動時に校正データ（calibration.json、約40MB）を毎回全部読み込んでいた（7/15、エージェントの調査）",
+        "初回だけ読み込んでキャッシュするようにし、本人が「速くなった」と確認した"
+      ],
+      "errors": [
+        "--verbose の追加や Docker 化など別の変更を原因や対処とする",
+        "原因はわからないと答える"
+      ],
+      "cite": ["n2_cause", "n2_report", "n2_fixed"]
     }
   ]
 }

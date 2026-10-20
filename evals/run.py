@@ -14,6 +14,12 @@ search something to sift through.
         writes the logs and the corpus only
     python3 evals/run.py --out DIR --score
         reads DIR/judgments.json and writes score.md
+    python3 evals/run.py --out DIR --evidence [--terms-from EARLIER_DIR] [--ask-arg ...]
+        stops each ask before its answer (--evidence-only) and writes funnel.md: how far each
+        record a case should cite got (read with its context, in the digest, judged relevant,
+        screened and judged not, found and not screened, missed), and whether the words that
+        settle a case reached the reader; with --terms-from, each case searches the strings
+        (and the period) the earlier run searched, so that runs differ only in their options
 
 Only the standard library is used. `ebira ask` uses the API it is set up for and spends
 under that key: about 30 US cents a case with the default models, a tenth with --quick.
@@ -240,6 +246,15 @@ def filler_sessions(seed=20261018, per_project=16):
     return sessions
 
 
+def stress_sessions():
+    """The sessions of evals/stress.py: logs that each strain one step of ask."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("stress", HERE / "stress.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.sessions()
+
+
 # ---------------------------------------------------------------------------------------
 # The logs, as Claude Code and Codex write them
 
@@ -414,6 +429,7 @@ def run(command, env=None):
 def build(out, ebira):
     sessions = parse_scenarios(HERE / "scenarios")
     sessions += filler_sessions()
+    sessions += stress_sessions()
     home = out / "home"
     keys = write_logs(sessions, home)
     for case in load_cases(None):
@@ -451,6 +467,91 @@ def ask(ebira, corpus, case, quick, extra=()):
             "answer": answer, "stderr": result.stderr[-4000:]}
 
 
+def fixed_terms(directory, case):
+    """The strings and the period an earlier run searched for this case, as options."""
+    path = directory / "answers" / f"{case['id']}.json"
+    if not path.exists():
+        return []
+    result = json.loads(path.read_text(encoding="utf-8"))
+    answer = result.get("answer") or {}
+    search = answer.get("search") or {}
+    # Only the first round's: each run's own draft chooses the strings of its second round.
+    first = first_round(result.get("stderr") or "")
+    args = []
+    for term in (search.get("terms") or [])[:first or None]:
+        args += ["--term", term["text"]]
+    period = search.get("period_inferred") or {}
+    for name in ("from", "to"):
+        if period.get(name):
+            args += [f"--{name}", period[name]]
+    return args
+
+
+def first_round(progress):
+    """How many strings were searched before the draft, from ask's progress lines."""
+    count = 0
+    for line in progress.splitlines():
+        if "answering from" in line:
+            break
+        match = re.search(r"searching for (\d+) string", line)
+        if match:
+            count += int(match.group(1))
+    return count
+
+
+STAGES = ["read", "context", "digest", "relevant", "screened_out", "found", "in_scope", "missed"]
+DELIVERED = ("read", "context", "digest")
+
+
+def funnel(answer, keys, case):
+    """How far each record the case should cite got, from an --evidence-only run."""
+    if not answer or answer.get("disposition") != "evidence":
+        return None
+    sources = {sid: os.path.realpath(path) for sid, path in (answer.get("sources") or {}).items()}
+
+    def place(entry):
+        return (sources.get(entry["source_id"], entry["source_id"]), entry["byte_start"])
+
+    read, context, digest, blocks = set(), set(), set(), []
+    for item in answer.get("evidence") or []:
+        blocks.append(item.get("block") or "")
+        if item.get("digest"):
+            digest.add(place(item))
+        else:
+            read.add(place(item))
+            context.update(place(line) for line in item.get("lines") or [])
+    pool = answer.get("pool") or {}
+    sets = {name: {place(entry) for entry in pool.get(name) or []}
+            for name in ("relevant", "near", "seen", "found", "swept")}
+    stages = {}
+    for key in case["cite"]:
+        places = {(os.path.realpath(where["path"]), where["byte_start"]) for where in keys.get(key, [])}
+        if places & read:
+            stage = "read"
+        elif places & context:
+            stage = "context"
+        elif places & digest:
+            stage = "digest"
+        elif places & sets["relevant"]:
+            stage = "relevant"
+        elif places & (sets["seen"] | sets["near"]):
+            stage = "screened_out"
+        elif places & sets["found"]:
+            stage = "found"
+        elif places & sets["swept"]:
+            stage = "in_scope"
+        else:
+            stage = "missed"
+        stages[key] = stage
+    shown = "\n".join(blocks)
+    search = answer.get("search") or {}
+    return {"stages": stages,
+            "key_text": {snippet: snippet in shown for snippet in case.get("key_text") or []},
+            "relevant": len(pool.get("relevant") or []), "read": len(read), "digest": len(digest),
+            "digest_left_out": (search.get("sweep_digest") or {}).get("left_out"),
+            "evidence_chars": len(shown)}
+
+
 def cited(answer, keys, wanted):
     """Which of the records the case should cite the answer's findings cite."""
     found = set()
@@ -464,7 +565,7 @@ def cited(answer, keys, wanted):
     return sorted(found)
 
 
-def ask_all(out, ebira, cases, quick, jobs, max_usd, extra=()):
+def ask_all(out, ebira, cases, quick, jobs, max_usd, extra=(), terms_from=None):
     corpus = out / "corpus"
     keys = json.loads((out / "records.json").read_text(encoding="utf-8"))
     answers_dir = out / "answers"
@@ -477,7 +578,8 @@ def ask_all(out, ebira, cases, quick, jobs, max_usd, extra=()):
         while queue or pending:
             while queue and len(pending) < jobs and (max_usd is None or spent < max_usd):
                 case = queue.pop(0)
-                pending[pool.submit(ask, ebira, corpus, case, quick, extra)] = case
+                options = list(extra) + (fixed_terms(terms_from, case) if terms_from else [])
+                pending[pool.submit(ask, ebira, corpus, case, quick, options)] = case
             if not pending:
                 break
             done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -488,11 +590,17 @@ def ask_all(out, ebira, cases, quick, jobs, max_usd, extra=()):
                 spent += cost
                 result["cost"] = cost
                 result["cited"] = cited(result["answer"], keys, case["cite"])
+                result["funnel"] = funnel(result["answer"], keys, case)
                 results[case["id"]] = result
                 (answers_dir / f"{case['id']}.json").write_text(
                     json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
-                print(f"{case['id']}: {result['seconds']}s ${cost:.3f} exit {result['exit']}"
-                      f" cited {len(result['cited'])}/{len(case['cite'])}", flush=True)
+                if result["funnel"]:
+                    got = sum(1 for stage in result["funnel"]["stages"].values() if stage in DELIVERED)
+                    print(f"{case['id']}: {result['seconds']}s ${cost:.3f} exit {result['exit']}"
+                          f" delivered {got}/{len(case['cite'])}", flush=True)
+                else:
+                    print(f"{case['id']}: {result['seconds']}s ${cost:.3f} exit {result['exit']}"
+                          f" cited {len(result['cited'])}/{len(case['cite'])}", flush=True)
     skipped = [case["id"] for case in cases if case["id"] not in results]
     if skipped:
         print(f"not asked, the spending limit was reached: {', '.join(skipped)}")
@@ -561,6 +669,54 @@ def write_reports(out, cases, results, quick):
     print(f"wrote {out / 'report.md'} and {out / 'judge.md'}; ${total:.2f} spent")
 
 
+def write_funnel(out, cases, results, label):
+    """funnel.md and funnel.json: how far the records each case should cite got."""
+    rows, totals, per_case = [], {stage: 0 for stage in STAGES}, []
+    key_seen = key_all = 0
+    cost = 0.0
+    for case in cases:
+        result = results.get(case["id"])
+        if not result:
+            continue
+        cost += result["cost"]
+        found = result.get("funnel")
+        if not found:
+            rows.append(f"| {case['id']} | {case['type']} | (failed: exit {result['exit']}) | | | | | |")
+            totals["missed"] += len(case["cite"])
+            if case["cite"]:
+                per_case.append(0.0)
+            continue
+        stages = found["stages"]
+        for stage in stages.values():
+            totals[stage] += 1
+        if stages:
+            per_case.append(sum(1 for stage in stages.values() if stage in DELIVERED) / len(stages))
+        texts = found["key_text"]
+        key_seen += sum(1 for seen in texts.values() if seen)
+        key_all += len(texts)
+        shown = ", ".join(f"{key}:{stage}" for key, stage in stages.items()) or "-"
+        text_cell = " ".join(("yes " if seen else "NO ") + snippet for snippet, seen in texts.items()) or "-"
+        rows.append(f"| {case['id']} | {case['type']} | {shown} | {text_cell} | {found['relevant']} "
+                    f"| {found['read']} | {found['digest']} | {result['cost']:.3f} |")
+    keys_total = sum(totals.values())
+    delivered = sum(totals[stage] for stage in DELIVERED)
+    lines = [f"# Funnel: {label}", "",
+             f"{len(rows)} cases, ${cost:.2f}.", "",
+             f"Records to cite delivered to the reader: {delivered}/{keys_total} "
+             f"(read with context {totals['read'] + totals['context']}, digest {totals['digest']}); "
+             f"per case {100 * sum(per_case) / max(1, len(per_case)):.0f}% on average.",
+             f"Words that settle a case reached the reader: {key_seen}/{key_all}.", "",
+             "| stage | records |", "|---|---|"]
+    lines += [f"| {stage} | {totals[stage]} |" for stage in STAGES]
+    lines += ["", "| case | type | stages | key words | relevant | read | digest | $ |",
+              "|---|---|---|---|---|---|---|---|"] + rows
+    (out / "funnel.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (out / "funnel.json").write_text(json.dumps(
+        {case_id: {"cost": result["cost"], "exit": result["exit"], "funnel": result.get("funnel")}
+         for case_id, result in results.items()}, ensure_ascii=False, indent=1), encoding="utf-8")
+    print("\n".join(lines[:7]))
+
+
 def score(out):
     cases = {case["id"]: case for case in load_cases(None)}
     judgments = json.loads((out / "judgments.json").read_text(encoding="utf-8"))
@@ -602,6 +758,10 @@ def main():
     parser.add_argument("--jobs", type=int, default=3, help="questions asked at once (default 3)")
     parser.add_argument("--max-usd", type=float, help="stop starting cases once this much is spent")
     parser.add_argument("--build-only", action="store_true", help="write the logs and the corpus only")
+    parser.add_argument("--evidence", action="store_true",
+                        help="stop before each answer and write funnel.md (passes --evidence-only)")
+    parser.add_argument("--terms-from", type=Path,
+                        help="search the strings and the period an earlier run in this directory searched")
     parser.add_argument("--score", action="store_true", help="score DIR/judgments.json")
     args = parser.parse_args()
     out = args.out.resolve()
@@ -613,8 +773,13 @@ def main():
     if args.build_only:
         return
     cases = load_cases(args.cases)
-    results = ask_all(out, args.ebira, cases, args.quick, args.jobs, args.max_usd, args.ask_arg)
-    write_reports(out, cases, results, args.quick)
+    extra = list(args.ask_arg) + (["--evidence-only"] if args.evidence else [])
+    terms_from = args.terms_from.resolve() if args.terms_from else None
+    results = ask_all(out, args.ebira, cases, args.quick, args.jobs, args.max_usd, extra, terms_from)
+    if args.evidence:
+        write_funnel(out, cases, results, " ".join(extra) or "defaults")
+    else:
+        write_reports(out, cases, results, args.quick)
 
 
 if __name__ == "__main__":

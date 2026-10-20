@@ -25,7 +25,7 @@ pub use api::Endpoint;
 use api::{ApiError, Client, Request, Usage};
 pub use records::Filters;
 use records::{Corpus, Hit, Label, Line, PersonMessages, SourceRef, Who};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -62,6 +62,18 @@ pub struct Options {
     pub sweep: bool,
     /// The most of the person's messages a sweep screens, the newest first.
     pub sweep_limit: usize,
+    /// Show the sweep each message with the agent's words around it.
+    pub sweep_context: bool,
+    /// Screen a long message in overlapping pieces instead of cutting out its middle.
+    pub sweep_chunks: bool,
+    /// Screen the agent's replies in the turns of the person's relevant messages.
+    pub turn_replies: bool,
+    /// How the records found are handed to the answer.
+    pub delivery: Delivery,
+    /// Which of the agents' records that hold a search string are screened.
+    pub agent_select: AgentSelect,
+    /// Stop before the answer and write what it would read, for measuring.
+    pub evidence_only: bool,
     /// The model of that first answer, a draft that only feeds the later searches.
     pub draft_model: Option<String>,
     pub plan_model: String,
@@ -93,6 +105,12 @@ impl Options {
             reversal_check: true,
             sweep: true,
             sweep_limit: 4000,
+            sweep_context: false,
+            sweep_chunks: false,
+            turn_replies: false,
+            delivery: Delivery::Current,
+            agent_select: AgentSelect::Newest,
+            evidence_only: false,
             draft_model: Some("claude-haiku-5-5".to_string()),
             plan_model: "claude-opus-5-5".to_string(),
             screen_model: "claude-haiku-5-5".to_string(),
@@ -117,6 +135,28 @@ impl Options {
     }
 }
 
+/// How the records found reach the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// The best by score then the order found, and the rest of the person's relevant messages
+    /// in one line each, the earliest and the latest when there are too many.
+    Current,
+    /// The central before the background, one session at a time within a score, and the rest
+    /// of the person's relevant messages within a character budget, identical ones once.
+    Spread,
+}
+
+/// Which of the agents' records that hold a search string go to the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentSelect {
+    /// The newest of each string.
+    Newest,
+    /// As many, chosen across the months by how rare the strings they hold are.
+    Idf,
+    /// All of them, up to a cap.
+    All,
+}
+
 const MAX_TERMS: usize = 16;
 const SECOND_ROUND_TERMS: usize = 8;
 /// The kinds of finding whose later change matters, in the order they are checked.
@@ -134,6 +174,22 @@ const RECENT_MESSAGES: usize = 8;
 /// How much of a message a sweep shows the screen: the person's messages are short, and a long
 /// one is mostly something pasted.
 const SWEEP_CHARS: usize = 600;
+/// A long message is screened in pieces of this many characters, overlapping by the second.
+const CHUNK_CHARS: usize = 500;
+const CHUNK_OVERLAP: usize = 100;
+/// How much of the agent's words around a message the sweep shows: the end of the reply before
+/// it, and the head and tail of the turn's last reply.
+const CONTEXT_CHARS: usize = 120;
+/// How many of the last replies of a relevant turn are screened, each up to this many characters.
+const TURN_REPLIES: usize = 3;
+const REPLY_CHARS: usize = 600;
+/// The spread digest: a character budget, and the most of one message shown.
+const DIGEST_BUDGET_CHARS: usize = 36_000;
+const DIGEST_LINE_CHARS: usize = 240;
+/// How many of the agents' records holding a string are read to choose from, and the most
+/// screened when all are.
+const AGENT_POOL_LIMIT: usize = 1500;
+const ALL_AGENTS_MAX: usize = 3000;
 /// How many of the person's later messages a reversal check reads for one claim in a sweep:
 /// the earliest and the latest halves when there are more.
 const REVERSAL_SWEEP_MAX: usize = 400;
@@ -224,6 +280,10 @@ struct Pool {
     screened: bool,
     rounds: usize,
     swept: Option<Swept>,
+    /// For a long message screened in pieces, the characters of the piece judged most relevant.
+    focus: HashMap<SourceRef, (usize, usize)>,
+    /// The agent's words around each message the sweep read, when they were read.
+    turns: HashMap<SourceRef, records::TurnContext>,
 }
 
 impl Pool {
@@ -510,6 +570,9 @@ fn ask(
             &mut pool,
             &mut notes,
         )?;
+        if options.turn_replies {
+            turn_replies(corpus, caller, options, &mut pool, &mut notes);
+        }
     }
     gather(
         corpus,
@@ -543,14 +606,7 @@ fn ask(
 
     // 4. Read the records around the best ones, or around the closest when the screen judged
     // none relevant.
-    let mut evidence = read_pool(
-        corpus,
-        &filters,
-        &pool,
-        options.keep,
-        Vec::new(),
-        &mut notes,
-    );
+    let mut evidence = read_pool(corpus, &filters, &pool, options, Vec::new(), &mut notes);
 
     // 5. Answer.
     let Some(caller) = caller else {
@@ -561,6 +617,17 @@ fn ask(
             &Summary::of(&pool, read_count(&evidence), &notes, &filters),
         ));
     };
+    if evidence.is_empty() && options.evidence_only {
+        let spent = caller.spent.lock().unwrap();
+        return Ok(evidence_report(
+            corpus,
+            options,
+            &evidence,
+            &pool,
+            &Summary::of(&pool, 0, &notes, &filters),
+            &spent,
+        ));
+    }
     if evidence.is_empty() {
         notes.coverage = coverage(corpus, &filters, &pool, &evidence, prefetched.as_ref());
         export_if_asked(corpus, options, &filters, &pool, &evidence, &mut notes);
@@ -625,8 +692,22 @@ fn ask(
     }
 
     // 8. The final answer, from the answer model, over the records as they now stand.
+    if options.evidence_only {
+        if records_changed {
+            evidence = read_pool(corpus, &filters, &pool, options, later, &mut notes);
+        }
+        let spent = caller.spent.lock().unwrap();
+        return Ok(evidence_report(
+            corpus,
+            options,
+            &evidence,
+            &pool,
+            &Summary::of(&pool, read_count(&evidence), &notes, &filters),
+            &spent,
+        ));
+    }
     if records_changed {
-        evidence = read_pool(corpus, &filters, &pool, options.keep, later, &mut notes);
+        evidence = read_pool(corpus, &filters, &pool, options, later, &mut notes);
         answer = answer_with(
             &caller,
             options,
@@ -669,13 +750,21 @@ fn read_pool(
     corpus: &Corpus,
     filters: &Filters,
     pool: &Pool,
-    keep: usize,
+    options: &Options,
     later: Vec<Hit>,
     notes: &mut Notes,
 ) -> Vec<Evidence> {
+    let keep = options.keep;
     let closest = pool.nothing_relevant();
     let mut hits = if closest {
         pool.closest(CLOSEST.min(keep))
+    } else if options.delivery == Delivery::Spread {
+        let order = spread_order(&pool.relevant);
+        order
+            .into_iter()
+            .take(keep)
+            .map(|index| pool.relevant[index].0.clone())
+            .collect()
     } else {
         pool.best(keep)
     };
@@ -700,19 +789,127 @@ fn read_pool(
         with_recent(corpus, filters, hits, notes)
     };
     let shown: HashSet<SourceRef> = hits.iter().map(|hit| hit.source_ref.clone()).collect();
-    let mut evidence = read_evidence(corpus, hits);
+    let mut evidence = read_evidence(corpus, hits, &pool.focus);
     if !closest {
-        let (digest, left_out) = sweep_digest(corpus, pool, &shown);
+        let (digest, left_out, chars) = match options.delivery {
+            Delivery::Current => {
+                let (digest, left_out) = sweep_digest(corpus, pool, &shown);
+                let digest = digest.into_iter().map(|hit| (hit, 1)).collect();
+                (digest, left_out, SWEEP_DIGEST_CHARS)
+            }
+            Delivery::Spread => {
+                let (digest, left_out) = sweep_digest_spread(corpus, pool, &shown);
+                (digest, left_out, DIGEST_LINE_CHARS)
+            }
+        };
         notes.digest = (!digest.is_empty() || left_out > 0).then_some((digest.len(), left_out));
         let base = evidence.len();
         evidence.extend(
             digest
                 .into_iter()
                 .enumerate()
-                .map(|(index, hit)| compose_digest(corpus, format!("E{}", base + index + 1), hit)),
+                .map(|(index, (hit, copies))| {
+                    let focus = pool.focus.get(&hit.source_ref).copied();
+                    compose_digest(
+                        corpus,
+                        format!("E{}", base + index + 1),
+                        hit,
+                        chars,
+                        focus,
+                        copies,
+                    )
+                }),
         );
     }
     evidence
+}
+
+/// The order to read scored records in: the higher score first, and within a score one
+/// session at a time (the sessions in the order their first record comes), so that one
+/// session does not fill the reading. Indices into `scored`.
+fn spread_order(scored: &[(Hit, u64)]) -> Vec<usize> {
+    let mut scores: Vec<u64> = scored.iter().map(|(_, score)| *score).collect();
+    scores.sort_unstable();
+    scores.dedup();
+    let mut order = Vec::with_capacity(scored.len());
+    for score in scores.into_iter().rev() {
+        let mut sessions: Vec<(&str, VecDeque<usize>)> = Vec::new();
+        for (index, (hit, value)) in scored.iter().enumerate() {
+            if *value != score {
+                continue;
+            }
+            match sessions
+                .iter_mut()
+                .find(|(session, _)| *session == hit.session.as_str())
+            {
+                Some((_, queue)) => queue.push_back(index),
+                None => sessions.push((hit.session.as_str(), VecDeque::from([index]))),
+            }
+        }
+        loop {
+            let mut took = false;
+            for (_, queue) in sessions.iter_mut() {
+                if let Some(index) = queue.pop_front() {
+                    order.push(index);
+                    took = true;
+                }
+            }
+            if !took {
+                break;
+            }
+        }
+    }
+    order
+}
+
+/// The spread digest: the person's relevant messages the answer does not read with context,
+/// identical ones once with their count, the central before the background and one session at
+/// a time, as many as `DIGEST_BUDGET_CHARS` holds at up to `DIGEST_LINE_CHARS` each; oldest
+/// first. Also how many were left out.
+fn sweep_digest_spread(
+    corpus: &Corpus,
+    pool: &Pool,
+    shown: &HashSet<SourceRef>,
+) -> (Vec<(Hit, usize)>, usize) {
+    if pool.swept.is_none() {
+        return (Vec::new(), 0);
+    }
+    let mut unique: Vec<(Hit, u64)> = Vec::new();
+    let mut copies: Vec<usize> = Vec::new();
+    let mut place: HashMap<String, usize> = HashMap::new();
+    for (hit, score) in pool.relevant.iter().filter(|(hit, _)| {
+        hit.who == Who::Person && hit.terms.is_empty() && !shown.contains(&hit.source_ref)
+    }) {
+        let key = text::normalize(&hit.text);
+        match place.get(&key) {
+            Some(&at) => {
+                copies[at] += 1;
+                unique[at].1 = unique[at].1.max(*score);
+            }
+            None => {
+                place.insert(key, unique.len());
+                unique.push((hit.clone(), *score));
+                copies.push(1);
+            }
+        }
+    }
+    let mut used = 0;
+    let mut chosen: Vec<usize> = Vec::new();
+    for index in spread_order(&unique) {
+        let cost = unique[index].0.text.chars().count().min(DIGEST_LINE_CHARS) + 60;
+        if used + cost > DIGEST_BUDGET_CHARS {
+            continue;
+        }
+        used += cost;
+        chosen.push(index);
+    }
+    let left_out = unique.len() - chosen.len();
+    let mut digest: Vec<(Hit, usize)> = chosen
+        .into_iter()
+        .map(|index| (unique[index].0.clone(), copies[index]))
+        .collect();
+    digest.sort_by(|left, right| time_order(corpus, &left.0, &right.0));
+    (digest, left_out)
 }
 
 /// The person's messages the sweep judged relevant that the answer does not read with their
@@ -740,11 +937,27 @@ fn sweep_digest(corpus: &Corpus, pool: &Pool, shown: &HashSet<SourceRef>) -> (Ve
     (rest, left_out)
 }
 
-/// The block for one of the digest's messages: one line, without its context.
-fn compose_digest(corpus: &Corpus, id: String, hit: Hit) -> Evidence {
+/// The block for one of the digest's messages: one line, without its context, at most `chars`
+/// characters of it (of the piece found, for a long message screened in pieces), and how many
+/// times the same words were sent.
+fn compose_digest(
+    corpus: &Corpus,
+    id: String,
+    hit: Hit,
+    chars: usize,
+    focus: Option<(usize, usize)>,
+    copies: usize,
+) -> Evidence {
+    let shown = match focus {
+        Some((start, end)) => {
+            let piece: String = hit.text.chars().skip(start).take(end - start).collect();
+            format!("… {}", text::clip_head(&text::one_line(&piece), chars))
+        }
+        None => text::clip_head(&text::one_line(&hit.text), chars),
+    };
     let block = format!(
         "{id} | {} | person | {} | {} | digest: shown in one line, without its context, cut at \
-         {} characters\n▶ person {}: {}\n",
+         {} characters{}\n▶ person {}: {}\n",
         corpus.local(&hit.timestamp),
         if hit.project.is_empty() {
             "?"
@@ -752,9 +965,14 @@ fn compose_digest(corpus: &Corpus, id: String, hit: Hit) -> Evidence {
             &hit.project
         },
         hit.app,
-        SWEEP_DIGEST_CHARS,
+        chars,
+        if copies > 1 {
+            format!(" | sent {copies} times in the same words")
+        } else {
+            String::new()
+        },
         corpus.local(&hit.timestamp),
-        text::clip_head(&text::one_line(&hit.text), SWEEP_DIGEST_CHARS)
+        shown
     );
     let lines = vec![ShownLine {
         author: Author::Found(Who::Person),
@@ -1225,7 +1443,12 @@ fn gather(
     if pool.synced_through.is_none() {
         pool.synced_through = searched.synced_through;
     }
-    let candidates = take_new(pool, corpus, searched.hits, options.candidates);
+    let limit = if options.agent_select == AgentSelect::All {
+        usize::MAX
+    } else {
+        options.candidates
+    };
+    let candidates = take_new(pool, corpus, searched.hits, limit);
     match caller {
         Some(caller) if !candidates.is_empty() => {
             progress(&format!(
@@ -1240,6 +1463,7 @@ fn gather(
                 &candidates,
                 notes,
                 Screening::Found,
+                None,
             );
             pool.screened = true;
             for (hit, score) in candidates.into_iter().zip(scores) {
@@ -1323,7 +1547,61 @@ fn sweep(
         ordered.len(),
         options.screen_model
     ));
-    let scores = screen(caller, options, corpus, &ordered, notes, Screening::Sweep);
+    // The agent's words around each message, read once: shown to the screen with the message,
+    // and kept for the turn's replies.
+    let contexts: Option<HashMap<SourceRef, String>> =
+        if options.sweep_context || options.turn_replies {
+            match corpus.turn_contexts(&ordered, TURN_REPLIES) {
+                Ok(turns) => {
+                    let shown = options.sweep_context.then(|| {
+                        turns
+                            .iter()
+                            .map(|(key, turn)| (key.clone(), turn_context_text(turn)))
+                            .collect()
+                    });
+                    pool.turns = turns;
+                    shown
+                }
+                Err(error) => {
+                    notes.issues.push(format!(
+                        "the agent's words around the person's messages could not be read \
+                         ({error})"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let (pieces, owners, ranges) = pieces_of(&ordered, options.sweep_chunks);
+    let screening = if contexts.is_some() {
+        Screening::SweepContext
+    } else {
+        Screening::Sweep
+    };
+    let piece_scores = screen(
+        caller,
+        options,
+        corpus,
+        &pieces,
+        notes,
+        screening,
+        contexts.as_ref(),
+    );
+    // A message's score is its best piece's, and that piece is where the reader looks.
+    let mut scores: Vec<Option<u64>> = vec![None; ordered.len()];
+    for ((owner, range), score) in owners.iter().zip(&ranges).zip(piece_scores) {
+        let Some(score) = score else {
+            continue;
+        };
+        if scores[*owner].is_none_or(|best| score > best) {
+            scores[*owner] = Some(score);
+            if let (Some(range), true) = (range, score >= 2) {
+                pool.focus
+                    .insert(ordered[*owner].source_ref.clone(), *range);
+            }
+        }
+    }
     pool.screened = true;
     // Into the pool newest first, as the search's records go.
     for (hit, score) in ordered.into_iter().zip(scores).rev() {
@@ -1349,6 +1627,130 @@ fn sweep(
     swept.screened -= swept.unscreened;
     pool.swept = Some(swept);
     Ok(())
+}
+
+/// Pieces of messages to screen, the message each is part of, and the characters it covers.
+type Pieces = (Vec<Hit>, Vec<usize>, Vec<Option<(usize, usize)>>);
+
+/// The pieces a sweep screens: each message whole, or, with `chunks`, a long one in overlapping
+/// pieces that each fit the screen whole. With each piece, the message it is part of and, for a
+/// piece, the characters it covers.
+fn pieces_of(messages: &[Hit], chunks: bool) -> Pieces {
+    let mut pieces = Vec::new();
+    let mut owners = Vec::new();
+    let mut ranges = Vec::new();
+    for (index, hit) in messages.iter().enumerate() {
+        let count = hit.text.chars().count();
+        if !chunks || count <= SWEEP_CHARS {
+            pieces.push(hit.clone());
+            owners.push(index);
+            ranges.push(None);
+            continue;
+        }
+        let chars: Vec<char> = hit.text.chars().collect();
+        let mut start = 0;
+        loop {
+            let end = (start + CHUNK_CHARS).min(count);
+            let mut piece = hit.clone();
+            piece.text = chars[start..end].iter().collect();
+            pieces.push(piece);
+            owners.push(index);
+            ranges.push(Some((start, end)));
+            if end == count {
+                break;
+            }
+            start = end - CHUNK_OVERLAP;
+        }
+    }
+    (pieces, owners, ranges)
+}
+
+/// What the sweep shows after a message: the end of the agent's reply before it, and the head
+/// and tail of the agent's last reply in the turn it opened.
+fn turn_context_text(turn: &records::TurnContext) -> String {
+    let mut out = String::new();
+    let before = text::one_line(&turn.before);
+    if !before.trim().is_empty() {
+        let chars: Vec<char> = before.chars().collect();
+        let tail: String = chars[chars.len().saturating_sub(CONTEXT_CHARS)..]
+            .iter()
+            .collect();
+        out.push_str(&format!(" [agent before] …{tail}"));
+    }
+    if let Some(last) = turn.replies.last() {
+        let after = text::one_line(&last.text);
+        out.push_str(&format!(
+            " [agent after] {}",
+            text::clip_middle(&after, CONTEXT_CHARS * 2)
+        ));
+    }
+    out
+}
+
+/// The agent's replies in the turns of the person's messages the sweep judged relevant: no
+/// search string has to hold them. Screened like the records a search finds.
+fn turn_replies(
+    corpus: &Corpus,
+    caller: &Caller,
+    options: &Options,
+    pool: &mut Pool,
+    notes: &mut Notes,
+) {
+    let mut candidates: Vec<Hit> = Vec::new();
+    let mut taken: HashSet<SourceRef> = HashSet::new();
+    for (hit, _) in pool
+        .relevant
+        .iter()
+        .filter(|(hit, _)| hit.who == Who::Person)
+    {
+        let Some(turn) = pool.turns.get(&hit.source_ref) else {
+            continue;
+        };
+        for reply in &turn.replies {
+            if !pool.seen.contains(&reply.source_ref) && taken.insert(reply.source_ref.clone()) {
+                candidates.push(reply.clone());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    progress(&format!(
+        "screening {} of the agent's replies in the relevant turns ({})",
+        candidates.len(),
+        options.screen_model
+    ));
+    let scores = screen(
+        caller,
+        options,
+        corpus,
+        &candidates,
+        notes,
+        Screening::Reply,
+        None,
+    );
+    let screened = candidates.len();
+    let mut relevant = 0;
+    for (hit, score) in candidates.into_iter().zip(scores) {
+        pool.seen.insert(hit.source_ref.clone());
+        match score {
+            Some(3) => {
+                relevant += 1;
+                pool.threes += 1;
+                pool.relevant.push((hit, 3));
+            }
+            Some(2) => {
+                relevant += 1;
+                pool.twos += 1;
+                pool.relevant.push((hit, 2));
+            }
+            _ => pool.near.push((hit, score.map_or(1, |score| score.min(1)))),
+        }
+    }
+    notes.issues.push(format!(
+        "Screened {screened} of the agent's replies in the turns of the person's relevant \
+         messages; {relevant} judged relevant"
+    ));
 }
 
 /// A sample of the person's messages in the scope, spread over its span, for the plan model to
@@ -1630,27 +2032,36 @@ fn write_export(
 enum Screening {
     Found,
     Sweep,
+    /// A sweep that shows each message with the agent's words around it.
+    SweepContext,
+    /// The agent's replies in the turns of relevant messages.
+    Reply,
 }
 
 impl Screening {
     fn step(self) -> &'static str {
         match self {
             Screening::Found => "screen",
-            Screening::Sweep => "sweep",
+            Screening::Sweep | Screening::SweepContext => "sweep",
+            Screening::Reply => "turn-screen",
         }
     }
 
     fn system(self) -> &'static str {
         match self {
-            Screening::Found => prompts::SCREEN_SYSTEM,
+            Screening::Found | Screening::Reply => prompts::SCREEN_SYSTEM,
             Screening::Sweep => prompts::SWEEP_SYSTEM,
+            Screening::SweepContext => prompts::SWEEP_CONTEXT_SYSTEM,
         }
     }
 
     fn text(self, hit: &Hit) -> String {
         match self {
             Screening::Found => text::one_line(&text::window(&hit.text, &hit.terms, 360)),
-            Screening::Sweep => text::one_line(&text::clip_middle(&hit.text, SWEEP_CHARS)),
+            Screening::Sweep | Screening::SweepContext => {
+                text::one_line(&text::clip_middle(&hit.text, SWEEP_CHARS))
+            }
+            Screening::Reply => text::one_line(&text::clip_middle(&hit.text, REPLY_CHARS)),
         }
     }
 }
@@ -1675,8 +2086,13 @@ fn take_new(pool: &mut Pool, corpus: &Corpus, hits: Vec<Hit>, limit: usize) -> V
     candidates
 }
 
-/// The records, oldest first, each with the nearest readable records around it.
-fn read_evidence(corpus: &Corpus, mut hits: Vec<Hit>) -> Vec<Evidence> {
+/// The records, oldest first, each with the nearest readable records around it; a long message
+/// screened in pieces shows the piece found.
+fn read_evidence(
+    corpus: &Corpus,
+    mut hits: Vec<Hit>,
+    focus: &HashMap<SourceRef, (usize, usize)>,
+) -> Vec<Evidence> {
     hits.sort_by(|left, right| time_order(corpus, left, right));
     if !hits.is_empty() {
         progress(&format!("reading the records around {} found", hits.len()));
@@ -1697,7 +2113,10 @@ fn read_evidence(corpus: &Corpus, mut hits: Vec<Hit>) -> Vec<Evidence> {
     hits.into_iter()
         .zip(contexts)
         .enumerate()
-        .map(|(index, (hit, lines))| compose(corpus, format!("E{}", index + 1), hit, lines))
+        .map(|(index, (hit, lines))| {
+            let piece = focus.get(&hit.source_ref).copied();
+            compose_focused(corpus, format!("E{}", index + 1), hit, lines, piece)
+        })
         .collect()
 }
 
@@ -1897,9 +2316,13 @@ fn search(
     filters: &Filters,
     options: &Options,
 ) -> Result<Searched, String> {
+    let agent_limit = match options.agent_select {
+        AgentSelect::Newest => options.agent_per_term,
+        AgentSelect::Idf | AgentSelect::All => AGENT_POOL_LIMIT.max(options.agent_per_term),
+    };
     let (person, agents) = thread::scope(|scope| {
         let agents = (options.agent_per_term > 0)
-            .then(|| scope.spawn(|| corpus.agents(terms, filters, options.agent_per_term)));
+            .then(|| scope.spawn(|| corpus.agents(terms, filters, agent_limit)));
         let person = corpus.person(terms, filters, options.person_per_term, true);
         let agents = agents.map(|handle| {
             handle.join().unwrap_or_else(|_| {
@@ -1918,6 +2341,12 @@ fn search(
         }
         None => (None, None),
     };
+    let selected: Option<HashSet<SourceRef>> = match (&agents, options.agent_select) {
+        (Some(lists), AgentSelect::Idf | AgentSelect::All) => {
+            Some(select_agents(corpus, lists, terms, options))
+        }
+        _ => None,
+    };
     let mut place: HashMap<SourceRef, usize> = HashMap::new();
     let mut searched = Searched {
         hits: Vec::new(),
@@ -1930,16 +2359,26 @@ fn search(
             lists.push((Who::Agent, &agents[index]));
         }
         for (who, found) in lists {
+            let taken: Vec<&Hit> = found
+                .hits
+                .iter()
+                .filter(|hit| {
+                    who == Who::Person
+                        || selected
+                            .as_ref()
+                            .is_none_or(|set| set.contains(&hit.source_ref))
+                })
+                .collect();
             searched.counts.push(TermCount {
                 term: term.clone(),
                 who,
-                returned: found.hits.len(),
+                returned: taken.len(),
                 total: found.total,
-                oldest_taken: ((found.hits.len() as u64) < found.total)
-                    .then(|| found.hits.last().map(|hit| hit.timestamp.clone()))
+                oldest_taken: ((taken.len() as u64) < found.total)
+                    .then(|| taken.last().map(|hit| hit.timestamp.clone()))
                     .flatten(),
             });
-            for hit in &found.hits {
+            for hit in taken {
                 match place.get(&hit.source_ref) {
                     Some(&at) => {
                         if !searched.hits[at].terms.contains(term) {
@@ -1955,6 +2394,105 @@ fn search(
         }
     }
     Ok(searched)
+}
+
+/// The agents' records to screen, from those that hold the strings (the newest
+/// `AGENT_POOL_LIMIT` of each): with `Idf`, as many as the newest of each string would give,
+/// chosen across the months, half in equal shares and half in proportion to the records each
+/// month holds, and within a month by the sum of the rarity, ln(1 + (D - df + 0.5)/(df + 0.5)),
+/// of the strings each holds, a string and its spacing variants counted once; with `All`, all
+/// of them, up to `ALL_AGENTS_MAX` chosen the same way.
+fn select_agents(
+    corpus: &Corpus,
+    lists: &[records::Found],
+    terms: &[String],
+    options: &Options,
+) -> HashSet<SourceRef> {
+    let mut records: HashMap<SourceRef, (String, HashSet<String>)> = HashMap::new();
+    let mut newest: HashSet<SourceRef> = HashSet::new();
+    for (term, found) in terms.iter().zip(lists) {
+        let group = text::normalize(term);
+        for (rank, hit) in found.hits.iter().enumerate() {
+            let entry = records
+                .entry(hit.source_ref.clone())
+                .or_insert_with(|| (hit.timestamp.clone(), HashSet::new()));
+            entry.1.insert(group.clone());
+            if rank < options.agent_per_term {
+                newest.insert(hit.source_ref.clone());
+            }
+        }
+    }
+    let total = records.len();
+    let quota = match options.agent_select {
+        AgentSelect::All if total <= ALL_AGENTS_MAX => return records.into_keys().collect(),
+        AgentSelect::All => ALL_AGENTS_MAX,
+        _ => newest.len(),
+    };
+    let mut df: HashMap<String, usize> = HashMap::new();
+    for (_, groups) in records.values() {
+        for group in groups {
+            *df.entry(group.clone()).or_default() += 1;
+        }
+    }
+    let documents = total as f64;
+    let rarity = |group: &String| {
+        let count = df.get(group).copied().unwrap_or(0) as f64;
+        (1.0 + (documents - count + 0.5) / (count + 0.5)).ln()
+    };
+    let mut strata: BTreeMap<String, Vec<(f64, Option<i128>, SourceRef)>> = BTreeMap::new();
+    for (key, (timestamp, groups)) in &records {
+        let month = corpus
+            .local_date(timestamp)
+            .map(|date| date.chars().take(7).collect())
+            .unwrap_or_else(|| "undated".to_string());
+        let score: f64 = groups.iter().map(rarity).sum();
+        strata
+            .entry(month)
+            .or_default()
+            .push((score, corpus.instant(timestamp), key.clone()));
+    }
+    let months = strata.len().max(1) as f64;
+    let mut shares: Vec<(String, usize)> = strata
+        .iter()
+        .map(|(month, list)| {
+            let share = quota as f64 * (0.5 / months + 0.5 * list.len() as f64 / total as f64);
+            (month.clone(), (share.round() as usize).min(list.len()))
+        })
+        .collect();
+    let mut left = quota.saturating_sub(shares.iter().map(|(_, share)| share).sum());
+    while left > 0 {
+        let mut gave = false;
+        let mut by_room: Vec<usize> = (0..shares.len()).collect();
+        by_room.sort_by_key(|&index| {
+            std::cmp::Reverse(strata[&shares[index].0].len() - shares[index].1)
+        });
+        for index in by_room {
+            if left == 0 {
+                break;
+            }
+            if shares[index].1 < strata[&shares[index].0].len() {
+                shares[index].1 += 1;
+                left -= 1;
+                gave = true;
+            }
+        }
+        if !gave {
+            break;
+        }
+    }
+    let mut selected = HashSet::new();
+    for (month, share) in shares {
+        let mut list = strata.remove(&month).unwrap_or_default();
+        list.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.1.cmp(&left.1))
+        });
+        selected.extend(list.into_iter().take(share).map(|(_, _, key)| key));
+    }
+    selected
 }
 
 /// More search strings matched first, then the person's own words, then the newer.
@@ -1976,6 +2514,7 @@ fn screen(
     candidates: &[Hit],
     notes: &mut Notes,
     screening: Screening,
+    contexts: Option<&HashMap<SourceRef, String>>,
 ) -> Vec<Option<u64>> {
     let schema = prompts::screen_schema();
     let chunks: Vec<(usize, &[Hit])> = candidates
@@ -1989,7 +2528,7 @@ fn screen(
             .enumerate()
             .map(|(index, hit)| {
                 format!(
-                    "C{} | {} | {} | {} | {}",
+                    "C{} | {} | {} | {} | {}{}",
                     base + index + 1,
                     corpus.local(&hit.timestamp),
                     if hit.who == Who::Person {
@@ -2002,7 +2541,11 @@ fn screen(
                     } else {
                         &hit.project
                     },
-                    screening.text(hit)
+                    screening.text(hit),
+                    contexts
+                        .and_then(|map| map.get(&hit.source_ref))
+                        .map(String::as_str)
+                        .unwrap_or("")
                 )
             })
             .collect();
@@ -2057,13 +2600,15 @@ fn screen(
                     }
                 }
                 // A sweep's chunk is a stretch of the conversation, not ranked: nothing in it
-                // can be kept on its position.
-                Screening::Sweep => notes.issues.push(format!(
-                    "the person's messages C{}-C{} were not swept ({error}); they count as \
+                // can be kept on its position. Nor can a turn's replies.
+                Screening::Sweep | Screening::SweepContext | Screening::Reply => {
+                    notes.issues.push(format!(
+                        "the person's messages C{}-C{} were not swept ({error}); they count as \
                      unscreened",
-                    base + 1,
-                    base + length
-                )),
+                        base + 1,
+                        base + length
+                    ))
+                }
             },
         }
     }
@@ -2135,9 +2680,33 @@ fn agent_text(read: &str, hit: &Hit) -> String {
     )
 }
 
-/// The block the answer model reads for one record: a header, then the record (▶) among its
-/// neighbours.
+/// A long message shown around the piece the screen judged relevant: its head, the piece, and its
+/// tail, instead of the head and tail alone.
+fn focused(full: &str, start: usize, end: usize) -> String {
+    let chars: Vec<char> = full.chars().collect();
+    let head: String = chars[..300.min(chars.len())].iter().collect();
+    let piece: String = chars[start.min(chars.len())..end.min(chars.len())]
+        .iter()
+        .collect();
+    let tail: String = chars[chars.len().saturating_sub(300)..].iter().collect();
+    format!("{head} … [the part found] {piece} … {tail}")
+}
+
+/// The block the answer model reads for one record, shown whole.
+#[cfg(test)]
 fn compose(corpus: &Corpus, id: String, hit: Hit, lines: Result<Vec<Line>, String>) -> Evidence {
+    compose_focused(corpus, id, hit, lines, None)
+}
+
+/// The block the answer model reads for one record: a header, then the record (▶) among its
+/// neighbours; a long message of the person's screened in pieces, around the piece found.
+fn compose_focused(
+    corpus: &Corpus,
+    id: String,
+    hit: Hit,
+    lines: Result<Vec<Line>, String>,
+    piece: Option<(usize, usize)>,
+) -> Evidence {
     let found = Author::Found(hit.who);
     let mut block = format!(
         "{id} | {} | {} | {} | {}{}{}\n",
@@ -2162,9 +2731,12 @@ fn compose(corpus: &Corpus, id: String, hit: Hit, lines: Result<Vec<Line>, Strin
     );
     let mut shown = Vec::new();
     let add_hit = |block: &mut String, shown: &mut Vec<ShownLine>, full: &str, timestamp: &str| {
-        let body = match hit.who {
-            Who::Person => text::clip_middle(full, 1800),
-            Who::Agent => text::clip_middle(full, 1500),
+        let body = match (hit.who, piece) {
+            (Who::Person, Some((start, end))) if full.chars().count() > 1800 => {
+                focused(full, start, end)
+            }
+            (Who::Person, _) => text::clip_middle(full, 1800),
+            (Who::Agent, _) => text::clip_middle(full, 1500),
         };
         block.push_str(&format!(
             "▶ {} {}: {}\n",
@@ -2783,6 +3355,107 @@ fn source_ref_json(hit: &Hit, source: &SourceRef) -> String {
         source.byte_start,
         source.byte_len,
     )
+}
+
+/// For measuring: what the answer would read, how each record is shown, and what the steps
+/// before it screened and judged, without calling the answer model.
+fn evidence_report(
+    corpus: &Corpus,
+    options: &Options,
+    evidence: &[Evidence],
+    pool: &Pool,
+    summary: &Summary,
+    spent: &[Spend],
+) -> String {
+    let mut ids: HashSet<String> = HashSet::new();
+    for item in evidence {
+        ids.insert(item.hit.source_ref.source_id.clone());
+    }
+    for key in pool.seen.iter().chain(pool.found.iter()) {
+        ids.insert(key.source_id.clone());
+    }
+    for (hit, _) in pool.relevant.iter().chain(pool.near.iter()) {
+        ids.insert(hit.source_ref.source_id.clone());
+    }
+    if let Some(swept) = &pool.swept {
+        for hit in &swept.messages {
+            ids.insert(hit.source_ref.source_id.clone());
+        }
+    }
+    let paths = corpus.source_paths(&ids).unwrap_or_default();
+    let reference = |key: &SourceRef| {
+        crate::json::Object::new()
+            .name("source_id", &key.source_id)
+            .number("byte_start", key.byte_start)
+            .finish()
+    };
+    let scored = |list: &[(Hit, u64)]| {
+        crate::json::array(list.iter().map(|(hit, score)| {
+            crate::json::Object::new()
+                .name("source_id", &hit.source_ref.source_id)
+                .number("byte_start", hit.source_ref.byte_start)
+                .number("score", *score)
+                .name("author", Author::Found(hit.who).id())
+                .finish()
+        }))
+    };
+    let items = evidence.iter().map(|item| {
+        let lines = item.lines.iter().map(|line| {
+            crate::json::Object::new()
+                .name("source_id", &line.source_ref.source_id)
+                .number("byte_start", line.source_ref.byte_start)
+                .name("author", line.author.id())
+                .finish()
+        });
+        crate::json::Object::new()
+            .name("id", &item.id)
+            .name("source_id", &item.hit.source_ref.source_id)
+            .number("byte_start", item.hit.source_ref.byte_start)
+            .name("author", Author::Found(item.hit.who).id())
+            .boolean("digest", item.digest)
+            .raw("lines", &crate::json::array(lines))
+            .text("block", &item.block)
+            .finish()
+    });
+    let swept = pool
+        .swept
+        .as_ref()
+        .map(|swept| {
+            crate::json::array(swept.messages.iter().map(|hit| reference(&hit.source_ref)))
+        })
+        .unwrap_or_else(|| "[]".to_string());
+    let sources = {
+        let mut object = crate::json::Object::new();
+        for (id, path) in &paths {
+            object.text(id, path);
+        }
+        object.finish()
+    };
+    let mut out = crate::json::Object::new()
+        .name("disposition", "evidence")
+        .name("mode", "ask")
+        .text("question", &options.question)
+        .raw("evidence", &crate::json::array(items))
+        .raw(
+            "pool",
+            &crate::json::Object::new()
+                .raw("relevant", &scored(&pool.relevant))
+                .raw("near", &scored(&pool.near))
+                .raw("seen", &crate::json::array(pool.seen.iter().map(reference)))
+                .raw(
+                    "found",
+                    &crate::json::array(pool.found.iter().map(reference)),
+                )
+                .raw("swept", &swept)
+                .finish(),
+        )
+        .raw("sources", &sources)
+        .name("local_time_zone", &corpus.zone())
+        .raw("search", &summary.json())
+        .raw("cost_usd", &cost_json(spent))
+        .finish();
+    out.push('\n');
+    out
 }
 
 /// Without the API: the records the answer model would have read.
@@ -3885,5 +4558,110 @@ mod tests {
         let thorough = Options::thorough("q".to_string());
         assert_eq!(thorough.draft_model.as_deref(), Some("claude-haiku-5-5"));
         assert!(thorough.reversal_check && thorough.second_round);
+    }
+
+    #[test]
+    fn a_long_message_is_screened_in_overlapping_pieces_that_each_fit_whole() {
+        let long: String = "あ".repeat(1200);
+        let messages = vec![
+            hit("短い", Who::Person, "2026-09-01T00:00:00Z", &[]),
+            hit(&long, Who::Person, "2026-09-02T00:00:00Z", &[]),
+        ];
+        let (pieces, owners, ranges) = pieces_of(&messages, true);
+        assert_eq!(owners, vec![0, 1, 1, 1]);
+        assert_eq!(
+            ranges,
+            vec![None, Some((0, 500)), Some((400, 900)), Some((800, 1200))]
+        );
+        assert!(pieces[1..]
+            .iter()
+            .all(|piece| piece.text.chars().count() <= SWEEP_CHARS));
+        let (whole, owners, _) = pieces_of(&messages, false);
+        assert_eq!((whole.len(), owners), (2, vec![0, 1]));
+    }
+
+    #[test]
+    fn a_long_message_is_read_around_the_piece_found() {
+        let text = format!("{}KEY{}", "a".repeat(1000), "b".repeat(1000));
+        let shown = focused(&text, 900, 1100);
+        assert!(shown.starts_with(&"a".repeat(300)) && shown.ends_with(&"b".repeat(300)));
+        assert!(shown.contains("[the part found]") && shown.contains("KEY"));
+    }
+
+    #[test]
+    fn within_a_score_the_reading_takes_one_session_at_a_time() {
+        let in_session = |session: &str, score: u64, at: &str| {
+            let mut found = hit("x", Who::Person, at, &[]);
+            found.session = session.to_string();
+            (found, score)
+        };
+        let scored = vec![
+            in_session("a", 3, "2026-09-05T00:00:00Z"),
+            in_session("a", 3, "2026-09-04T00:00:00Z"),
+            in_session("a", 3, "2026-09-03T00:00:00Z"),
+            in_session("b", 2, "2026-09-02T00:00:00Z"),
+            in_session("c", 3, "2026-09-01T00:00:00Z"),
+        ];
+        assert_eq!(spread_order(&scored), vec![0, 4, 1, 2, 3]);
+    }
+
+    #[test]
+    fn the_sweep_shows_the_end_of_the_reply_before_and_the_turns_last_reply() {
+        let turn = records::TurnContext {
+            before: format!("{}Leaflet をおすすめします。", "前置き".repeat(60)),
+            replies: vec![
+                hit("見てみます。", Who::Agent, "2026-09-01T00:01:00Z", &[]),
+                hit(
+                    "Leaflet で実装しました。",
+                    Who::Agent,
+                    "2026-09-01T00:02:00Z",
+                    &[],
+                ),
+            ],
+        };
+        let shown = turn_context_text(&turn);
+        assert!(shown.starts_with(" [agent before] …"), "{shown}");
+        assert!(shown.contains("Leaflet をおすすめします。 [agent after] Leaflet で実装しました。"));
+        assert!(!shown.contains("見てみます。"));
+        assert_eq!(
+            turn_context_text(&records::TurnContext::default()),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn rarity_and_months_choose_the_agents_records_to_screen() {
+        let agent = |at: &str| hit("x", Who::Agent, at, &[]);
+        let (a1, a2, a3, a4) = (
+            agent("2026-10-04T00:00:00Z"),
+            agent("2026-10-03T00:00:00Z"),
+            agent("2026-10-02T00:00:00Z"),
+            agent("2026-10-01T00:00:00Z"),
+        );
+        let august = agent("2026-08-04T00:00:00Z");
+        let lists = vec![
+            records::Found {
+                hits: vec![a1.clone(), a2.clone(), a3.clone(), august.clone()],
+                total: 4,
+            },
+            records::Found {
+                hits: vec![a1.clone(), a4.clone(), august.clone()],
+                total: 3,
+            },
+        ];
+        let terms = vec!["MQTT".to_string(), "keepalive".to_string()];
+        let mut options = Options::thorough("q".to_string());
+        options.agent_per_term = 2;
+        options.agent_select = AgentSelect::Idf;
+        // As many as the newest two of each string give (three), one of them from August, and
+        // in October the two holding the rarer strings.
+        let chosen = select_agents(&corpus(), &lists, &terms, &options);
+        let expected: HashSet<SourceRef> = [&a1, &a4, &august]
+            .iter()
+            .map(|hit| hit.source_ref.clone())
+            .collect();
+        assert_eq!(chosen, expected);
+        options.agent_select = AgentSelect::All;
+        assert_eq!(select_agents(&corpus(), &lists, &terms, &options).len(), 5);
     }
 }

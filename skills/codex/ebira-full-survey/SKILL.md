@@ -55,7 +55,7 @@ Without a key, or to look further, search yourself.
 The person's own statements across Claude Code and Codex, newest first:
 
 ```text
-ebira said --query <text> [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] --format text
+ebira said --query <text> [--cwd <project-path-part>] [--from <yyyy-mm-dd>] [--to <yyyy-mm-dd>] [--context] --format text
 ```
 
 The conversations in a scope, each with its span, places, and first and last
@@ -112,7 +112,10 @@ For how a project, tool, or decision developed and where it stands:
 3. Read every message of the person's about it: one `said` pass with each
    spelling as its own `--query` (the English name, its katakana, lowercase, a
    former name). These are the backbone of the account; an agent's report is a
-   claim to check against them.
+   claim to check against them. A short reply ("go with that", "fixed!") answers
+   what the agent had just written: read it with `--context`, which shows the end
+   of the agent's reply before each message and the agent's last reply in its
+   turn, and never take a short reply's meaning from its words alone.
 4. When the work produced code, `ebira commits --repo <repository>` ties the
    commits to the conversations, and Git dates the code itself, uncommitted
    changes included.

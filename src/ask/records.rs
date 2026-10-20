@@ -10,7 +10,7 @@ use crate::format::{self, EventHeader};
 use crate::said::{self, SaidRequest};
 use crate::search::{self, SearchRequest};
 use crate::time::{self, Range};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -72,6 +72,16 @@ pub struct PersonMessages {
     pub stale_sources: u64,
     pub unscanned_bytes: u64,
     pub hits: Vec<Hit>,
+}
+
+/// The agent's words around one of the person's messages: the agent's last reply before it, and
+/// the agent's replies in the turn it opened, up to the person's next message.
+#[derive(Clone, Debug, Default)]
+pub struct TurnContext {
+    /// The text of the agent's last reply before the message in its log.
+    pub before: String,
+    /// The agent's text replies in the turn the message opened, the last few, oldest first.
+    pub replies: Vec<Hit>,
 }
 
 /// A bounded tail of a related session's own human messages, independent of search terms.
@@ -446,6 +456,81 @@ impl Corpus {
             after,
         )?;
         Ok(readable_lines(&events, source.byte_start))
+    }
+
+    /// For each of the person's messages given, the agent's words around it, from one pass
+    /// over each log that holds one: the agent's last reply before it, and the last
+    /// `max_replies` of the agent's replies in the turn it opened.
+    pub fn turn_contexts(
+        &self,
+        messages: &[Hit],
+        max_replies: usize,
+    ) -> io::Result<HashMap<SourceRef, TurnContext>> {
+        let _lock = corpus::read_lock(&self.root)?;
+        let catalog = corpus::source_catalog(&self.root)?;
+        let named: Vec<(String, u64)> = messages
+            .iter()
+            .map(|hit| (hit.source_ref.source_id.clone(), hit.source_ref.byte_start))
+            .collect();
+        let turns = crate::turns::read(&self.root, &named, max_replies)?;
+        let mut out = HashMap::new();
+        for hit in messages {
+            let key = (hit.source_ref.source_id.clone(), hit.source_ref.byte_start);
+            let Some(turn) = turns.get(&key) else {
+                continue;
+            };
+            let entry = catalog.get(&hit.source_ref.source_id);
+            let source_path = entry.map(|entry| entry.path.clone()).unwrap_or_default();
+            let app = entry.map(|entry| entry.app.clone()).unwrap_or_default();
+            let replies = turn
+                .replies
+                .iter()
+                .map(|reply| Hit {
+                    source_ref: SourceRef {
+                        source_id: hit.source_ref.source_id.clone(),
+                        byte_start: reply.header.byte_start,
+                        byte_len: reply.header.byte_len,
+                    },
+                    source_path: source_path.clone(),
+                    line: reply.header.line,
+                    session: reply.header.session.clone(),
+                    project: text::project_from_cwd(&reply.header.cwd),
+                    timestamp: reply.header.timestamp.clone(),
+                    who: Who::Agent,
+                    app: app.clone(),
+                    text: reply.text.clone(),
+                    images: 0,
+                    terms: Vec::new(),
+                    note: String::new(),
+                })
+                .collect();
+            out.insert(
+                hit.source_ref.clone(),
+                TurnContext {
+                    before: turn
+                        .before
+                        .as_ref()
+                        .map(|reply| reply.text.clone())
+                        .unwrap_or_default(),
+                    replies,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// The path of each source named, as the catalog records it.
+    pub fn source_paths(&self, ids: &HashSet<String>) -> io::Result<HashMap<String, String>> {
+        let _lock = corpus::read_lock(&self.root)?;
+        let catalog = corpus::source_catalog(&self.root)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| {
+                catalog
+                    .get(id)
+                    .map(|entry| (id.clone(), entry.path.clone()))
+            })
+            .collect())
     }
 }
 

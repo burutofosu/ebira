@@ -4,6 +4,31 @@ The notable changes in each release of Ebira. Before 1.0, a minor version may
 change what a command writes; a change to the corpus's storage format or reading
 rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
+## Unreleased
+
+Measured on the evaluation in `evals/`, now fifty-four questions, and on the
+author's own history ([results](evals/results/2026-10-20-delivery.md)).
+
+### Added
+
+- `said --context` shows each of the person's messages with the end of the
+  agent's reply before it and the agent's last reply in the turn it opened, each
+  with its `source_ref`, so that a short reply says what it answers; tool calls,
+  thinking, and the memory citations Codex appends are not replies, and a message
+  or reply Codex wrote twice counts once. On the author's history, 332 of the 335
+  messages of twelve characters or fewer get the reply they answered, and a page
+  takes as long as without it.
+- `ask --evidence-only` stops before the answer and writes what the answer would
+  read and what the steps before it screened, for measuring; `evals/run.py
+  --evidence` reports from it how far each record a question should cite gets,
+  and `--terms-from` makes runs search the same strings. Ways of reading under
+  trial, off by default: `--sweep-context`, `--sweep-chunks`, `--turn-replies`,
+  `--delivery current|spread`, `--agent-select newest|idf|all`.
+- Twelve evaluation cases that each strain one step of `ask`, on logs
+  `evals/stress.py` generates: short agreements to an agent's proposal, a long
+  pasted spec, hundreds of design remarks with three rules restated, and causes
+  an agent found months ago.
+
 ## 0.4.0 - 2026-10-20
 
 Measured with the evaluation in `evals/`, now forty-two questions, and on the

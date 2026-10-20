@@ -24,6 +24,7 @@ source retrieval. All commands run locally; `ask` also calls the Anthropic API
 | `context_text.rs` | Readable original records, using the corpus's sender and native-answer classification |
 | `resume.rs` | Current-turn recovery and the brief recovery view |
 | `said.rs` | The person's own messages, by session, project, agent, or topic |
+| `turns.rs` | The agent's words around the person's messages, for `said --context` and `ask` |
 | `sessions.rs` | The conversations: each session's span, places, counts, and first and last messages |
 | `follow.rs` | Waiting for the next message in another agent's transcript, by sender |
 | `commits.rs` | Commit-name extraction and Git resolution |
@@ -329,6 +330,17 @@ so separate questions with identical answers at the same timestamp remain distin
 such events; a session scope reads the segments of the session's sources, and
 the other filters apply to event headers.
 
+`said --context` reads, after the page's messages are known, the logs that hold
+them once more (`turns.rs`), each only up to the end of the turn of its last
+message on the page: the agent's last reply before each message, and the agent's
+replies in the turn it opened, up to the person's next message. A reply is the
+visible text of an assistant record (Claude's `text` blocks, Codex's
+`output_text` blocks and `agent_message` events), without thinking, tool calls,
+or the memory citations Codex appends. A message Codex wrote twice at the same
+time, as an item and as an event, is one message; its second copy does not end
+the turn, and a reply written twice is counted once. `ask` reads the same turns
+for its screen.
+
 A `--session` is resolved once, by `corpus::session_sources`: the session's
 sources are those whose records declare it, which takes in the transcripts of the
 agents it started (Claude Code subagents and Codex child threads record their
@@ -428,6 +440,10 @@ read: the sweep's counts, the sessions in the scope that contributed no record,
 and, for a string held by more records than were taken, the time of the oldest
 taken. `--no-sweep` leaves the person's side to the strings alone, as before.
 `--export` writes the records read and the sweep's relevant messages to a file.
+`--evidence-only` stops before the answer and writes, as JSON, what the answer
+would read (each block as shown, and the records in it), what the steps before it
+found, screened and judged, and the path of each source; `evals/run.py --evidence`
+measures from it how far each record a question should cite gets.
 
 Ebira keeps no summary of the records. The corpus holds the records' own fields
 and where each record is in its log, and an index would hold where text occurs,

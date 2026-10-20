@@ -864,3 +864,165 @@ fn another_api_needs_its_models_named_before_anything_is_sent() {
         .unwrap();
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("--api must be one of"));
 }
+
+/// Logs of both apps synced into one corpus: each `(path under the home, log)`.
+fn synced_logs(name: &str, logs_by_path: &[(&str, &str)]) -> (Logs, PathBuf) {
+    let logs =
+        Logs(std::env::temp_dir().join(format!("ebira-ask-api-{name}-{}", std::process::id())));
+    let corpus = logs.0.join("corpus");
+    let mut command = ebira(&logs.0);
+    command.arg("sync");
+    for (path, log) in logs_by_path {
+        let source = logs.0.join(path);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, log).unwrap();
+        command.args(["--source", source.to_str().unwrap()]);
+    }
+    let sync = command
+        .args(["--corpus", corpus.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        sync.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    (logs, corpus)
+}
+
+#[test]
+fn the_sweep_can_read_each_message_with_the_agents_words_and_screen_the_turns_replies() {
+    // A short agreement takes its meaning from the agent's words around it, in either app's
+    // log; Codex writes each message and reply twice, and the copies do not split the turn.
+    let claude = concat!(
+        r#"{"type":"user","sessionId":"c","timestamp":"2026-09-15T00:00:00Z","message":{"role":"user","content":"地図どれ使う？"}}"#,
+        "\n",
+        r#"{"type":"assistant","sessionId":"c","timestamp":"2026-09-15T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Leaflet がおすすめです。"}]}}"#,
+        "\n",
+        r#"{"type":"user","sessionId":"c","timestamp":"2026-09-15T00:05:00Z","message":{"role":"user","content":"それでいこう"}}"#,
+        "\n",
+        r#"{"type":"assistant","sessionId":"c","timestamp":"2026-09-15T00:06:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm i leaflet"}}]}}"#,
+        "\n",
+        r#"{"type":"user","sessionId":"c","timestamp":"2026-09-15T00:07:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"added 1 package"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","sessionId":"c","timestamp":"2026-09-15T00:08:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Leaflet で実装しました。"}]}}"#,
+        "\n",
+        r#"{"type":"user","sessionId":"c","timestamp":"2026-09-15T00:10:00Z","message":{"role":"user","content":"次はボタンの色"}}"#,
+        "\n",
+    );
+    let codex = concat!(
+        r#"{"timestamp":"2026-09-16T00:00:00.000Z","type":"session_meta","payload":{"id":"x","timestamp":"2026-09-16T00:00:00.000Z","cwd":"/work/tabi","originator":"codex_cli_rs","cli_version":"0.60.0","source":"cli"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"タイルはどこから取る？"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"タイルはどこから取る？","images":[]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:01:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"MapLibre がおすすめです。"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"MapLibre がおすすめです。"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:05:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:05:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"OK それ採用"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:05:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"OK それ採用","images":[]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:08:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"MapLibre で実装しました。"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-16T00:08:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"MapLibre で実装しました。"}}"#,
+        "\n",
+    );
+    let (logs, corpus) = synced_logs(
+        "turns",
+        &[
+            (".claude/projects/C--work-tabi/c.jsonl", claude),
+            (
+                ".codex/sessions/2026/09/16/rollout-2026-09-16T00-00-00-x.jsonl",
+                codex,
+            ),
+        ],
+    );
+    let service = ChatService::start(|body| {
+        if body.contains(SWEEP) {
+            (
+                200,
+                chat(
+                    "cheap-model",
+                    r#"{"scores":[{"id":"C1","score":2},{"id":"C2","score":3},{"id":"C3","score":0},{"id":"C4","score":2},{"id":"C5","score":3}]}"#,
+                ),
+            )
+        } else if body.contains(SCREEN) {
+            (
+                200,
+                chat(
+                    "cheap-model",
+                    r#"{"scores":[{"id":"C1","score":3},{"id":"C2","score":3},{"id":"C3","score":3}]}"#,
+                ),
+            )
+        } else {
+            (200, chat("strong-model", ANSWER))
+        }
+    });
+    let output = ask_compatible_with(
+        &logs,
+        &corpus,
+        &service.url,
+        "地図ライブラリは何にした？",
+        "地図",
+        &["--sweep-context", "--turn-replies", "--evidence-only"],
+    );
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sweep = requests
+        .iter()
+        .map(|(_, body)| body)
+        .find(|body| body.contains(SWEEP))
+        .expect("a sweep");
+    for shown in [
+        "それでいこう [agent before] …Leaflet がおすすめです。 [agent after] Leaflet で実装しました。",
+        "OK それ採用 [agent before] …MapLibre がおすすめです。 [agent after] MapLibre で実装しました。",
+        "次はボタンの色 [agent before] …Leaflet で実装しました。",
+    ] {
+        assert!(sweep.contains(shown), "{shown} in the sweep: {sweep}");
+    }
+    assert!(
+        sweep.contains("C5 | ") && !sweep.contains("C6 | "),
+        "five messages, Codex's copies once: {sweep}"
+    );
+    let turn_screen = requests
+        .iter()
+        .map(|(_, body)| body)
+        .find(|body| body.contains(SCREEN) && body.contains("MapLibre で実装しました。"))
+        .expect("the relevant turns' replies are screened without a search string");
+    assert_eq!(
+        turn_screen.matches("MapLibre で実装しました。").count(),
+        1,
+        "a reply Codex wrote twice is screened once: {turn_screen}"
+    );
+    let others = requests
+        .iter()
+        .filter(|(_, body)| !body.contains(SWEEP) && !body.contains(SCREEN))
+        .count();
+    assert_eq!(others, 1, "the draft, and no final answer");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(r#"{"disposition":"evidence","mode":"ask","#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Screened 4 of the agent's replies in the turns of the person's relevant messages; 3 judged relevant"
+        ) && stdout.contains(r#""score":3,"author":"agent"}"#),
+        "the replies of the four relevant turns, one each: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""digest":false"#) && stdout.contains(r#""sources":{"#),
+        "the evidence it would read, and where each source is: {stdout}"
+    );
+}

@@ -55,6 +55,17 @@ Score every candidate by meaning, not by shared words:
 
 Return one score for every id you were given.";
 
+/// The sweep, with the agent's words around each message.
+pub const SWEEP_CONTEXT_SYSTEM: &str = "You screen a person's own messages to their coding agents (Claude Code and Codex) for bearing on a question about their past work. The candidates are every message the person wrote in the scope asked about, in the order written, not search hits: most are about other things, and a message can bear on the question without sharing a word with it (a decision in other words, a later change of mind, an example given to convey a feeling, a complaint about the thing, praise of it, a report that it is broken). Each candidate line gives an id, the time, the project, and the message; a long one is cut in the middle. After the message, [agent before] is the end of the agent's reply the person was answering, and [agent after] is the head and tail of the agent's last reply in the turn the message opened. A short message such as \"go with that\", \"yes, that one\" or \"fixed!\" takes its meaning from them: what the person agreed to, chose or confirmed is what the message is about.
+
+Score the person's message, read with that context, by meaning, not by shared words:
+3 = central: a decision, a reversal, a rule, praise, a report of the problem, the cause found, or what was tried, about the matter asked
+2 = about the same matter and useful as background, or a change that may touch it
+1 = shares words with the question but is about something else
+0 = unrelated
+
+Return one score for every id you were given.";
+
 /// Reads the records and answers with citations.
 pub const ANSWER_SYSTEM: &str = "\
 You answer a question about a person's own history with coding agents (Claude Code and Codex), using only the records \

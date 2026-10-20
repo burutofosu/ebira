@@ -8,14 +8,23 @@
 use crate::core::{human_text_from_body, persons_message, PersonsMessage, SeenMessages, Sender};
 use crate::corpus::{self, SourceEntry};
 use crate::format::{self, parse_event_header, EventHeader};
+use crate::turns::{self, Turn};
 use crate::{json, output};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::Instant;
 
 const IO_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// How much of the agent's words around a message `--context` shows: the end of the agent's
+/// reply before it, and the agent's last reply in its turn, cut in the middle.
+const BEFORE_CHARS: usize = 200;
+const AFTER_CHARS: usize = 240;
+
+/// The agent's words around the messages a page may show, by source id and byte offset.
+type Turns = HashMap<(String, u64), Turn>;
 
 #[derive(Clone, Debug, Default)]
 pub struct SaidRequest {
@@ -43,6 +52,9 @@ pub struct SaidRequest {
     /// Codex threads can import another agent's conversation; those copies of the person's
     /// messages carry the import time. They are left out unless asked for.
     pub include_imported: bool,
+    /// Show each message with the end of the agent's reply before it and the agent's last
+    /// reply in its turn. Their characters count toward the page's budget.
+    pub context: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -104,17 +116,22 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
     }
     let started = Instant::now();
     let found = find(root, request)?;
+    let turns = if request.context {
+        Some(page_turns(root, request, &found)?)
+    } else {
+        None
+    };
     let duration_ms = started.elapsed().as_millis() as u64;
     if request.queries.len() > 1 {
         return if request.text_format {
-            output::write(&many_text(request, &found))
+            output::write(&many_text(request, &found, turns.as_ref()))
         } else {
-            output::write_line(&many_json(request, &found, duration_ms))
+            output::write_line(&many_json(request, &found, turns.as_ref(), duration_ms))
         };
     }
 
     let list = &found.lists[0];
-    let page = Page::of(list, request);
+    let page = Page::of(list, request, turns.as_ref());
     if request.text_format {
         let mut text = text_header(
             request,
@@ -153,9 +170,22 @@ pub fn run(root: &Path, request: &SaidRequest) -> io::Result<()> {
         .number("stale_sources", found.stale_sources)
         .number("unscanned_source_bytes", found.unscanned_bytes)
         .number("duration_ms", duration_ms)
-        .raw("messages", &page.messages_json(request.offset_minutes))
+        .raw("messages", &page.messages_json(request))
         .finish();
     output::write_line(&output)
+}
+
+/// The agent's words around every message that a page of the request could show: at most
+/// `limit` from its offset, in each list.
+fn page_turns(root: &Path, request: &SaidRequest, found: &SaidFound) -> io::Result<Turns> {
+    let start = usize::try_from(request.offset).unwrap_or(usize::MAX);
+    let named: Vec<(String, u64)> = found
+        .lists
+        .iter()
+        .flat_map(|list| list.messages.iter().skip(start).take(request.limit))
+        .map(|said| (said.header.source_id.clone(), said.header.byte_start))
+        .collect();
+    turns::read(root, &named, 1)
 }
 
 /// The person's messages for each of the request's queries, from one pass over the corpus.
@@ -218,17 +248,63 @@ pub(crate) fn find(root: &Path, request: &SaidRequest) -> io::Result<SaidFound> 
     })
 }
 
+/// One message on a page: the text shown, whether it was cut, and, with `--context`, the
+/// agent's words around it as shown.
+struct Entry<'a> {
+    said: &'a Said,
+    text: String,
+    cut: bool,
+    context: Option<Shown<'a>>,
+}
+
+/// The agent's words around a message, as `--context` shows them.
+struct Shown<'a> {
+    before: Option<(&'a turns::Reply, String)>,
+    after: Option<(&'a turns::Reply, String, usize)>,
+}
+
+impl<'a> Shown<'a> {
+    fn of(turns: &'a Turns, said: &Said) -> Shown<'a> {
+        let turn = turns.get(&(said.header.source_id.clone(), said.header.byte_start));
+        Shown {
+            before: turn
+                .and_then(|turn| turn.before.as_ref())
+                .map(|reply| (reply, turns::tail(&reply.text, BEFORE_CHARS))),
+            after: turn.and_then(|turn| {
+                turn.replies.last().map(|reply| {
+                    (
+                        reply,
+                        turns::middle(&reply.text, AFTER_CHARS),
+                        turn.reply_count,
+                    )
+                })
+            }),
+        }
+    }
+
+    fn chars(&self) -> usize {
+        self.before
+            .as_ref()
+            .map_or(0, |(_, text)| text.chars().count())
+            + self
+                .after
+                .as_ref()
+                .map_or(0, |(_, text, _)| text.chars().count())
+    }
+}
+
 /// One page of a list: the messages from the request's offset, within its limit and its
-/// character budget, each with the text shown and whether it was cut.
+/// character budget, each with the text shown and whether it was cut; with `--context`, the
+/// agent's words around each count toward the budget too.
 struct Page<'a> {
-    entries: Vec<(&'a Said, String, bool)>,
+    entries: Vec<Entry<'a>>,
     total: u64,
     next_offset: u64,
     has_more: bool,
 }
 
 impl<'a> Page<'a> {
-    fn of(list: &'a SaidList, request: &SaidRequest) -> Page<'a> {
+    fn of(list: &'a SaidList, request: &SaidRequest, turns: Option<&'a Turns>) -> Page<'a> {
         let total = list.messages.len() as u64;
         let start = usize::try_from(request.offset)
             .unwrap_or(usize::MAX)
@@ -239,18 +315,26 @@ impl<'a> Page<'a> {
             if entries.len() == request.limit {
                 break;
             }
-            let length = said.text.chars().count();
+            let context = turns.map(|turns| Shown::of(turns, said));
+            let extra = context.as_ref().map_or(0, Shown::chars);
+            let length = said.text.chars().count() + extra;
             if !entries.is_empty() && length > budget {
                 break;
             }
-            let cut = length > budget;
+            let room = budget.saturating_sub(extra);
+            let cut = said.text.chars().count() > room;
             let text = if cut {
-                said.text.chars().take(budget).collect()
+                said.text.chars().take(room).collect()
             } else {
                 said.text.clone()
             };
             budget = budget.saturating_sub(length);
-            entries.push((said, text, cut));
+            entries.push(Entry {
+                said,
+                text,
+                cut,
+                context,
+            });
         }
         let next_offset = request.offset.saturating_add(entries.len() as u64);
         Page {
@@ -271,18 +355,23 @@ impl<'a> Page<'a> {
         }
     }
 
-    fn messages_json(&self, offset_minutes: i64) -> String {
+    fn messages_json(&self, request: &SaidRequest) -> String {
         json::array(
             self.entries
                 .iter()
-                .map(|(said, text, cut)| message_json(said, text, *cut, offset_minutes)),
+                .map(|entry| message_json(entry, request.offset_minutes)),
         )
     }
 }
 
 /// The result of several queries: what the pass read once, then one entry per query with the
 /// page a request for it alone would give.
-fn many_json(request: &SaidRequest, found: &SaidFound, duration_ms: u64) -> String {
+fn many_json(
+    request: &SaidRequest,
+    found: &SaidFound,
+    turns: Option<&Turns>,
+    duration_ms: u64,
+) -> String {
     let filters = json::Object::new()
         .optional("session", request.session.as_deref())
         .optional("source_id", request.source_id.as_deref())
@@ -294,7 +383,7 @@ fn many_json(request: &SaidRequest, found: &SaidFound, duration_ms: u64) -> Stri
     let pages = found
         .lists
         .iter()
-        .map(|list| Page::of(list, request))
+        .map(|list| Page::of(list, request, turns))
         .collect::<Vec<_>>();
     let results = request
         .queries
@@ -311,7 +400,7 @@ fn many_json(request: &SaidRequest, found: &SaidFound, duration_ms: u64) -> Stri
                 .number("offset", request.offset)
                 .boolean("truncated", page.has_more)
                 .optional_number("next_offset", page.has_more.then_some(page.next_offset))
-                .raw("messages", &page.messages_json(request.offset_minutes))
+                .raw("messages", &page.messages_json(request))
                 .finish()
         });
     let disposition = if pages.iter().all(|page| page.total == 0) {
@@ -341,7 +430,7 @@ fn many_json(request: &SaidRequest, found: &SaidFound, duration_ms: u64) -> Stri
         .finish()
 }
 
-fn many_text(request: &SaidRequest, found: &SaidFound) -> String {
+fn many_text(request: &SaidRequest, found: &SaidFound, turns: Option<&Turns>) -> String {
     let mut output = format!(
         "# ebira said: {} queries, {}, times in {} (stale sources: {})\n",
         request.queries.len(),
@@ -354,7 +443,7 @@ fn many_text(request: &SaidRequest, found: &SaidFound) -> String {
         found.stale_sources,
     );
     for (query, list) in request.queries.iter().zip(&found.lists) {
-        let page = Page::of(list, request);
+        let page = Page::of(list, request, turns);
         output.push_str(&format!(
             "\n## {}: {} of {} messages (copies and imports skipped: {})\n",
             json::string(query),
@@ -491,18 +580,20 @@ fn local_time(timestamp: &str, offset_minutes: i64) -> String {
     crate::time::shown_minute(timestamp, offset_minutes)
 }
 
-fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> String {
+fn message_json(entry: &Entry, offset_minutes: i64) -> String {
+    let said = entry.said;
     let header = &said.header;
-    json::Object::new()
+    let mut object = json::Object::new();
+    object
         .name("timestamp", &header.timestamp)
         .name("local_time", &local_time(&header.timestamp, offset_minutes))
         .name("app", &said.app)
         .name("via", &header.via)
         .name("session", &header.session)
         .name("cwd", &header.cwd)
-        .text("text", text)
+        .text("text", &entry.text)
         .number("chars", said.text.chars().count() as u64)
-        .boolean("text_truncated", cut)
+        .boolean("text_truncated", entry.cut)
         .number("images", said.images as u64)
         .raw(
             "source_ref",
@@ -513,8 +604,88 @@ fn message_json(said: &Said, text: &str, cut: bool, offset_minutes: i64) -> Stri
                 header.byte_start,
                 header.byte_len,
             ),
+        );
+    if let Some(context) = &entry.context {
+        object.raw(
+            "context",
+            &context_json(context, &said.source_path, offset_minutes),
+        );
+    }
+    object.finish()
+}
+
+/// `{"before": ..., "after": ...}`: each the text shown, the reply's whole length, its time
+/// and source reference; the reply after also says how many replies the turn held.
+fn context_json(context: &Shown, source_path: &str, offset_minutes: i64) -> String {
+    let reply = |reply: &turns::Reply, text: &str, count: Option<usize>| {
+        let header = &reply.header;
+        let mut object = json::Object::new();
+        object
+            .text("text", text)
+            .number("chars", reply.text.chars().count() as u64)
+            .name("timestamp", &header.timestamp)
+            .name("local_time", &local_time(&header.timestamp, offset_minutes));
+        if let Some(count) = count {
+            object.number("replies_in_turn", count as u64);
+        }
+        object
+            .raw(
+                "source_ref",
+                &json::source_ref(
+                    &header.source_id,
+                    source_path,
+                    Some(header.line),
+                    header.byte_start,
+                    header.byte_len,
+                ),
+            )
+            .finish()
+    };
+    json::Object::new()
+        .raw(
+            "before",
+            &json::or_null(
+                context
+                    .before
+                    .as_ref()
+                    .map(|(before, text)| reply(before, text, None)),
+            ),
+        )
+        .raw(
+            "after",
+            &json::or_null(
+                context
+                    .after
+                    .as_ref()
+                    .map(|(after, text, count)| reply(after, text, Some(*count))),
+            ),
         )
         .finish()
+}
+
+/// The agent's words around a message, one line each, under it.
+fn text_context(context: &Shown, offset_minutes: i64) -> String {
+    let mut output = String::new();
+    if let Some((reply, text)) = &context.before {
+        output.push_str(&format!(
+            "  agent before ({}): {}\n",
+            local_time(&reply.header.timestamp, offset_minutes),
+            text
+        ));
+    }
+    if let Some((reply, text, count)) = &context.after {
+        output.push_str(&format!(
+            "  agent after ({}, {}): {}\n",
+            local_time(&reply.header.timestamp, offset_minutes),
+            if *count == 1 {
+                "the turn's one reply".to_string()
+            } else {
+                format!("the last of the turn's {count} replies")
+            },
+            text
+        ));
+    }
+    output
 }
 
 fn text_header(request: &SaidRequest, page: &Page, skipped: u64, stale_sources: u64) -> String {
@@ -535,7 +706,8 @@ fn text_header(request: &SaidRequest, page: &Page, skipped: u64, stale_sources: 
 
 fn text_messages(request: &SaidRequest, page: &Page) -> String {
     let mut output = String::new();
-    for (said, text, cut) in &page.entries {
+    for entry in &page.entries {
+        let (said, text, cut) = (entry.said, &entry.text, &entry.cut);
         let header = &said.header;
         output.push_str(&format!(
             "\n[{}] {} {} session={} source-id={} byte={}+{}{}\n{}{}\n",
@@ -564,6 +736,9 @@ fn text_messages(request: &SaidRequest, page: &Page) -> String {
                 String::new()
             },
         ));
+        if let Some(context) = &entry.context {
+            output.push_str(&text_context(context, request.offset_minutes));
+        }
     }
     if page.has_more {
         output.push_str(&format!("\n# more: --offset {}\n", page.next_offset));

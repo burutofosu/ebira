@@ -1,8 +1,9 @@
 # Evaluating `ebira ask`
 
-Forty-two questions about made-up conversations, whose answers are known. They test what is
-hard about reading a person's history with coding agents: six ways with five questions each
-(one of the five in English), and four more with three each:
+Fifty-four questions about made-up conversations, whose answers are known. Forty-two test what
+is hard about reading a person's history with coding agents: six ways with five questions each
+(one of the five in English), and four more with three each. Twelve more strain one step of
+`ask` each, on logs that `stress.py` generates:
 
 | Type | What the answer has to do |
 | --- | --- |
@@ -16,17 +17,25 @@ hard about reading a person's history with coding agents: six ways with five que
 | `attempt_history` | Give each thing tried for a problem with how the person said it turned out, and the one that holds now |
 | `origin_of_rule` | Say that a rule the records carry as the person's was written by an agent or a summary, and what the person actually said |
 | `other_words` | Find the message that settles the question though it shares no noun with it |
+| `short_reply` | Find a short agreement ("go with that") to an agent's proposal, and say what was agreed to; the agreement means nothing without the agent's words around it, and newer records bury the proposal |
+| `long_message` | Read what settles the question in the middle of a long spec the person pasted |
+| `repeated_principle` (M1) | The same, among some 660 design remarks of the person's, more than the digest holds |
+| `span_of_repeats` | Give the first and the last time a rule was said, among the same remarks |
+| `agent_found_cause` | Find the cause an agent found months ago, under fifty and more newer agent records holding the same words, and that the person confirmed the fix |
 
 The conversations are in eight projects, as Claude Code and Codex would log them, with
 compaction summaries, tool calls and their output, and a Codex message wrapped with the
 files it mentions. Generated filler sessions in the same projects, the same every time,
 settle nothing the questions ask about; they give the search something to sift through.
 Each question is asked with `--cwd` naming its project, as an agent working there would
-ask: the person's messages, as in real logs, do not name the project they are in.
+ask: the person's messages, as in real logs, do not name the project they are in. The stress
+cases are in three more projects: `tabi-app` (short agreements, and a pasted spec),
+`atelier` (hundreds of design remarks, three rules restated), and `sensor-hub` (Codex logs
+of causes found long ago).
 
 ## What it does not test
 
-- The logs are small: about 200 sessions and 2,400 records, a little over a megabyte. Real
+- The logs are small: about 380 sessions and 5,000 records, a little over three megabytes. Real
   histories run to gigabytes, where choosing the search strings matters more, and the
   person's messages in a project run to a thousand or more, where screening them all
   matters more.
@@ -44,7 +53,7 @@ cargo build --release
 python3 evals/run.py --out /tmp/ebira-eval --ebira target/release/ebira
 ```
 
-This writes the logs and a corpus under `/tmp/ebira-eval`, asks the thirty questions
+This writes the logs and a corpus under `/tmp/ebira-eval`, asks the fifty-four questions
 (three at a time; `--jobs` changes that), and writes `report.md`, with the cost, time,
 verified quotes, and whether each answer cites the records the case names, and `judge.md`,
 the answers for a judge to score as [JUDGE.md](JUDGE.md) says. `--quick` asks with
@@ -52,9 +61,19 @@ the answers for a judge to score as [JUDGE.md](JUDGE.md) says. `--quick` asks wi
 `--build-only` writes the logs and the corpus only, and `--ask-arg=<option>` (repeatable)
 passes an option to every `ask`, such as `--ask-arg=--no-sweep`.
 
+To compare ways of finding and handing over the records without paying for answers,
+`--evidence` stops each `ask` before its answer (`--evidence-only`) and writes `funnel.md`:
+for every record a case should cite, how far it got (read with its context, shown in the
+digest, judged relevant but not handed over, screened and judged not relevant, found and not
+screened, or missed), and whether the words that settle a long-message case reached the
+reader. `--terms-from <dir>` makes each case search the strings that an earlier run in `<dir>`
+searched in its first round, with that run's period, so that runs differ only in their
+options; each run's own draft still chooses its second round. A funnel run costs about two
+US cents a question.
+
 `ebira ask` uses the API it is set up for (see `ebira help ask-setup`) and spends under that
 key. On logs this small a question costs less than on a real history: with the default
-models, about 5 US cents, so about $2.30 for the forty-two; with `--quick`, under a cent.
+models, about 5 US cents, so about $2.70 for the fifty-four; with `--quick`, under a cent.
 Python 3.8 or later is needed, with the standard library only.
 
 ## Files
@@ -62,6 +81,7 @@ Python 3.8 or later is needed, with the standard library only.
 - `scenarios/*.txt`: the conversations, one project a file.
 - `cases.json`: the questions, the key points a right answer makes, the mistakes to watch
   for, and the records it should cite.
+- `stress.py`: generates the logs of the stress cases, the same every time.
 - `run.py`: writes the logs, builds the corpus, asks, and reports.
 - `JUDGE.md`: how to score the answers.
 - `results/`: the scores of earlier runs.

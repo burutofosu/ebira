@@ -47,6 +47,9 @@ that it holds the records it held before.
 # Your messages, newest first
 ebira said --format text
 
+# Each with the end of the agent's reply before it and the agent's last reply after it
+ebira said --context --format text
+
 # The conversations in a project: when each ran, how much you said, how it began
 ebira sessions --cwd <project-path-part> --format text
 
@@ -73,6 +76,12 @@ it is also available as `CLAUDE_CODE_SESSION_ID` (Claude Code) or
 `said` separates your messages from agent prompts, notifications, tool results,
 and summaries. Filter it with `--session <id>`, `--cwd <project-path-part>`,
 or `--query <text>`. Use `--limit` and `--offset` to page through results.
+A short reply means nothing by itself: "go with that" agreed to something the
+agent had just proposed. `--context` shows under each message the last 200
+characters of the agent's reply before it and the agent's last reply in the turn
+it opened, cut to 240 characters around its middle, with how many replies the
+turn held and a `source_ref` for reading each whole; tool calls and thinking are
+not replies. Their characters count toward the page's `--max-chars`.
 
 Search matches literal text. Add `--ignore-case` for ASCII case-insensitive
 matching or `--from` and `--to` for dates. The corpus keeps selected fields
@@ -156,7 +165,7 @@ record found means no further call (`no_records`).
 Every quote is checked against the records before it is shown, and each finding
 cites its `source_ref`. A verified quote confirms the quoted words, not the
 answer's interpretation or completeness. Check important conclusions against the
-original records. [evals](evals/README.md) holds forty-two questions about made-up logs,
+original records. [evals](evals/README.md) holds fifty-four questions about made-up logs,
 with the answers known, to measure what a change to `ask` does.
 
 It needs an API key. Run `ebira ask-setup` to choose the service (Anthropic by
