@@ -4,6 +4,31 @@ The notable changes in each release of Ebira. Before 1.0, a minor version may
 change what a command writes; a change to the corpus's storage format or reading
 rules makes the next `ebira sync` rebuild the corpus from the original logs.
 
+## Unreleased
+
+Measured on the evaluation in `evals/` and on the author's own history
+([results](evals/results/2026-10-20-delivery.md)).
+
+### Changed
+
+- `ask` reads the person's messages in the three ways that measured best, now by
+  default. The sweep shows the screen each message with the end of the agent's
+  reply before it and the agent's last reply in its turn, so that a short reply
+  is judged by what it answered. A long message is screened in overlapping
+  pieces, and the answer is shown the piece judged relevant. The answer gets the
+  relevant records the higher score first and one session at a time, and the
+  digest gives identical messages once with their count, within a character
+  budget, instead of the earliest and the latest 300. On the fifty-four
+  questions, the answers made 100% of the key points instead of 95%, with no
+  answer making a mistake instead of two, at the same cost; on six questions
+  about the author's history, 83% and 89%, which one run each cannot tell apart.
+  `--no-sweep-context`, `--no-sweep-chunks`, and `--delivery current` read as
+  0.5.0 did.
+
+### Removed
+
+- `ask --sweep-context` and `--sweep-chunks`: what they turned on is the default.
+
 ## 0.5.0 - 2026-10-20
 
 Measured on the evaluation in `evals/`, now fifty-four questions, and on the

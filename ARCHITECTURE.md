@@ -426,11 +426,20 @@ of `said` without a query gives every message the person wrote in the scope
 sessions that have a message in that directory, since an app moves a session
 between folders), and the cheap model screens the newest `--sweep-limit` of them
 against the question in chunks of forty, in the order written, with the same
-scores as the search's screen. The relevant ones join the pool as the search's
-hits do; those beyond what the answer reads with their context go to it as a
-digest, one line each, at most 300 (the earliest and the latest halves when there
-are more), as evidence of their own so that a quote from them is checked and
-cited like any other. After a sweep, the check for later changes screens every
+scores as the search's screen. Each message comes with the agent's words around it
+(`turns.rs`: the last 120 characters of the reply before it, and the turn's last
+reply cut to 240 around its middle), and a message longer than the screen shows
+is screened in overlapping pieces of 500 characters, the message taking its best
+piece's score; the answer is then shown that piece between the message's head and
+tail. The relevant ones join the pool as the search's hits do. The answer reads
+the best of the pool with their context, the higher score first and one session at
+a time; the person's relevant messages beyond those go to it as a digest, one line
+each of at most 240 characters, identical messages once with their count, the
+central before the background and one session at a time, within 36,000
+characters, oldest first, as evidence of their own so that a quote from them is
+checked and cited like any other. `--delivery current` keeps the earlier way: the
+best 40 in the order found, and at most 300 in the digest, the earliest and the
+latest halves when there are more. After a sweep, the check for later changes screens every
 later message of the person's (the earliest and the latest 200 when there are
 more) instead of searching for strings. The same pass gives the plan model a
 sample of how the person writes, spread over the scope, before it chooses the

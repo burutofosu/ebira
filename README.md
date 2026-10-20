@@ -136,10 +136,16 @@ Your own messages are few next to the agents' records (a few thousand in a
 history of a million records), so `ask` does not leave them to the search
 strings: by default it screens every message you wrote in the scope, the newest
 4,000 at most, with the cheap model, in the order written, and the ones judged to
-bear on the question join the records read. Those beyond what the answer reads
-with their context are given to it in one line each (`search.sweep_digest`). The
-check for later changes then reads every later message of yours instead of
-searching for them. With `--cwd`, the scope is every message of the sessions that
+bear on the question join the records read. Each message is screened with the end
+of the agent's reply before it and the agent's last reply in its turn, so that a
+short reply ("go with that") is judged by what it answered; a long message is
+screened in overlapping pieces, and the answer is shown the piece judged relevant.
+Those beyond what the answer reads with their context are given to it in one line
+each (`search.sweep_digest`): the most relevant first, one session at a time,
+identical messages once with how many times they were sent, within a character
+budget. `--no-sweep-context`, `--no-sweep-chunks`, and `--delivery current` read
+as 0.5.0 did. The check for later changes then reads every later message of yours
+instead of searching for them. With `--cwd`, the scope is every message of the sessions that
 worked in that directory, also those written while a session was elsewhere.
 `search.sweep` reports how many messages were screened and judged relevant, and
 `search.coverage` which sessions in the scope the records read come from.

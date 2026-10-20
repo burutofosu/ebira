@@ -528,6 +528,11 @@ fn the_sweep_screens_every_message_of_the_persons_and_reads_what_bears_on_the_qu
         "both messages, oldest first: {}",
         sweeps[0]
     );
+    assert!(
+        sweeps[0].contains("パスワード管理したくないから、メールにリンク送る方式にしよ [agent before] …実装します。"),
+        "each message with the agent's words before it, by default: {}",
+        sweeps[0]
+    );
     let answers: Vec<&String> = requests
         .iter()
         .map(|(_, body)| body)
@@ -865,6 +870,65 @@ fn another_api_needs_its_models_named_before_anything_is_sent() {
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("--api must be one of"));
 }
 
+#[test]
+fn the_sweep_reads_each_message_alone_when_asked_as_before() {
+    let (logs, corpus) = synced_log(
+        "sweep-alone",
+        concat!(
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-09-15T00:00:00Z","message":{"role":"user","content":"地図どれ使う？"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","timestamp":"2026-09-15T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Leaflet がおすすめです。"}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-09-15T00:05:00Z","message":{"role":"user","content":"それでいこう"}}"#,
+            "\n",
+        ),
+    );
+    let service = ChatService::start(|body| {
+        if body.contains(SWEEP) {
+            (
+                200,
+                chat(
+                    "cheap-model",
+                    r#"{"scores":[{"id":"C1","score":2},{"id":"C2","score":3}]}"#,
+                ),
+            )
+        } else if body.contains(SCREEN) {
+            (200, chat("cheap-model", SCREENED))
+        } else {
+            (200, chat("strong-model", ANSWER))
+        }
+    });
+    let output = ask_compatible_with(
+        &logs,
+        &corpus,
+        &service.url,
+        "地図ライブラリは何にした？",
+        "地図",
+        &[
+            "--no-sweep-context",
+            "--no-sweep-chunks",
+            "--delivery",
+            "current",
+            "--evidence-only",
+        ],
+    );
+    let requests = service.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sweep = requests
+        .iter()
+        .map(|(_, body)| body)
+        .find(|body| body.contains(SWEEP))
+        .expect("a sweep");
+    assert!(
+        sweep.contains("それでいこう") && !sweep.contains("[agent before]"),
+        "each message alone, as 0.5.0 screened them: {sweep}"
+    );
+}
+
 /// Logs of both apps synced into one corpus: each `(path under the home, log)`.
 fn synced_logs(name: &str, logs_by_path: &[(&str, &str)]) -> (Logs, PathBuf) {
     let logs =
@@ -971,7 +1035,7 @@ fn the_sweep_can_read_each_message_with_the_agents_words_and_screen_the_turns_re
         &service.url,
         "地図ライブラリは何にした？",
         "地図",
-        &["--sweep-context", "--turn-replies", "--evidence-only"],
+        &["--turn-replies", "--evidence-only"],
     );
     let requests = service.finish();
     assert!(

@@ -88,7 +88,9 @@ impl Options {
     /// The default, the most accurate for its cost in a comparison of model setups on questions
     /// with known answers (October 2026): Claude Opus 5.5 chooses the search strings and writes
     /// the answer, Claude Haiku 5.5 screens and drafts, two rounds of searching, and the
-    /// reversal check.
+    /// reversal check. The sweep shows the screen the agent's words around each message and
+    /// a long message in pieces, and the records reach the answer spread out: together they
+    /// made 100% of the evaluation's key points, against 95% without (evals/results).
     pub fn thorough(question: String) -> Options {
         Options {
             question,
@@ -105,10 +107,10 @@ impl Options {
             reversal_check: true,
             sweep: true,
             sweep_limit: 4000,
-            sweep_context: false,
-            sweep_chunks: false,
+            sweep_context: true,
+            sweep_chunks: true,
             turn_replies: false,
-            delivery: Delivery::Current,
+            delivery: Delivery::Spread,
             agent_select: AgentSelect::Newest,
             evidence_only: false,
             draft_model: Some("claude-haiku-5-5".to_string()),
@@ -237,6 +239,7 @@ struct TermCount {
 }
 
 /// A sweep: every message the person wrote in the scope, screened against the question.
+#[derive(Default)]
 struct Swept {
     in_scope: usize,
     screened: usize,
@@ -4558,6 +4561,100 @@ mod tests {
         let thorough = Options::thorough("q".to_string());
         assert_eq!(thorough.draft_model.as_deref(), Some("claude-haiku-5-5"));
         assert!(thorough.reversal_check && thorough.second_round);
+    }
+
+    #[test]
+    fn the_spread_digest_gives_the_central_first_identical_messages_once_and_keeps_its_budget() {
+        let message = |text: String, day: u32, minute: u32, score: u64| {
+            let mut found = hit(
+                &text,
+                Who::Person,
+                &format!("2026-09-{day:02}T00:{minute:02}:00Z"),
+                &[],
+            );
+            found.session = format!("s{}", minute % 7);
+            (found, score)
+        };
+        let mut pool = Pool {
+            swept: Some(Swept::default()),
+            ..Pool::default()
+        };
+        // Ten central messages and 150 background ones, each as long as a digest line shows,
+        // and the same short reply sent twice.
+        for minute in 0..10 {
+            pool.relevant.push(message(
+                format!("{minute}{}", "要".repeat(300)),
+                20,
+                minute,
+                3,
+            ));
+        }
+        for minute in 0..50 {
+            for day in 1..4 {
+                pool.relevant.push(message(
+                    format!("{day}{minute}{}", "背".repeat(300)),
+                    day,
+                    minute,
+                    2,
+                ));
+            }
+        }
+        let (digest, left_out) = sweep_digest_spread(&corpus(), &pool, &HashSet::new());
+        // Each line costs its 240 characters shown and 60 of heading: 120 fit 36,000.
+        assert_eq!(digest.len() + left_out, 160);
+        assert!(
+            digest.len() >= 120 && digest.len() <= 121,
+            "{}",
+            digest.len()
+        );
+        assert_eq!(
+            digest
+                .iter()
+                .filter(|(found, _)| found.text.contains('要'))
+                .count(),
+            10,
+            "every central message"
+        );
+        let times: Vec<&str> = digest
+            .iter()
+            .map(|(found, _)| found.timestamp.as_str())
+            .collect();
+        assert!(
+            times.windows(2).all(|pair| pair[0] <= pair[1]),
+            "oldest first"
+        );
+        // The same words sent twice are shown once, with how many times they were sent.
+        let mut small = Pool {
+            swept: Some(Swept::default()),
+            ..Pool::default()
+        };
+        small.relevant = vec![
+            message("OK".to_string(), 25, 1, 2),
+            message("色は3色まで".to_string(), 25, 3, 3),
+            message("OK".to_string(), 26, 2, 2),
+        ];
+        let (digest, left_out) = sweep_digest_spread(&corpus(), &small, &HashSet::new());
+        assert_eq!((digest.len(), left_out), (2, 0));
+        let (reply, copies) = digest
+            .iter()
+            .find(|(found, _)| found.text == "OK")
+            .cloned()
+            .expect("the short reply, once");
+        assert_eq!(copies, 2);
+        let block = compose_digest(
+            &corpus(),
+            "E9".to_string(),
+            reply,
+            DIGEST_LINE_CHARS,
+            None,
+            copies,
+        );
+        assert!(
+            block.block.contains("sent 2 times in the same words")
+                && block.block.contains("cut at 240 characters"),
+            "{}",
+            block.block
+        );
     }
 
     #[test]

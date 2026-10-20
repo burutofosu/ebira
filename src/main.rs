@@ -83,11 +83,16 @@ const ASK_DETAILS: &[&str] = &[
     "  --agent-per-term <n>         the agents' replies per search string (default 40; 0 for none)",
     "  --candidates <n>             records screened per round (default 600)",
     "",
+    "How the sweep reads your messages, and what reaches the answer:",
+    "  --no-sweep-context           screen each message alone, as 0.5.0 did, without the end of",
+    "                               the agent's reply before it and its turn's last reply",
+    "  --no-sweep-chunks            screen a long message by its head and tail, as 0.5.0 did",
+    "  --delivery current|spread    spread (default): the highest scores first, one session at",
+    "                               a time, identical messages once, within a character budget;",
+    "                               current, as 0.5.0 did: the best 40, then a digest of 300",
+    "",
     "Ways under trial, for measuring (they may change or go):",
-    "  --sweep-context              show the sweep each message with the agent's words around it",
-    "  --sweep-chunks               screen a long message in overlapping pieces, not its ends",
     "  --turn-replies               screen the agent's replies in the turns of relevant messages",
-    "  --delivery current|spread    how the records found reach the answer (default current)",
     "  --agent-select newest|idf|all which of the agents' records holding a string are screened",
     "                               (default newest)",
     "  --evidence-only              stop before the answer and write, as JSON, what it would read",
@@ -426,8 +431,8 @@ const COMMANDS: &[CommandSpec] = &[
             "--quick",
             "--no-api",
             "--no-sweep",
-            "--sweep-context",
-            "--sweep-chunks",
+            "--no-sweep-context",
+            "--no-sweep-chunks",
             "--turn-replies",
             "--evidence-only",
         ],
@@ -777,8 +782,8 @@ fn ask_options(args: &[String], question: String) -> io::Result<ask::Options> {
     // The sweep screens with the API: without it, only the strings are searched.
     options.sweep = !has_flag(args, "--no-sweep") && !options.no_api;
     options.sweep_limit = bounded_number(args, "--sweep-limit", options.sweep_limit, 1, 100_000)?;
-    options.sweep_context = has_flag(args, "--sweep-context");
-    options.sweep_chunks = has_flag(args, "--sweep-chunks");
+    options.sweep_context = !has_flag(args, "--no-sweep-context");
+    options.sweep_chunks = !has_flag(args, "--no-sweep-chunks");
     options.turn_replies = has_flag(args, "--turn-replies");
     options.evidence_only = has_flag(args, "--evidence-only");
     if let Some(value) = option_values(args, "--delivery").into_iter().next() {
